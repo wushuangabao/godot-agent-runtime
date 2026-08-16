@@ -1,5 +1,7 @@
 # Machine-local development environment.
 /config/development.local.json
+/.codex/config.toml
+/.dsh/
 
 # Node.js and test outputs.
 **/node_modules/

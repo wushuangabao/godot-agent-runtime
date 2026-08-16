@@ -6,12 +6,12 @@ import { validateBridgeHandshake } from "../../packages/core/src/runtime.js";
 describe("bridge handshake negotiation", () => {
   it("preserves the bridge's actual supported capability subset", () => {
     const result = validateBridgeHandshake(
-      { protocolVersion: "0.1.0", capabilities: ["ui"] },
+      { protocolVersion: "0.3.0", capabilities: ["ui"] },
       "runtime",
       ["ui", "input"],
     );
 
-    expect(result).toEqual({ protocolVersion: "0.1.0", capabilities: ["ui"] });
+    expect(result).toEqual({ protocolVersion: "0.3.0", capabilities: ["ui"] });
   });
 
   it("rejects an incompatible protocol version with a stable error", () => {
@@ -32,7 +32,7 @@ describe("bridge handshake negotiation", () => {
         payload: {
           code: "EDITOR_PROTOCOL_VERSION_MISMATCH",
           stage: "protocol",
-          details: { expected: "0.1.0", actual: "0.0.9" },
+          details: { expected: "0.3.0", actual: "0.0.9" },
         },
       });
     }
@@ -40,7 +40,7 @@ describe("bridge handshake negotiation", () => {
 
   it("rejects unknown capabilities for the negotiated version", () => {
     expect(() => validateBridgeHandshake(
-      { protocolVersion: "0.1.0", capabilities: ["run_script"] },
+      { protocolVersion: "0.3.0", capabilities: ["run_script"] },
       "runtime",
       ["ui"],
     )).toThrowError(expect.objectContaining({

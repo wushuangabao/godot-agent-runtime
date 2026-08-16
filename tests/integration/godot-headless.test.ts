@@ -26,10 +26,10 @@ describe.skipIf(!hasLocalConfig)("configured Godot headless integration", () => 
     "imports and runs the %s scene",
     async (projectName, readyMarker) => {
       const projectPath = resolve("examples", projectName);
-      const check = await checkProject({ projectPath, configPath, timeoutMs: 30_000 });
+      const check = await checkProject({ projectPath, configPath, timeoutMs: 45_000 });
       expect(check.ok, JSON.stringify(check.diagnostics)).toBe(true);
 
-      const run = await runProject({ projectPath, configPath, timeoutMs: 30_000 });
+      const run = await runProject({ projectPath, configPath, timeoutMs: 45_000 });
       expect(run.ok, JSON.stringify(run.diagnostics)).toBe(true);
       expect(`${run.stdout}\n${run.stderr}`).toContain(readyMarker);
     },

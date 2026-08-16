@@ -12,7 +12,9 @@ export type { FindProjectsOptions } from "./discovery.js";
 export { runDoctor } from "./doctor.js";
 export { RuntimeFailure, toRuntimeError } from "./errors.js";
 export {
+  captureEditorScreenshot,
   connectEditorSignal,
+  createInheritedEditorScene,
   createEditorNode,
   createEditorResource,
   deleteEditorNode,
@@ -36,12 +38,14 @@ export {
   updateEditorResource,
 } from "./editor.js";
 export type {
+  EditorScreenshotOptions,
   EditorNodeCreateOptions,
   EditorNodeDeleteOptions,
   EditorNodeLookupOptions,
   EditorNodeMoveOptions,
   EditorNodeUpdateOptions,
   EditorSceneInstantiateOptions,
+  EditorSceneInheritanceOptions,
   EditorResourceCreateOptions,
   EditorResourceLookupOptions,
   EditorResourceUpdateOptions,
@@ -83,11 +87,15 @@ export {
   findLoopbackPort,
   findRuntimeUi,
   getRuntimeNode,
+  observeRuntime,
+  projectRuntime3D,
+  raycastRuntime3D,
   getRuntimeSceneTree,
   getRuntimeInfo,
   injectRuntimeInput,
   injectRuntimeInputSequence,
   sendBridgeCommand,
+  simulateRuntimePhysics,
   waitForRuntimeBridge,
   waitForRuntime,
 } from "./runtime.js";
@@ -99,7 +107,11 @@ export type {
   RuntimeInputStep,
   RuntimeLookupOptions,
   RuntimeNodeLookupOptions,
+  RuntimeObservationOptions,
+  RuntimeProjection3DOptions,
+  RuntimeRaycast3DOptions,
   RuntimeSceneTreeOptions,
+  RuntimeSimulationOptions,
   RuntimeUiFindOptions,
   RuntimeUiSelector,
   RuntimeWaitOptions,

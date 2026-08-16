@@ -31,20 +31,21 @@ async function checkLoopback(): Promise<number> {
 
 async function checkClientConfiguration(
   root: string,
-  target: "codex" | "claude-code",
+  target: "codex" | "deepseek-harness",
 ): Promise<DoctorResult["checks"][number]> {
   const path =
     target === "codex"
       ? resolve(root, ".codex", "config.toml")
-      : resolve(root, ".mcp.json");
+      : resolve(root, ".dsh", "godot-agent-runtime.patch.yml");
   try {
     const source = await readFile(path, "utf8");
     let configured = false;
     if (target === "codex") {
       configured = /\[mcp_servers\.godot-agent-runtime\]/.test(source);
     } else {
-      const parsed = JSON.parse(source) as { mcpServers?: Record<string, unknown> };
-      configured = parsed.mcpServers?.["godot-agent-runtime"] !== undefined;
+      configured =
+        /name:\s*['"]?@deepseek-ai\/dsh-mcp-client['"]?/.test(source) &&
+        /serverName:\s*['"]?godot['"]?/.test(source);
     }
     return {
       name: `client-${target}`,
@@ -155,7 +156,7 @@ export async function runDoctor(configPath?: string): Promise<DoctorResult> {
 
   checks.push(
     await checkClientConfiguration(process.cwd(), "codex"),
-    await checkClientConfiguration(process.cwd(), "claude-code"),
+    await checkClientConfiguration(process.cwd(), "deepseek-harness"),
   );
 
   return {

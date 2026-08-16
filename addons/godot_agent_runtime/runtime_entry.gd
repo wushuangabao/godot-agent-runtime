@@ -1,6 +1,6 @@
 extends SceneTree
 
-const PROTOCOL_VERSION := "0.1.0"
+const PROTOCOL_VERSION := "0.3.0"
 const MAX_MESSAGE_BYTES := 1024 * 1024
 
 
@@ -19,6 +19,7 @@ class RuntimeBridge:
 	var _port := 0
 	var _token := ""
 	var _run_id := ""
+	var _exclusive_operation_active := false
 
 
 	func _ready() -> void:
@@ -98,7 +99,9 @@ class RuntimeBridge:
 		if typeof(params) != TYPE_DICTIONARY:
 			_send_error(peer, "RUNTIME_REQUEST_INVALID", "params must be an object.", request_id)
 			return
-		var result: Dictionary = await _dispatch(command, params)
+		var request_timeout_ms := clampi(int(request.get("timeoutMs", 5000)), 100, 32000)
+		var deadline_ms := Time.get_ticks_msec() + request_timeout_ms
+		var result: Dictionary = await _dispatch(command, params, peer, deadline_ms)
 		if result.has("_error"):
 			var failure: Dictionary = result["_error"]
 			_send_error(peer, str(failure.code), str(failure.message), request_id, failure.get("details", {}))
@@ -106,14 +109,14 @@ class RuntimeBridge:
 		_send(peer, {"id": request_id, "ok": true, "result": result})
 
 
-	func _dispatch(command: String, params: Dictionary) -> Dictionary:
+	func _dispatch(command: String, params: Dictionary, peer: PeerState, deadline_ms: int) -> Dictionary:
 		match command:
 			"hello":
 				return {
 					"protocolVersion": PROTOCOL_VERSION,
 					"engineVersion": Engine.get_version_info().get("string", "unknown"),
 					"scene": get_tree().current_scene.scene_file_path if get_tree().current_scene != null else null,
-					"capabilities": ["screenshot", "ui", "scene_tree", "node", "input", "input_sequence", "assert", "wait", "control"],
+					"capabilities": ["screenshot", "ui", "scene_tree", "node", "observe", "simulate", "spatial_3d", "input", "input_sequence", "assert", "wait", "control"],
 				}
 			"screenshot":
 				return await _capture_screenshot()
@@ -123,16 +126,40 @@ class RuntimeBridge:
 				return _scene_tree(params)
 			"node_get":
 				return _node_get(params)
+			"observe":
+				return _observe_nodes(params)
+			"simulate":
+				if not await _acquire_exclusive_operation(peer, deadline_ms):
+					return _request_cancelled()
+				var simulation_result := await _simulate_physics(params, peer, deadline_ms)
+				_release_exclusive_operation()
+				return simulation_result
+			"project_3d":
+				return _project_3d(params)
+			"raycast_3d":
+				return _raycast_3d(params)
 			"input":
-				return await _inject_input(params)
+				if not await _acquire_exclusive_operation(peer, deadline_ms):
+					return _request_cancelled()
+				var input_result := await _inject_input(params, peer, deadline_ms)
+				_release_exclusive_operation()
+				return input_result
 			"input_sequence":
-				return await _inject_input_sequence(params)
+				if not await _acquire_exclusive_operation(peer, deadline_ms):
+					return _request_cancelled()
+				var sequence_result := await _inject_input_sequence(params, peer, deadline_ms)
+				_release_exclusive_operation()
+				return sequence_result
 			"assert":
 				return _assert_state(params)
 			"wait":
 				return await _wait_for_state(params)
 			"control":
-				return await _control_runtime(params)
+				if not await _acquire_exclusive_operation(peer, deadline_ms):
+					return _request_cancelled()
+				var control_result := await _control_runtime(params, peer, deadline_ms)
+				_release_exclusive_operation()
+				return control_result
 			_:
 				return _failure("RUNTIME_COMMAND_UNKNOWN", "Unknown runtime command: %s" % command)
 
@@ -238,6 +265,427 @@ class RuntimeBridge:
 		}
 
 
+	func _observe_nodes(params: Dictionary) -> Dictionary:
+		var raw_paths = params.get("nodePaths", [])
+		if typeof(raw_paths) != TYPE_ARRAY or raw_paths.is_empty() or raw_paths.size() > 32:
+			return _failure("RUNTIME_OBSERVE_PATHS_INVALID", "nodePaths must contain between 1 and 32 node paths.")
+		var extra_properties = params.get("properties", [])
+		if typeof(extra_properties) != TYPE_ARRAY or extra_properties.size() > 32:
+			return _failure("RUNTIME_OBSERVE_PROPERTIES_INVALID", "properties must be an array with at most 32 names.")
+		var nodes: Array[Dictionary] = []
+		for path_value in raw_paths:
+			var path := str(path_value)
+			var node := _node_at_path(path)
+			if node == null:
+				return _failure("RUNTIME_NODE_NOT_FOUND", "Node was not found in the running scene.", {"nodePath": path})
+			var described := _describe_observation(node, extra_properties)
+			if described.has("_error"):
+				return described
+			nodes.append(described)
+		return {"count": nodes.size(), "nodes": nodes}
+
+
+	func _describe_observation(node: Node, extra_properties: Array) -> Dictionary:
+		var state := {}
+		var common_properties := [
+			"position", "global_position", "rotation", "rotation_degrees", "scale",
+			"velocity", "linear_velocity", "angular_velocity", "visible",
+			"animation", "frame", "playing", "current_animation", "current_animation_position",
+		]
+		for property in common_properties:
+			if _has_property(node, property):
+				state[property] = _serialize(node.get(property))
+		for property_value in extra_properties:
+			var property := str(property_value)
+			if property.begins_with("meta:"):
+				var meta_name := property.trim_prefix("meta:")
+				if not node.has_meta(meta_name):
+					return _failure("RUNTIME_PROPERTY_NOT_FOUND", "Node metadata does not exist.", {"nodePath": str(node.get_path()), "property": property})
+				state[property] = _serialize(node.get_meta(meta_name))
+			elif not _has_property(node, property):
+				return _failure("RUNTIME_PROPERTY_NOT_FOUND", "Node property does not exist.", {"nodePath": str(node.get_path()), "property": property})
+			else:
+				state[property] = _serialize(node.get(property))
+		if node is CharacterBody2D:
+			var body_2d := node as CharacterBody2D
+			state["is_on_floor"] = body_2d.is_on_floor()
+			state["is_on_wall"] = body_2d.is_on_wall()
+			state["is_on_ceiling"] = body_2d.is_on_ceiling()
+		elif node is CharacterBody3D:
+			var body_3d := node as CharacterBody3D
+			state["is_on_floor"] = body_3d.is_on_floor()
+			state["is_on_wall"] = body_3d.is_on_wall()
+			state["is_on_ceiling"] = body_3d.is_on_ceiling()
+		var groups: Array[String] = []
+		for group_value in node.get_groups():
+			var group := str(group_value)
+			if not group.begins_with("_") and groups.size() < 100:
+				groups.append(group)
+		var metadata := {}
+		var meta_names: Array = node.get_meta_list()
+		for index in range(mini(meta_names.size(), 32)):
+			var meta_name := str(meta_names[index])
+			metadata[meta_name] = _serialize(node.get_meta(meta_names[index]))
+		return {
+			"path": str(node.get_path()),
+			"name": str(node.name),
+			"type": node.get_class(),
+			"scenePath": node.scene_file_path if not node.scene_file_path.is_empty() else null,
+			"groups": groups,
+			"metadata": metadata,
+			"state": state,
+		}
+
+
+	func _simulate_physics(params: Dictionary, peer: PeerState, deadline_ms: int) -> Dictionary:
+		var node_path := str(params.get("nodePath", ""))
+		var source_node := _node_at_path(node_path)
+		var source_scene := get_tree().current_scene
+		if source_node == null or source_scene == null or not (source_node == source_scene or source_scene.is_ancestor_of(source_node)):
+			return _failure("RUNTIME_SIMULATION_NODE_NOT_FOUND", "Simulation node must belong to the current scene.", {"nodePath": node_path})
+		var pending_nodes: Array[Node] = [source_scene]
+		var scene_node_count := 0
+		while not pending_nodes.is_empty():
+			var counted_node: Node = pending_nodes.pop_back()
+			scene_node_count += 1
+			if scene_node_count > 5000:
+				return _failure("RUNTIME_SIMULATION_SCENE_TOO_LARGE", "Isolated simulation is limited to scenes with at most 5000 nodes.", {"nodeCount": scene_node_count})
+			for counted_child in counted_node.get_children():
+				pending_nodes.append(counted_child)
+		var frames := int(params.get("frames", 1))
+		if frames < 1 or frames > 120:
+			return _failure("RUNTIME_SIMULATION_FRAMES_INVALID", "frames must be between 1 and 120.", {"frames": frames})
+		var raw_properties = params.get("properties", ["position", "global_position", "velocity"])
+		if typeof(raw_properties) != TYPE_ARRAY or raw_properties.is_empty() or raw_properties.size() > 32:
+			return _failure("RUNTIME_SIMULATION_PROPERTIES_INVALID", "properties must contain between 1 and 32 names.")
+		for property_value in raw_properties:
+			var property := str(property_value)
+			if property.begins_with("meta:"):
+				if not source_node.has_meta(property.trim_prefix("meta:")):
+					return _failure("RUNTIME_PROPERTY_NOT_FOUND", "Node metadata does not exist.", {"nodePath": node_path, "property": property})
+			elif not _has_property(source_node, property) and not _is_character_body_state(source_node, property):
+				return _failure("RUNTIME_PROPERTY_NOT_FOUND", "Node property does not exist.", {"nodePath": node_path, "property": property})
+		var action := str(params.get("action", ""))
+		if not action.is_empty() and not InputMap.has_action(action):
+			return _failure("RUNTIME_INPUT_ACTION_UNKNOWN", "InputMap action does not exist.", {"action": action})
+
+		var relative_path := source_scene.get_path_to(source_node)
+		var sandbox := SubViewport.new()
+		sandbox.name = "GodotAgentSimulation"
+		sandbox.own_world_3d = true
+		sandbox.process_mode = Node.PROCESS_MODE_ALWAYS
+		var clone := source_scene.duplicate()
+		if clone == null:
+			sandbox.free()
+			return _failure("RUNTIME_SIMULATION_DUPLICATE_FAILED", "Godot could not duplicate the current scene for isolated simulation.")
+		clone.name = source_scene.name
+		clone.process_mode = Node.PROCESS_MODE_ALWAYS
+		sandbox.add_child(clone)
+		get_tree().root.add_child(sandbox)
+		var simulated_node := clone if relative_path == NodePath(".") else clone.get_node_or_null(relative_path)
+		if simulated_node == null:
+			sandbox.queue_free()
+			return _failure("RUNTIME_SIMULATION_NODE_NOT_FOUND", "The duplicated scene did not contain the requested node.", {"nodePath": node_path})
+		if not _request_is_active(peer, deadline_ms):
+			sandbox.queue_free()
+			return _request_cancelled()
+
+		var tree := get_tree()
+		var was_paused := tree.paused
+		var live_process_modes := _disable_scene_processing(source_scene)
+		var live_physics_spaces := _suspend_live_physics(source_scene)
+		# The sandbox needs global physics ticks. The live scene is isolated by disabled
+		# process modes and inactive physics spaces instead of pausing SceneTree physics.
+		tree.paused = false
+		var before_physics_frames := Engine.get_physics_frames()
+		var samples: Array[Dictionary] = [{"frame": 0, "properties": _sample_properties(simulated_node, raw_properties)}]
+		var action_was_pressed := false
+		var action_previous_strength := 0.0
+		if not action.is_empty():
+			action_previous_strength = Input.get_action_raw_strength(action)
+			# Raw strength preserves simulated actions below the InputMap deadzone too.
+			action_was_pressed = Input.is_action_pressed(action) or action_previous_strength > 0.0
+			Input.action_press(action, clampf(float(params.get("strength", 1.0)), 0.0, 1.0))
+		for frame in range(1, frames + 1):
+			await tree.physics_frame
+			if not _request_is_active(peer, deadline_ms):
+				_restore_simulation_state(tree, was_paused, live_process_modes, live_physics_spaces, action, action_was_pressed, action_previous_strength)
+				sandbox.queue_free()
+				return _request_cancelled({"frame": frame})
+			if not is_instance_valid(simulated_node):
+				_restore_simulation_state(tree, was_paused, live_process_modes, live_physics_spaces, action, action_was_pressed, action_previous_strength)
+				sandbox.queue_free()
+				return _failure("RUNTIME_SIMULATION_NODE_FREED", "The simulated node was freed before sampling completed.", {"frame": frame})
+			samples.append({"frame": frame, "properties": _sample_properties(simulated_node, raw_properties)})
+		var advanced := Engine.get_physics_frames() - before_physics_frames
+		_restore_simulation_state(tree, was_paused, live_process_modes, live_physics_spaces, action, action_was_pressed, action_previous_strength)
+		var restored := tree.paused == was_paused
+		sandbox.queue_free()
+		return {
+			"nodePath": node_path,
+			"isolated": true,
+			"framesRequested": frames,
+			"physicsFramesAdvanced": advanced,
+			"pausedRestored": restored,
+			"action": action if not action.is_empty() else null,
+			"samples": samples,
+		}
+
+
+	func _sample_properties(node: Node, properties: Array) -> Dictionary:
+		var sampled := {}
+		for property_value in properties:
+			var property := str(property_value)
+			if property.begins_with("meta:"):
+				sampled[property] = _serialize(node.get_meta(property.trim_prefix("meta:"), null))
+			elif _is_character_body_state(node, property):
+				sampled[property] = _character_body_state(node, property)
+			else:
+				sampled[property] = _serialize(node.get(property))
+		return sampled
+
+
+	func _is_character_body_state(node: Node, property: String) -> bool:
+		return (node is CharacterBody2D or node is CharacterBody3D) and property in ["is_on_floor", "is_on_wall", "is_on_ceiling"]
+
+
+	func _character_body_state(node: Node, property: String) -> bool:
+		if node is CharacterBody2D:
+			var body_2d := node as CharacterBody2D
+			if property == "is_on_floor": return body_2d.is_on_floor()
+			if property == "is_on_wall": return body_2d.is_on_wall()
+			return body_2d.is_on_ceiling()
+		var body_3d := node as CharacterBody3D
+		if property == "is_on_floor": return body_3d.is_on_floor()
+		if property == "is_on_wall": return body_3d.is_on_wall()
+		return body_3d.is_on_ceiling()
+
+
+	func _disable_scene_processing(scene: Node) -> Array[Dictionary]:
+		var states: Array[Dictionary] = []
+		var pending: Array[Node] = [scene]
+		while not pending.is_empty():
+			var node: Node = pending.pop_back()
+			states.append({"node": node, "processMode": node.process_mode})
+			node.process_mode = Node.PROCESS_MODE_DISABLED
+			for child in node.get_children():
+				pending.append(child)
+		return states
+
+
+	func _restore_scene_processing(states: Array[Dictionary]) -> void:
+		for state in states:
+			var node: Node = state.node
+			if is_instance_valid(node):
+				node.process_mode = int(state.processMode)
+
+
+	func _suspend_live_physics(scene: Node) -> Array[Dictionary]:
+		var viewports: Array[Viewport] = [scene.get_viewport()]
+		var pending: Array[Node] = [scene]
+		while not pending.is_empty():
+			var node: Node = pending.pop_back()
+			if node is Viewport and node != viewports[0]:
+				viewports.append(node as Viewport)
+			for child in node.get_children():
+				pending.append(child)
+
+		var states: Array[Dictionary] = []
+		for viewport in viewports:
+			var world_2d := viewport.find_world_2d()
+			if world_2d != null:
+				_suspend_physics_space(states, world_2d.space, 2)
+			var world_3d := viewport.find_world_3d()
+			if world_3d != null:
+				_suspend_physics_space(states, world_3d.space, 3)
+		return states
+
+
+	func _suspend_physics_space(states: Array[Dictionary], space: RID, dimension: int) -> void:
+		if not space.is_valid():
+			return
+		for state in states:
+			if int(state.dimension) == dimension and state.space == space:
+				return
+		var active := PhysicsServer2D.space_is_active(space) if dimension == 2 else PhysicsServer3D.space_is_active(space)
+		states.append({"space": space, "dimension": dimension, "active": active})
+		if dimension == 2:
+			PhysicsServer2D.space_set_active(space, false)
+		else:
+			PhysicsServer3D.space_set_active(space, false)
+
+
+	func _restore_live_physics(states: Array[Dictionary]) -> void:
+		for state in states:
+			var space: RID = state.space
+			if not space.is_valid():
+				continue
+			if int(state.dimension) == 2:
+				PhysicsServer2D.space_set_active(space, bool(state.active))
+			else:
+				PhysicsServer3D.space_set_active(space, bool(state.active))
+
+
+	func _restore_simulation_state(tree: SceneTree, was_paused: bool, process_modes: Array[Dictionary], physics_spaces: Array[Dictionary], action: String, action_was_pressed: bool, action_previous_strength: float) -> void:
+		if not action.is_empty():
+			if action_was_pressed:
+				Input.action_press(action, action_previous_strength)
+			else:
+				Input.action_release(action)
+		tree.paused = was_paused
+		_restore_live_physics(physics_spaces)
+		_restore_scene_processing(process_modes)
+
+
+	func _project_3d(params: Dictionary) -> Dictionary:
+		var camera_result := _resolve_camera_3d(params)
+		if camera_result.has("_error"):
+			return camera_result
+		var camera: Camera3D = camera_result.camera
+		var node_path := str(params.get("nodePath", ""))
+		var world_position := Vector3.ZERO
+		if not node_path.is_empty():
+			var node := _node_at_path(node_path)
+			if not node is Node3D:
+				return _failure("RUNTIME_3D_NODE_INVALID", "nodePath must resolve to a Node3D.", {"nodePath": node_path})
+			world_position = (node as Node3D).global_position
+		else:
+			var decoded := _decode_vector3(params.get("worldPosition", null))
+			if decoded.has("_error"):
+				return decoded
+			world_position = decoded.value
+		var viewport_size := camera.get_viewport().get_visible_rect().size
+		if viewport_size.x <= 0 or viewport_size.y <= 0:
+			return _failure("RUNTIME_3D_VIEWPORT_EMPTY", "The active camera viewport has no visible area.")
+		var screen_position := camera.unproject_position(world_position)
+		var behind := camera.is_position_behind(world_position)
+		var local_position := camera.to_local(world_position)
+		return {
+			"cameraPath": str(camera.get_path()),
+			"nodePath": node_path if not node_path.is_empty() else null,
+			"worldPosition": _serialize(world_position),
+			"screenPosition": _serialize(screen_position),
+			"viewport": {"width": int(viewport_size.x), "height": int(viewport_size.y)},
+			"behind": behind,
+			"onScreen": not behind and screen_position.x >= 0.0 and screen_position.y >= 0.0 and screen_position.x < viewport_size.x and screen_position.y < viewport_size.y,
+			"depth": -local_position.z,
+			"distance": camera.global_position.distance_to(world_position),
+		}
+
+
+	func _raycast_3d(params: Dictionary) -> Dictionary:
+		var camera_result := _resolve_camera_3d(params)
+		if camera_result.has("_error"):
+			return camera_result
+		var camera: Camera3D = camera_result.camera
+		var screen_value = params.get("screenPosition", null)
+		if typeof(screen_value) != TYPE_DICTIONARY or screen_value.size() != 2 or not screen_value.has("x") or not screen_value.has("y"):
+			return _failure("RUNTIME_3D_SCREEN_POSITION_INVALID", "screenPosition must contain numeric x and y values.")
+		for coordinate in ["x", "y"]:
+			var coordinate_type := typeof(screen_value[coordinate])
+			if coordinate_type != TYPE_INT and coordinate_type != TYPE_FLOAT:
+				return _failure("RUNTIME_3D_SCREEN_POSITION_INVALID", "screenPosition values must be numbers.", {"coordinate": coordinate})
+		var screen_position := Vector2(float(screen_value.x), float(screen_value.y))
+		if not is_finite(screen_position.x) or not is_finite(screen_position.y):
+			return _failure("RUNTIME_3D_SCREEN_POSITION_INVALID", "screenPosition values must be finite numbers.")
+		var max_distance := float(params.get("maxDistance", 1000.0))
+		if not is_finite(max_distance) or max_distance <= 0.0 or max_distance > 100000.0:
+			return _failure("RUNTIME_3D_RAY_DISTANCE_INVALID", "maxDistance must be greater than 0 and at most 100000.", {"maxDistance": max_distance})
+		var collision_mask := int(params.get("collisionMask", 4294967295))
+		if collision_mask < 0:
+			return _failure("RUNTIME_3D_COLLISION_MASK_INVALID", "collisionMask must be non-negative.", {"collisionMask": collision_mask})
+		var ray_origin := camera.project_ray_origin(screen_position)
+		var ray_direction := camera.project_ray_normal(screen_position).normalized()
+		var query := PhysicsRayQueryParameters3D.create(ray_origin, ray_origin + ray_direction * max_distance, collision_mask)
+		query.collide_with_bodies = bool(params.get("collideWithBodies", true))
+		query.collide_with_areas = bool(params.get("collideWithAreas", false))
+		var hit := camera.get_world_3d().direct_space_state.intersect_ray(query)
+		var collider_data = null
+		if not hit.is_empty():
+			var collider = hit.get("collider")
+			collider_data = {
+				"path": str(collider.get_path()) if collider is Node else null,
+				"type": collider.get_class() if collider is Object else "unknown",
+			}
+		return {
+			"cameraPath": str(camera.get_path()),
+			"screenPosition": _serialize(screen_position),
+			"rayOrigin": _serialize(ray_origin),
+			"rayDirection": _serialize(ray_direction),
+			"maxDistance": max_distance,
+			"collisionMask": collision_mask,
+			"hit": not hit.is_empty(),
+			"collider": collider_data,
+			"position": _serialize(hit.position) if not hit.is_empty() else null,
+			"normal": _serialize(hit.normal) if not hit.is_empty() else null,
+			"shape": int(hit.get("shape", -1)) if not hit.is_empty() else null,
+			"faceIndex": int(hit.get("face_index", -1)) if not hit.is_empty() else null,
+		}
+
+
+	func _resolve_camera_3d(params: Dictionary) -> Dictionary:
+		var camera_path := str(params.get("cameraPath", ""))
+		var camera: Camera3D = null
+		if not camera_path.is_empty():
+			var node := _node_at_path(camera_path)
+			if not node is Camera3D:
+				return _failure("RUNTIME_3D_CAMERA_INVALID", "cameraPath must resolve to a Camera3D.", {"cameraPath": camera_path})
+			camera = node as Camera3D
+		else:
+			camera = get_viewport().get_camera_3d()
+		if camera == null or not camera.is_inside_tree():
+			return _failure("RUNTIME_3D_CAMERA_UNAVAILABLE", "No active Camera3D is available in the root viewport.")
+		return {"camera": camera}
+
+
+	func _decode_vector3(value: Variant) -> Dictionary:
+		if typeof(value) != TYPE_DICTIONARY or value.size() != 3 or not value.has("x") or not value.has("y") or not value.has("z"):
+			return _failure("RUNTIME_3D_WORLD_POSITION_INVALID", "worldPosition must contain numeric x, y, and z values.")
+		for coordinate in ["x", "y", "z"]:
+			var coordinate_type := typeof(value[coordinate])
+			if coordinate_type != TYPE_INT and coordinate_type != TYPE_FLOAT:
+				return _failure("RUNTIME_3D_WORLD_POSITION_INVALID", "worldPosition values must be numbers.", {"coordinate": coordinate})
+		var vector := Vector3(float(value.x), float(value.y), float(value.z))
+		if not vector.is_finite():
+			return _failure("RUNTIME_3D_WORLD_POSITION_INVALID", "worldPosition values must be finite numbers.")
+		return {"value": vector}
+
+
+	func _acquire_exclusive_operation(peer: PeerState, deadline_ms: int) -> bool:
+		while _exclusive_operation_active:
+			if not _request_is_active(peer, deadline_ms):
+				return false
+			await get_tree().process_frame
+		if not _request_is_active(peer, deadline_ms):
+			return false
+		_exclusive_operation_active = true
+		return true
+
+
+	func _release_exclusive_operation() -> void:
+		_exclusive_operation_active = false
+
+
+	func _request_is_active(peer: PeerState, deadline_ms: int) -> bool:
+		if Time.get_ticks_msec() >= deadline_ms or peer.stream == null:
+			return false
+		peer.stream.poll()
+		return peer.stream.get_status() == StreamPeerTCP.STATUS_CONNECTED
+
+
+	func _request_cancelled(details: Dictionary = {}) -> Dictionary:
+		return _failure("RUNTIME_REQUEST_CANCELLED", "The runtime request expired or its client disconnected before completion.", details)
+
+
+	func _wait_request_delay(milliseconds: int, peer: PeerState, deadline_ms: int) -> bool:
+		var delay_end_ms := Time.get_ticks_msec() + milliseconds
+		while Time.get_ticks_msec() < delay_end_ms:
+			if not _request_is_active(peer, deadline_ms):
+				return false
+			await get_tree().process_frame
+		return _request_is_active(peer, deadline_ms)
+
+
 	func _collect_controls(node: Node, selector: Dictionary, limit: int, elements: Array[Dictionary], budget: Array[int]) -> int:
 		if budget[0] <= 0:
 			return 0
@@ -304,7 +752,7 @@ class RuntimeBridge:
 		return ""
 
 
-	func _inject_input(params: Dictionary) -> Dictionary:
+	func _inject_input(params: Dictionary, peer: PeerState, deadline_ms: int) -> Dictionary:
 		var kind := str(params.get("kind", ""))
 		match kind:
 			"click":
@@ -341,10 +789,15 @@ class RuntimeBridge:
 				Input.action_press(action, clampf(float(params.get("strength", 1.0)), 0.0, 1.0))
 				var action_hold := clampi(int(params.get("holdMs", 0)), 0, 2000)
 				if action_hold > 0:
-					await get_tree().create_timer(float(action_hold) / 1000.0).timeout
+					var action_completed := await _wait_request_delay(action_hold, peer, deadline_ms)
+					Input.action_release(action)
+					if not action_completed:
+						return _request_cancelled()
 				else:
 					await get_tree().process_frame
-				Input.action_release(action)
+					Input.action_release(action)
+					if not _request_is_active(peer, deadline_ms):
+						return _request_cancelled()
 				await get_tree().process_frame
 				return {"delivered": true, "target": action}
 			"key":
@@ -358,7 +811,14 @@ class RuntimeBridge:
 				Input.parse_input_event(press)
 				var key_hold := clampi(int(params.get("holdMs", 0)), 0, 2000)
 				if key_hold > 0:
-					await get_tree().create_timer(float(key_hold) / 1000.0).timeout
+					var key_completed := await _wait_request_delay(key_hold, peer, deadline_ms)
+					if not key_completed:
+						var cancelled_release := InputEventKey.new()
+						cancelled_release.keycode = keycode
+						cancelled_release.physical_keycode = keycode
+						cancelled_release.pressed = false
+						Input.parse_input_event(cancelled_release)
+						return _request_cancelled()
 				else:
 					await get_tree().process_frame
 				var release := InputEventKey.new()
@@ -372,7 +832,7 @@ class RuntimeBridge:
 				return _failure("RUNTIME_INPUT_KIND_UNKNOWN", "Input kind must be click, action, or key.")
 
 
-	func _inject_input_sequence(params: Dictionary) -> Dictionary:
+	func _inject_input_sequence(params: Dictionary, peer: PeerState, deadline_ms: int) -> Dictionary:
 		if get_tree().paused:
 			return _failure("RUNTIME_INPUT_SEQUENCE_PAUSED", "Resume the SceneTree before injecting an input sequence.")
 		var raw_steps = params.get("steps", [])
@@ -396,14 +856,15 @@ class RuntimeBridge:
 		var started := Time.get_ticks_msec()
 		for index in range(raw_steps.size()):
 			var step: Dictionary = raw_steps[index]
-			var result := await _inject_input(step)
+			var result := await _inject_input(step, peer, deadline_ms)
 			if result.has("_error"):
 				return _failure("RUNTIME_INPUT_SEQUENCE_STEP_FAILED", "An input sequence step failed.", {"index": index, "completed": results.size(), "cause": result._error})
 			result["kind"] = str(step.get("kind", ""))
 			results.append(result)
 			var after_ms := int(step.get("afterMs", 0))
 			if after_ms > 0:
-				await get_tree().create_timer(float(after_ms) / 1000.0).timeout
+				if not await _wait_request_delay(after_ms, peer, deadline_ms):
+					return _request_cancelled({"completed": results.size()})
 		return {
 			"delivered": true,
 			"completed": results.size(),
@@ -484,7 +945,7 @@ class RuntimeBridge:
 		return _failure("RUNTIME_WAIT_ABORTED", "Runtime wait ended unexpectedly.")
 
 
-	func _control_runtime(params: Dictionary) -> Dictionary:
+	func _control_runtime(params: Dictionary, peer: PeerState, deadline_ms: int) -> Dictionary:
 		var action := str(params.get("action", ""))
 		var tree := get_tree()
 		var started := Time.get_ticks_msec()
@@ -508,6 +969,9 @@ class RuntimeBridge:
 				# before pausing the tree again.
 				for _frame in range(requested_frames + 1):
 					await tree.process_frame
+					if not _request_is_active(peer, deadline_ms):
+						tree.paused = true
+						return _request_cancelled({"framesCompleted": _frame})
 				tree.paused = true
 			"step_physics":
 				if not tree.paused:
@@ -518,6 +982,9 @@ class RuntimeBridge:
 				tree.paused = false
 				for _frame in range(requested_frames + 1):
 					await tree.physics_frame
+					if not _request_is_active(peer, deadline_ms):
+						tree.paused = true
+						return _request_cancelled({"framesCompleted": _frame})
 				tree.paused = true
 			_:
 				return _failure("RUNTIME_CONTROL_ACTION_UNKNOWN", "Control action must be pause, resume, step, or step_physics.")
@@ -622,8 +1089,23 @@ class RuntimeBridge:
 
 	func _send(peer: PeerState, response: Dictionary) -> void:
 		var bytes := (JSON.stringify(response) + "\n").to_utf8_buffer()
-		if bytes.size() <= MAX_MESSAGE_BYTES and peer.stream != null:
-			peer.stream.put_data(bytes)
+		if peer.stream == null:
+			return
+		peer.stream.poll()
+		if peer.stream.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+			return
+		if bytes.size() > MAX_MESSAGE_BYTES:
+			var request_id := str(response.get("id", ""))
+			bytes = (JSON.stringify({
+				"id": request_id,
+				"ok": false,
+				"error": {
+					"code": "RUNTIME_RESPONSE_TOO_LARGE",
+					"message": "Runtime bridge response exceeded 1 MiB.",
+					"details": {"bytes": bytes.size(), "maxBytes": MAX_MESSAGE_BYTES},
+				},
+			}) + "\n").to_utf8_buffer()
+		peer.stream.put_data(bytes)
 
 
 	func _exit_tree() -> void:

@@ -2,9 +2,15 @@
 
 Godot Agent Runtime 是面向外部编码 Agent 的本地 Godot 4.x 自动化与自验证层。首个可重复闭环现已可用：安全修改项目文本、静态检查、受管启动/停止、运行时截图、UI 发现、输入注入，以及带 expected/actual/evidence 的结构化交互断言。所有能力通过 stdio MCP 暴露，也提供可组合 CLI。
 
-实时 `EditorPlugin` 已提供安装、受管启动、场景树和属性读取、节点增删改与移动、PackedScene 实例化与 Editable Children、Resource 子属性读写及内置/外部保存、文件系统选择与资源聚焦、信号连接、原生 Undo/Redo、场景保存和 2D 视口截图。Runtime Bridge 通过 Godot `--script` 临时主循环启动，支持有界运行时场景树和节点属性观察，且不改写目标项目的 `project.godot`、退出后不残留 autoload。
+实时 `EditorPlugin` 已提供安装、受管启动、场景树和属性读取、节点增删改与移动、PackedScene 实例化与 Editable Children、真实场景继承、Resource 子属性读写及内置/外部保存、文件系统选择与资源聚焦、信号连接、原生 Undo/Redo、场景保存，以及带活动相机元数据的 2D/3D 编辑器视口截图。Runtime Bridge 通过 Godot `--script` 临时主循环启动，支持有界运行时场景树、节点属性与游戏状态批量观察、Camera3D 世界坐标投影和屏幕物理射线，并可在私有 2D/3D World 中复制场景、注入动作和逐物理帧采样；它不改写目标项目的 `project.godot`，退出后不残留 autoload。
 
 首个里程碑可通过 `pnpm run benchmark:milestone-1` 一键验收。脚本使用临时项目，通过 EditorPlugin 修改并保存 UI，再启动 Runtime Bridge 完成截图、UI 发现、点击、等待和结构化断言；证据包写入被 Git 忽略的 `artifacts/milestone-1/<时间戳>/`。
+
+里程碑 2 可通过 `pnpm run benchmark:milestone-2` 一键验收。脚本创建并运行真实继承场景，批量读取位置、速度、碰撞状态、分组和元数据，在隔离物理 World 中验证 Player 预测移动且不改变真实位置，再注入真实输入完成移动与结构化断言；证据包写入 `artifacts/milestone-2/<时间戳>/`。
+
+里程碑 3 可通过 `pnpm run benchmark:milestone-3` 一键验收。脚本经 EditorPlugin 修改并保存 Node3D 变换、捕获真实 3D 编辑器视口和相机，再启动 CharacterBody3D 场景，通过世界坐标投影、屏幕射线选中、私有 World3D 仿真、真实输入、碰撞状态和前后截图完成完整 3D 自动化闭环；证据包写入 `artifacts/milestone-3/<时间戳>/`。
+
+里程碑 4 的客户端适配验收命令为 `pnpm run benchmark:milestone-4`。它幂等生成 Codex 与 DeepSeek Harness 配置，通过生成的 stdio 命令完成 MCP 握手、工具 Schema 和结构化调用检查，并在隔离的临时 DSH Home 中合成和启动 Headless Profile；报告写入 `artifacts/milestone-4/<时间戳>/`。真实模型闭环任务与报告 Schema 位于 `tests/agent-benchmarks/deepseek-harness/`，需要用户自行配置的 DSH 模型凭据。
 
 ## 开发
 
@@ -41,6 +47,10 @@ node packages/cli/dist/bin.js runtime-control examples/control-ui <RUN_ID> pause
 node packages/cli/dist/bin.js runtime-control examples/control-ui <RUN_ID> step --frames 2
 node packages/cli/dist/bin.js runtime-control examples/control-ui <RUN_ID> step_physics --frames 2
 node packages/cli/dist/bin.js runtime-control examples/control-ui <RUN_ID> resume
+node packages/cli/dist/bin.js runtime-observe examples/physics-2d <RUN_ID> --nodes '["/root/Main/Player"]' --properties '["meta:distance"]'
+node packages/cli/dist/bin.js runtime-simulate examples/physics-2d <RUN_ID> --node /root/Main/Player --frames 20 --properties '["position","velocity","meta:distance"]' --action ui_right
+node packages/cli/dist/bin.js runtime-3d-project examples/physics-3d <RUN_ID> --node /root/Main/Player
+node packages/cli/dist/bin.js runtime-3d-raycast examples/physics-3d <RUN_ID> --x 226 --y 180
 node packages/cli/dist/bin.js input-sequence examples/control-ui <RUN_ID> --steps '[{"kind":"click","path":"/root/Main/StartButton","afterMs":20},{"kind":"key","keycode":65,"holdMs":10}]'
 node packages/cli/dist/bin.js screenshot examples/control-ui <RUN_ID>
 ```
@@ -59,10 +69,10 @@ stdio 的标准输出只承载 MCP JSON-RPC；服务端诊断写入标准错误�
 
 ```powershell
 node packages/cli/dist/bin.js configure codex
-node packages/cli/dist/bin.js configure claude-code
+node packages/cli/dist/bin.js configure deepseek-harness
 ```
 
-Codex 配置写入项目级 `.codex/config.toml` 的受管区段；Claude Code 配置合并到 `.mcp.json`，不会删除其他 MCP Server。
+Codex 配置写入项目级 `.codex/config.toml` 的受管区段；DeepSeek Harness 配置写入 `.dsh/godot-agent-runtime.patch.yml`，通过标准 MCP Client 将工具暴露为 `mcp__godot__godot_*`。DSH 的本机启动方式见 [适配说明](adapters/deepseek-harness/README.md)，两端共用的闭环步骤见 [任务配方](adapters/agent-recipes.md)。已有 Claude Code 配置生成目标暂时保留向后兼容，但不属于当前里程碑的安装和验收范围。
 
 安装并验证 EditorPlugin：
 
@@ -74,6 +84,7 @@ node packages/cli/dist/bin.js editor-node-create examples/control-ui <RUN_ID> --
 node packages/cli/dist/bin.js editor-node-update examples/control-ui <RUN_ID> --node /root/Main/AgentButton --properties '{"position":{"$type":"Vector2","x":32,"y":288}}'
 node packages/cli/dist/bin.js editor-node-move examples/control-ui <RUN_ID> --node /root/Main/AgentButton --parent /root/Main/Panel
 node packages/cli/dist/bin.js editor-scene-instantiate examples/control-ui <RUN_ID> --parent /root/Main --scene res://badge.tscn --name AgentBadge
+node packages/cli/dist/bin.js editor-scene-inherit examples/physics-2d <RUN_ID> --source res://main.tscn --target res://variants/player_test.tscn --root-name PlayerTest --root-properties '{"scenario_name":"player-test"}'
 node packages/cli/dist/bin.js editor-resource-create examples/control-ui <RUN_ID> --node /root/Main/Panel/AgentButton --property theme_override_styles/normal --type StyleBoxFlat --properties '{"bg_color":{"$type":"Color","r":0.1,"g":0.35,"b":0.8,"a":1}}'
 node packages/cli/dist/bin.js editor-resource-save examples/control-ui <RUN_ID> --node /root/Main/Panel/AgentButton --property theme_override_styles/normal --path res://agent_button_style.tres
 node packages/cli/dist/bin.js editor-resource-focus examples/control-ui <RUN_ID> --path res://agent_button_style.tres
@@ -82,6 +93,7 @@ node packages/cli/dist/bin.js editor-signal-connect examples/control-ui <RUN_ID>
 node packages/cli/dist/bin.js editor-undo examples/control-ui <RUN_ID>
 node packages/cli/dist/bin.js editor-redo examples/control-ui <RUN_ID>
 node packages/cli/dist/bin.js editor-save examples/control-ui <RUN_ID>
+node packages/cli/dist/bin.js editor-screenshot examples/physics-3d <RUN_ID> --viewport 3d --viewport-index 0
 node packages/cli/dist/bin.js stop examples/control-ui <RUN_ID>
 ```
 
@@ -93,7 +105,10 @@ node packages/cli/dist/bin.js stop examples/control-ui <RUN_ID>
 pnpm run typecheck
 pnpm run test
 pnpm run benchmark:milestone-1
+pnpm run benchmark:milestone-2
+pnpm run benchmark:milestone-3
+pnpm run benchmark:milestone-4
 pnpm run benchmark:runtime
 ```
 
-存在 `config/development.local.json` 时，测试会真实启动配置的 Godot，覆盖 headless 导入、受管进程、Runtime Bridge 场景树/节点观察、组合输入、等待、暂停和 process/physics 帧推进闭环，以及 EditorPlugin 节点编辑/移动、场景实例及 Editable Children、Resource 子属性与内置/外部保存、选择聚焦、原生撤销/重做、信号连接、保存和截图。安全边界见 [docs/security.md](docs/security.md)。示例项目独立采用 MIT License，核心代码采用 AGPL-3.0-or-later。
+存在 `config/development.local.json` 时，测试会真实启动配置的 Godot，覆盖 headless 导入、受管进程、Runtime Bridge 场景树/节点观察、2D/3D 物理仿真、Camera3D 投影与射线、组合输入、等待、暂停和 process/physics 帧推进闭环，以及 EditorPlugin 节点编辑/移动、场景实例及 Editable Children、Resource 子属性与内置/外部保存、选择聚焦、原生撤销/重做、信号连接、保存和 2D/3D 视口截图。安全边界见 [docs/security.md](docs/security.md)。示例项目独立采用 MIT License，核心代码采用 AGPL-3.0-or-later。

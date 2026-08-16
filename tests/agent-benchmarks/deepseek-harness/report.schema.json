@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Godot Agent Runtime cross-agent benchmark report",
+  "type": "object",
+  "required": ["client", "ok", "toolCalls", "durationMs", "assertion", "screenshots", "cleanup"],
+  "properties": {
+    "client": { "enum": ["codex", "deepseek-harness"] },
+    "ok": { "type": "boolean" },
+    "toolCalls": { "type": "integer", "minimum": 1 },
+    "durationMs": { "type": "integer", "minimum": 0 },
+    "assertion": {
+      "type": "object",
+      "required": ["passed", "nodePath", "property", "expected", "actual"],
+      "properties": {
+        "passed": { "type": "boolean" },
+        "nodePath": { "type": "string" },
+        "property": { "type": "string" },
+        "expected": {},
+        "actual": {}
+      },
+      "additionalProperties": true
+    },
+    "screenshots": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": { "type": "string" },
+          "sha256": { "type": "string", "minLength": 64, "maxLength": 64 }
+        },
+        "additionalProperties": true
+      }
+    },
+    "cleanup": { "type": "boolean" },
+    "error": { "type": ["object", "null"] }
+  },
+  "additionalProperties": true
+}

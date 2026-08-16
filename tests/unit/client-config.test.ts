@@ -48,4 +48,30 @@ describe("client configuration", () => {
     expect(value.mcpServers.existing).toBeDefined();
     expect(value.mcpServers["godot-agent-runtime"]).toBeDefined();
   });
+
+  it("creates an idempotent DeepSeek Harness Cordis overlay", async () => {
+    const projectPath = await temporaryRoot();
+    const serverPath = resolve(projectPath, "server.js");
+    await writeFile(serverPath, "", "utf8");
+    const first = await configureClient({
+      target: "deepseek-harness",
+      projectPath,
+      serverPath,
+    });
+    const second = await configureClient({
+      target: "deepseek-harness",
+      projectPath,
+      serverPath,
+    });
+    const content = await readFile(first.path, "utf8");
+
+    expect(first.operation).toBe("created");
+    expect(second.operation).toBe("unchanged");
+    expect(first.path).toBe(resolve(projectPath, ".dsh", "godot-agent-runtime.patch.yml"));
+    expect(content).toContain("name: '@deepseek-ai/dsh-mcp-client'");
+    expect(content).toContain("serverName: godot");
+    expect(content).toContain(JSON.stringify(serverPath));
+    expect(content).toContain(JSON.stringify(projectPath));
+    expect(content).toContain("failOnStartupError: true");
+  });
 });

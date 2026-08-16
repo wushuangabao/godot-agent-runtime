@@ -1,7 +1,7 @@
 @tool
 extends Node
 
-const PROTOCOL_VERSION := "0.1.0"
+const PROTOCOL_VERSION := "0.3.0"
 const MAX_MESSAGE_BYTES := 1024 * 1024
 
 var _editor: EditorInterface
@@ -88,7 +88,7 @@ func _handle(peer: Dictionary, line: String) -> void:
 				"protocolVersion": PROTOCOL_VERSION,
 				"engineVersion": Engine.get_version_info().get("string", "unknown"),
 				"scene": root.scene_file_path if root != null else null,
-				"capabilities": ["scene_tree", "selection", "screenshot", "node_edit", "scene_instantiate", "instance_editable", "resource_edit", "resource_save", "resource_focus", "signal_connect", "scene_save", "undo_redo"],
+				"capabilities": ["scene_tree", "selection", "screenshot", "viewport_3d", "node_edit", "scene_instantiate", "scene_inheritance", "instance_editable", "resource_edit", "resource_save", "resource_focus", "signal_connect", "scene_save", "undo_redo"],
 			})
 		"scene_tree":
 			var root := _editor.get_edited_scene_root()
@@ -102,13 +102,15 @@ func _handle(peer: Dictionary, line: String) -> void:
 		"selection_set":
 			_send_ok(peer, request_id, _selection_set(params))
 		"screenshot":
-			_send_ok(peer, request_id, await _screenshot())
+			_send_ok(peer, request_id, await _screenshot(params))
 		"node_get":
 			_send_ok(peer, request_id, _node_get(params))
 		"node_create":
 			_send_ok(peer, request_id, _node_create(params))
 		"scene_instantiate":
 			_send_ok(peer, request_id, _scene_instantiate(params))
+		"scene_create_inherited":
+			_send_ok(peer, request_id, await _scene_create_inherited(params))
 		"node_update":
 			_send_ok(peer, request_id, _node_update(params))
 		"node_delete":
@@ -273,6 +275,97 @@ func _scene_instantiate(params: Dictionary) -> Dictionary:
 		"changedProperties": prepared.names,
 		"undoable": true,
 	}
+
+
+func _scene_create_inherited(params: Dictionary) -> Dictionary:
+	var checked_source := _validated_res_path(str(params.get("sourceScenePath", "")), ["tscn"])
+	if checked_source.has("_error"):
+		return checked_source
+	var checked_target := _validated_res_path(str(params.get("targetScenePath", "")), ["tscn"])
+	if checked_target.has("_error"):
+		return checked_target
+	var source_path: String = checked_source.path
+	var target_path: String = checked_target.path
+	if source_path == target_path:
+		return _failure("EDITOR_INHERITED_SCENE_PATH_CONFLICT", "The inherited scene target must differ from its source.", {"path": source_path})
+	if not FileAccess.file_exists(source_path):
+		return _failure("EDITOR_SCENE_RESOURCE_NOT_FOUND", "Inherited scene source was not found.", {"sourceScenePath": source_path})
+	var overwrite := bool(params.get("overwrite", false))
+	var target_exists := FileAccess.file_exists(target_path)
+	if target_exists and not overwrite:
+		return _failure("EDITOR_INHERITED_SCENE_EXISTS", "Inherited scene target already exists and overwrite is false.", {"targetScenePath": target_path})
+	var source = load(source_path)
+	if not source is PackedScene or not (source as PackedScene).can_instantiate():
+		return _failure("EDITOR_PACKED_SCENE_INVALID", "The inherited scene source is not an instantiable PackedScene.", {"sourceScenePath": source_path})
+
+	var previous_root := _editor.get_edited_scene_root()
+	var previous_scene := previous_root.scene_file_path if previous_root != null else ""
+	if previous_root != null and previous_scene.is_empty():
+		return _failure("EDITOR_CURRENT_SCENE_UNSAVED", "Save or close the current untitled scene before creating an inherited scene.")
+	# This is the same standard API path used by Scene > New Inherited Scene.
+	# It attaches the internal SceneState that is intentionally not exposed as a
+	# public Node method, then save_scene_as serializes the true base-scene link.
+	_editor.open_scene_from_path(source_path, true)
+	var inherited_root := _editor.get_edited_scene_root()
+	if inherited_root == null or not inherited_root.scene_file_path.is_empty():
+		await _restore_or_close_edited_scene(previous_scene)
+		return _failure("EDITOR_INHERITED_SCENE_INSTANTIATE_FAILED", "Godot could not open a new inherited scene from the source.", {"sourceScenePath": source_path})
+
+	var requested_name = params.get("rootName", null)
+	if requested_name != null:
+		var name_error := _validate_node_name(str(requested_name))
+		if not name_error.is_empty():
+			await _restore_or_close_edited_scene(previous_scene)
+			return _failure("EDITOR_NODE_NAME_INVALID", name_error, {"name": str(requested_name)})
+		inherited_root.name = str(requested_name)
+	var prepared := _prepare_properties(inherited_root, params.get("rootProperties", {}))
+	if prepared.has("_error"):
+		await _restore_or_close_edited_scene(previous_scene)
+		return prepared
+	for change in prepared.changes:
+		inherited_root.set(change.property, change.value)
+	var root_name := str(inherited_root.name)
+
+	var directory_error := DirAccess.make_dir_recursive_absolute(str(checked_target.absolutePath).get_base_dir())
+	if directory_error != OK:
+		await _restore_or_close_edited_scene(previous_scene)
+		return _failure("EDITOR_INHERITED_SCENE_DIRECTORY_FAILED", "Godot could not create the inherited scene target directory.", {"targetScenePath": target_path, "error": directory_error})
+	_editor.save_scene_as(target_path, false)
+	if inherited_root.scene_file_path != target_path or not FileAccess.file_exists(target_path):
+		await _restore_or_close_edited_scene(previous_scene)
+		return _failure("EDITOR_INHERITED_SCENE_SAVE_FAILED", "Godot could not save the inherited scene.", {"targetScenePath": target_path})
+	_editor.get_resource_filesystem().scan()
+	var requested_open := bool(params.get("open", false))
+	if not requested_open:
+		await _restore_or_close_edited_scene(previous_scene)
+	var active_root := _editor.get_edited_scene_root()
+	var open_scene := active_root != null and active_root.scene_file_path == target_path
+	return {
+		"created": true,
+		"sourceScene": source_path,
+		"targetScene": target_path,
+		"rootName": root_name,
+		"opened": open_scene,
+		"overwritten": target_exists,
+		"undoable": false,
+	}
+
+
+func _restore_or_close_edited_scene(scene_path: String) -> void:
+	if scene_path.is_empty():
+		_editor.close_scene()
+	else:
+		await _restore_edited_scene(scene_path)
+
+
+func _restore_edited_scene(scene_path: String) -> bool:
+	_editor.open_scene_from_path(scene_path)
+	for _frame in range(120):
+		await get_tree().process_frame
+		var restored_root := _editor.get_edited_scene_root()
+		if restored_root != null and restored_root.scene_file_path == scene_path:
+			return true
+	return false
 
 
 func _node_update(params: Dictionary) -> Dictionary:
@@ -1061,21 +1154,64 @@ func _failure(code: String, message: String, details: Dictionary = {}) -> Dictio
 	return {"_error": {"code": code, "message": message, "details": details}}
 
 
-func _screenshot() -> Dictionary:
-	await get_tree().process_frame
-	var viewport := _editor.get_editor_viewport_2d()
+func _screenshot(params: Dictionary) -> Dictionary:
+	var viewport_kind := str(params.get("viewport", "2d"))
+	if viewport_kind not in ["2d", "3d"]:
+		return _failure("EDITOR_SCREENSHOT_VIEWPORT_INVALID", "viewport must be 2d or 3d.", {"viewport": viewport_kind})
+	var viewport_index := int(params.get("viewportIndex", 0))
+	if viewport_index < 0 or viewport_index > 3:
+		return _failure("EDITOR_SCREENSHOT_VIEWPORT_INDEX_INVALID", "viewportIndex must be between 0 and 3.", {"viewportIndex": viewport_index})
+	_editor.set_main_screen_editor("3D" if viewport_kind == "3d" else "2D")
+	for _frame in range(3):
+		await get_tree().process_frame
+	RenderingServer.force_draw(false, 0.0)
+	var viewport := _editor.get_editor_viewport_3d(viewport_index) if viewport_kind == "3d" else _editor.get_editor_viewport_2d()
+	if viewport == null:
+		return _failure("EDITOR_SCREENSHOT_VIEWPORT_UNAVAILABLE", "The requested editor viewport is unavailable.", {"viewport": viewport_kind, "viewportIndex": viewport_index})
 	var image := viewport.get_texture().get_image()
 	if image == null or image.is_empty():
-		return {"_error": {"code": "EDITOR_SCREENSHOT_EMPTY", "message": "The 2D editor viewport did not produce an image."}}
+		return _failure("EDITOR_SCREENSHOT_EMPTY", "The requested editor viewport did not produce an image.", {"viewport": viewport_kind, "viewportIndex": viewport_index})
 	var directory := ProjectSettings.globalize_path("res://.godot/agent-runtime/evidence/%s" % _run_id)
 	var mkdir_error := DirAccess.make_dir_recursive_absolute(directory)
 	if mkdir_error != OK:
 		return {"_error": {"code": "EDITOR_SCREENSHOT_DIRECTORY_FAILED", "message": "Could not create evidence directory."}}
-	var path := directory.path_join("editor-%d.png" % Time.get_ticks_msec())
+	var suffix := "%s-%d" % [viewport_kind, viewport_index] if viewport_kind == "3d" else "2d"
+	var path := directory.path_join("editor-%s-%d.png" % [suffix, Time.get_ticks_msec()])
 	var error := image.save_png(path)
 	if error != OK:
 		return {"_error": {"code": "EDITOR_SCREENSHOT_SAVE_FAILED", "message": "Could not save editor screenshot."}}
-	return {"path": path.replace("\\", "/"), "width": image.get_width(), "height": image.get_height()}
+	var camera_data = null
+	if viewport_kind == "3d":
+		var camera := viewport.get_camera_3d()
+		if camera == null:
+			return _failure("EDITOR_SCREENSHOT_CAMERA_UNAVAILABLE", "The requested 3D editor viewport has no active camera.", {"viewportIndex": viewport_index})
+		var projection_name := "perspective"
+		match camera.projection:
+			Camera3D.PROJECTION_ORTHOGONAL:
+				projection_name = "orthogonal"
+			Camera3D.PROJECTION_FRUSTUM:
+				projection_name = "frustum"
+		camera_data = {
+			"projection": projection_name,
+			"position": _plain_vector3(camera.global_position),
+			"rotationDegrees": _plain_vector3(camera.global_rotation_degrees),
+			"fov": camera.fov,
+			"size": camera.size,
+			"near": camera.near,
+			"far": camera.far,
+		}
+	return {
+		"path": path.replace("\\", "/"),
+		"width": image.get_width(),
+		"height": image.get_height(),
+		"viewport": viewport_kind,
+		"viewportIndex": viewport_index if viewport_kind == "3d" else null,
+		"camera": camera_data,
+	}
+
+
+func _plain_vector3(value: Vector3) -> Dictionary:
+	return {"x": value.x, "y": value.y, "z": value.z}
 
 
 func _send_ok(peer: Dictionary, request_id: String, result: Dictionary) -> void:
@@ -1087,8 +1223,18 @@ func _send_ok(peer: Dictionary, request_id: String, result: Dictionary) -> void:
 
 func _send(peer: Dictionary, response: Dictionary) -> void:
 	var bytes := (JSON.stringify(response) + "\n").to_utf8_buffer()
-	if bytes.size() <= MAX_MESSAGE_BYTES:
-		(peer.stream as StreamPeerTCP).put_data(bytes)
+	if bytes.size() > MAX_MESSAGE_BYTES:
+		var request_id := str(response.get("id", ""))
+		bytes = (JSON.stringify({
+			"id": request_id,
+			"ok": false,
+			"error": {
+				"code": "EDITOR_RESPONSE_TOO_LARGE",
+				"message": "Editor bridge response exceeded 1 MiB.",
+				"details": {"bytes": bytes.size(), "maxBytes": MAX_MESSAGE_BYTES},
+			},
+		}) + "\n").to_utf8_buffer()
+	(peer.stream as StreamPeerTCP).put_data(bytes)
 
 
 func _exit_tree() -> void:

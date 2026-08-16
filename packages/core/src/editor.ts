@@ -1,6 +1,11 @@
+import { createHash } from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
+import { relative, resolve, sep } from "node:path";
+
 import type {
   EditorBridgeInfo,
   EditorHistoryResult,
+  EditorInheritedSceneResult,
   EditorInstanceMutationResult,
   EditorInstanceResult,
   EditorMutationResult,
@@ -11,6 +16,7 @@ import type {
   EditorResourceSaveResult,
   EditorSceneSaveResult,
   EditorSceneTreeResult,
+  EditorScreenshotResult,
   EditorSelectionResult,
   EditorSignalConnectionResult,
   GodotLaunchResult,
@@ -39,8 +45,10 @@ const EDITOR_CAPABILITIES = [
   "scene_tree",
   "selection",
   "screenshot",
+  "viewport_3d",
   "node_edit",
   "scene_instantiate",
+  "scene_inheritance",
   "instance_editable",
   "resource_edit",
   "resource_save",
@@ -205,6 +213,15 @@ export interface EditorSceneInstantiateOptions extends RuntimeLookupOptions {
   readonly properties?: Readonly<Record<string, unknown>>;
 }
 
+export interface EditorSceneInheritanceOptions extends RuntimeLookupOptions {
+  readonly sourceScenePath: string;
+  readonly targetScenePath: string;
+  readonly rootName?: string;
+  readonly rootProperties?: Readonly<Record<string, unknown>>;
+  readonly open?: boolean;
+  readonly overwrite?: boolean;
+}
+
 export interface EditorNodeUpdateOptions extends RuntimeLookupOptions {
   readonly nodePath: string;
   readonly name?: string;
@@ -273,6 +290,11 @@ export interface EditorSignalConnectOptions extends RuntimeLookupOptions {
   readonly flags?: number;
 }
 
+export interface EditorScreenshotOptions extends RuntimeLookupOptions {
+  readonly viewport?: "2d" | "3d";
+  readonly viewportIndex?: number;
+}
+
 export async function getEditorNode(
   options: EditorNodeLookupOptions,
 ): Promise<EditorNodeResult> {
@@ -305,6 +327,56 @@ export async function instantiateEditorScene(
     properties: options.properties ?? {},
   });
   return { ok: true, runId: options.runId, ...result } as EditorMutationResult;
+}
+
+export async function createInheritedEditorScene(
+  options: EditorSceneInheritanceOptions,
+): Promise<EditorInheritedSceneResult> {
+  const result = await sendBridgeCommand(options, "scene_create_inherited", {
+    sourceScenePath: options.sourceScenePath,
+    targetScenePath: options.targetScenePath,
+    ...(options.rootName === undefined ? {} : { rootName: options.rootName }),
+    rootProperties: options.rootProperties ?? {},
+    open: options.open ?? false,
+    overwrite: options.overwrite ?? false,
+  });
+  const targetScene = String(result.targetScene ?? "");
+  if (!targetScene.startsWith("res://")) {
+    const status = await getManagedRunStatus(options);
+    throw new RuntimeFailure({
+      code: "EDITOR_INHERITED_SCENE_PATH_INVALID",
+      stage: "protocol",
+      message: "Editor bridge returned an invalid inherited scene path.",
+      details: { targetScene, result, stderr: status.stderr, diagnostics: status.diagnostics },
+      recovery: ["Reinstall the matching Godot Agent Runtime addon and retry."],
+    });
+  }
+  const projectRoot = resolve(options.projectPath);
+  const targetPath = resolve(projectRoot, targetScene.slice("res://".length));
+  const offset = relative(projectRoot, targetPath);
+  if (offset === ".." || offset.startsWith(`..${sep}`) || resolve(offset) === offset) {
+    throw new RuntimeFailure({
+      code: "EDITOR_INHERITED_SCENE_PATH_INVALID",
+      stage: "validation",
+      message: "Inherited scene target escaped the project directory.",
+      details: { targetScene, projectRoot },
+      recovery: ["Use a normalized .tscn path below res://."],
+    });
+  }
+  const [content, information] = await Promise.all([readFile(targetPath), stat(targetPath)]);
+  return {
+    ok: true,
+    runId: options.runId,
+    created: true,
+    sourceScene: String(result.sourceScene),
+    targetScene,
+    rootName: String(result.rootName),
+    opened: Boolean(result.opened),
+    overwritten: Boolean(result.overwritten),
+    bytes: information.size,
+    sha256: createHash("sha256").update(content).digest("hex"),
+    undoable: false,
+  };
 }
 
 export async function updateEditorNode(
@@ -468,4 +540,44 @@ export async function redoEditorAction(
 ): Promise<EditorHistoryResult> {
   const result = await sendBridgeCommand(options, "history_redo");
   return { ok: true, runId: options.runId, ...result } as EditorHistoryResult;
+}
+
+export async function captureEditorScreenshot(
+  options: EditorScreenshotOptions,
+): Promise<EditorScreenshotResult> {
+  const result = await sendBridgeCommand(options, "screenshot", {
+    viewport: options.viewport ?? "2d",
+    viewportIndex: options.viewportIndex ?? 0,
+  });
+  const path = resolve(String(result.path ?? ""));
+  const evidenceRoot = resolve(
+    options.projectPath,
+    ".godot",
+    "agent-runtime",
+    "evidence",
+    options.runId,
+  );
+  const offset = relative(evidenceRoot, path);
+  if (offset === ".." || offset.startsWith(`..${sep}`) || resolve(offset) === offset) {
+    throw new RuntimeFailure({
+      code: "EDITOR_EVIDENCE_PATH_INVALID",
+      stage: "validation",
+      message: "Editor bridge returned a screenshot path outside its evidence directory.",
+      details: { path, evidenceRoot },
+      recovery: ["Stop this editor run and launch a fresh bridge session."],
+    });
+  }
+  const [buffer, information] = await Promise.all([readFile(path), stat(path)]);
+  return {
+    ok: true,
+    runId: options.runId,
+    path,
+    width: Number(result.width),
+    height: Number(result.height),
+    bytes: information.size,
+    sha256: createHash("sha256").update(buffer).digest("hex"),
+    viewport: result.viewport as "2d" | "3d",
+    viewportIndex: result.viewportIndex === null ? null : Number(result.viewportIndex),
+    camera: result.camera as EditorScreenshotResult["camera"],
+  };
 }

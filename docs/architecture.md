@@ -3,7 +3,7 @@
 外部编码 Agent 通过 MCP 调用本项目；本项目再控制标准 Godot 4.x 编辑器与可选运行时桥。
 
 ```text
-Codex / Claude Code / Cursor / DeepSeek Harness / 其他 AI Coding 工具
+Codex / DeepSeek Harness / 其他标准 MCP 客户端
                     │
                     │ stdio 或 Streamable HTTP
                     ▼
@@ -23,7 +23,7 @@ Codex / Claude Code / Cursor / DeepSeek Harness / 其他 AI Coding 工具
                     │
                     ▼
           可选的临时 Runtime Bridge
-          ├─ 游戏截图
+          ├─ 游戏截图与 3D 空间查询
           ├─ 输入注入
           ├─ 运行时场景树/状态读取
           └─ 测试探针与确定性推进
@@ -34,7 +34,7 @@ Codex / Claude Code / Cursor / DeepSeek Harness / 其他 AI Coding 工具
 - EditorPlugin 由 `godot_addon_install` 复制到目标项目并显式加入 `editor_plugins/enabled`。只有受管编辑器进程携带端口、令牌和 runId 环境变量时才监听；普通编辑器启动不会开放端口。
 - Runtime Bridge 不注册 autoload，也不修改项目配置。受管场景使用 Godot `--script addons/godot_agent_runtime/runtime_entry.gd` 的仓库源文件作为临时 `SceneTree` 主循环，再加载目标场景。
 - 两个桥都只监听 `127.0.0.1`，每次运行使用 256 位随机令牌，采用单请求单响应的换行分隔 JSON。请求和响应均限制为 1 MiB；首次握手严格协商协议版本并采用桥接端实际能力列表。
-- 桥接没有任意 GDScript/JavaScript 执行命令。命令集合固定为编辑态与运行态结构读取、受校验的节点/属性/Resource 子属性/PackedScene 实例及 Editable Children/信号编辑、原生 Undo/Redo、保存、截图、受限单次/组合输入、结构化断言、有界等待和暂停后有限 process/physics 帧推进。
+- 桥接没有任意 GDScript/JavaScript 执行命令。命令集合固定为编辑态与运行态结构读取、受校验的节点/属性/Resource 子属性/PackedScene 实例、场景继承及 Editable Children/信号编辑、原生 Undo/Redo、保存、2D/3D 编辑器与游戏截图、Camera3D 世界坐标投影和屏幕物理射线、游戏状态批量观察、受限单次/组合输入、结构化断言、有界等待、暂停后有限 process/physics 帧推进，以及私有 2D/3D World 中的有界场景副本物理采样。
 - 截图证据只写入项目 `.godot/agent-runtime/evidence/<runId>/`；MCP 层再次验证返回路径没有逃逸该目录。
 
 ## 技术栈
@@ -62,9 +62,8 @@ godot-agent-runtime/
 │  └─ godot_agent_runtime/
 ├─ adapters/
 │  ├─ codex/
-│  ├─ claude-code/
 │  ├─ deepseek-harness/
-│  └─ shared-skills/
+│  └─ agent-recipes.md
 ├─ examples/
 │  ├─ minimal-2d/
 │  ├─ minimal-3d/
@@ -74,7 +73,6 @@ godot-agent-runtime/
 │  ├─ integration/
 │  └─ agent-benchmarks/
 │     ├─ codex/
-│     ├─ claude-code/
 │     └─ deepseek-harness/
 └─ docs/
    ├─ architecture.md

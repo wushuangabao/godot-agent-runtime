@@ -1,6 +1,6 @@
 import * as z from "zod/v4";
 
-export const PROTOCOL_VERSION = "0.1.0";
+export const PROTOCOL_VERSION = "0.3.0";
 
 export const ErrorStageSchema = z.enum([
   "configuration",
@@ -183,7 +183,7 @@ export const RuntimeBridgeInfoSchema = z.object({
   protocolVersion: z.literal(PROTOCOL_VERSION),
   engineVersion: z.string().min(1),
   scene: z.string().nullable(),
-  capabilities: z.array(z.enum(["screenshot", "ui", "scene_tree", "node", "input", "input_sequence", "assert", "wait", "control"])),
+  capabilities: z.array(z.enum(["screenshot", "ui", "scene_tree", "node", "observe", "simulate", "spatial_3d", "input", "input_sequence", "assert", "wait", "control"])),
 });
 
 export type RuntimeBridgeInfo = z.infer<typeof RuntimeBridgeInfoSchema>;
@@ -260,6 +260,94 @@ export const RuntimeNodeResultSchema = z.object({
 });
 
 export type RuntimeNodeResult = z.infer<typeof RuntimeNodeResultSchema>;
+
+export const RuntimeObservationNodeSchema = z.object({
+  path: z.string().min(1),
+  name: z.string(),
+  type: z.string().min(1),
+  scenePath: z.string().nullable(),
+  groups: z.array(z.string()).max(100),
+  metadata: z.record(z.string(), z.unknown()),
+  state: z.record(z.string(), z.unknown()),
+});
+
+export const RuntimeObservationResultSchema = z.object({
+  ok: z.literal(true),
+  runId: z.uuid(),
+  count: z.number().int().nonnegative().max(32),
+  nodes: z.array(RuntimeObservationNodeSchema).max(32),
+});
+
+export type RuntimeObservationResult = z.infer<typeof RuntimeObservationResultSchema>;
+
+export const Vector2ValueSchema = z.object({
+  x: z.number(),
+  y: z.number(),
+});
+
+export const Vector3ValueSchema = Vector2ValueSchema.extend({
+  z: z.number(),
+});
+
+export const RuntimeProjection3DResultSchema = z.object({
+  ok: z.literal(true),
+  runId: z.uuid(),
+  cameraPath: z.string().min(1),
+  nodePath: z.string().min(1).nullable(),
+  worldPosition: Vector3ValueSchema,
+  screenPosition: Vector2ValueSchema,
+  viewport: z.object({
+    width: z.number().int().positive(),
+    height: z.number().int().positive(),
+  }),
+  behind: z.boolean(),
+  onScreen: z.boolean(),
+  depth: z.number(),
+  distance: z.number().nonnegative(),
+});
+
+export type RuntimeProjection3DResult = z.infer<typeof RuntimeProjection3DResultSchema>;
+
+export const RuntimeRaycast3DResultSchema = z.object({
+  ok: z.literal(true),
+  runId: z.uuid(),
+  cameraPath: z.string().min(1),
+  screenPosition: Vector2ValueSchema,
+  rayOrigin: Vector3ValueSchema,
+  rayDirection: Vector3ValueSchema,
+  maxDistance: z.number().positive(),
+  collisionMask: z.number().int().nonnegative(),
+  hit: z.boolean(),
+  collider: z.object({
+    path: z.string().min(1).nullable(),
+    type: z.string().min(1),
+  }).nullable(),
+  position: Vector3ValueSchema.nullable(),
+  normal: Vector3ValueSchema.nullable(),
+  shape: z.number().int().nullable(),
+  faceIndex: z.number().int().nullable(),
+});
+
+export type RuntimeRaycast3DResult = z.infer<typeof RuntimeRaycast3DResultSchema>;
+
+export const RuntimeSimulationSampleSchema = z.object({
+  frame: z.number().int().nonnegative().max(120),
+  properties: z.record(z.string(), z.unknown()),
+});
+
+export const RuntimeSimulationResultSchema = z.object({
+  ok: z.literal(true),
+  runId: z.uuid(),
+  nodePath: z.string().min(1),
+  isolated: z.literal(true),
+  framesRequested: z.number().int().min(1).max(120),
+  physicsFramesAdvanced: z.number().int().nonnegative(),
+  pausedRestored: z.boolean(),
+  action: z.string().nullable(),
+  samples: z.array(RuntimeSimulationSampleSchema).min(2).max(121),
+});
+
+export type RuntimeSimulationResult = z.infer<typeof RuntimeSimulationResultSchema>;
 
 export const RuntimeScreenshotResultSchema = z.object({
   ok: z.literal(true),
@@ -356,6 +444,8 @@ export const EditorBridgeInfoSchema = z.object({
       "screenshot",
       "node_edit",
       "scene_instantiate",
+      "scene_inheritance",
+      "viewport_3d",
       "instance_editable",
       "resource_edit",
       "resource_save",
@@ -368,6 +458,24 @@ export const EditorBridgeInfoSchema = z.object({
 });
 
 export type EditorBridgeInfo = z.infer<typeof EditorBridgeInfoSchema>;
+
+export const EditorCamera3DSchema = z.object({
+  projection: z.enum(["perspective", "orthogonal", "frustum"]),
+  position: Vector3ValueSchema,
+  rotationDegrees: Vector3ValueSchema,
+  fov: z.number(),
+  size: z.number(),
+  near: z.number().positive(),
+  far: z.number().positive(),
+});
+
+export const EditorScreenshotResultSchema = RuntimeScreenshotResultSchema.extend({
+  viewport: z.enum(["2d", "3d"]),
+  viewportIndex: z.number().int().min(0).max(3).nullable(),
+  camera: EditorCamera3DSchema.nullable(),
+});
+
+export type EditorScreenshotResult = z.infer<typeof EditorScreenshotResultSchema>;
 
 export interface EditorSceneNode {
   readonly path: string;
@@ -430,6 +538,22 @@ export const EditorMutationResultSchema = z.object({
 });
 
 export type EditorMutationResult = z.infer<typeof EditorMutationResultSchema>;
+
+export const EditorInheritedSceneResultSchema = z.object({
+  ok: z.literal(true),
+  runId: z.uuid(),
+  created: z.literal(true),
+  sourceScene: z.string().startsWith("res://").endsWith(".tscn"),
+  targetScene: z.string().startsWith("res://").endsWith(".tscn"),
+  rootName: z.string().min(1),
+  opened: z.boolean(),
+  overwritten: z.boolean(),
+  bytes: z.number().int().positive(),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  undoable: z.literal(false),
+});
+
+export type EditorInheritedSceneResult = z.infer<typeof EditorInheritedSceneResultSchema>;
 
 export const EditorSignalConnectionResultSchema = z.object({
   ok: z.literal(true),

@@ -11,7 +11,11 @@ import {
   type RuntimeInputResult,
   type RuntimeInputSequenceResult,
   type RuntimeNodeResult,
+  type RuntimeObservationResult,
+  type RuntimeProjection3DResult,
+  type RuntimeRaycast3DResult,
   type RuntimeSceneTreeResult,
+  type RuntimeSimulationResult,
   type RuntimeScreenshotResult,
   type RuntimeUiResult,
   type RuntimeWaitResult,
@@ -26,6 +30,9 @@ const RUNTIME_CAPABILITIES = [
   "ui",
   "scene_tree",
   "node",
+  "observe",
+  "simulate",
+  "spatial_3d",
   "input",
   "input_sequence",
   "assert",
@@ -108,6 +115,34 @@ export interface RuntimeSceneTreeOptions extends RuntimeLookupOptions {
 export interface RuntimeNodeLookupOptions extends RuntimeLookupOptions {
   readonly nodePath: string;
   readonly properties?: readonly string[];
+}
+
+export interface RuntimeObservationOptions extends RuntimeLookupOptions {
+  readonly nodePaths: readonly string[];
+  readonly properties?: readonly string[];
+}
+
+export interface RuntimeSimulationOptions extends RuntimeLookupOptions {
+  readonly nodePath: string;
+  readonly frames?: number;
+  readonly properties?: readonly string[];
+  readonly action?: string;
+  readonly strength?: number;
+}
+
+export interface RuntimeProjection3DOptions extends RuntimeLookupOptions {
+  readonly cameraPath?: string;
+  readonly nodePath?: string;
+  readonly worldPosition?: { readonly x: number; readonly y: number; readonly z: number };
+}
+
+export interface RuntimeRaycast3DOptions extends RuntimeLookupOptions {
+  readonly cameraPath?: string;
+  readonly screenPosition: { readonly x: number; readonly y: number };
+  readonly maxDistance?: number;
+  readonly collisionMask?: number;
+  readonly collideWithBodies?: boolean;
+  readonly collideWithAreas?: boolean;
 }
 
 export type RuntimeInputOptions = RuntimeLookupOptions &
@@ -217,8 +252,8 @@ export async function sendBridgeCommand(
 ): Promise<Record<string, unknown>> {
   const connection = await getManagedRunConnection(options);
   const id = randomUUID();
-  const request = `${JSON.stringify({ id, token: connection.token, command, params })}\n`;
   const timeoutMs = options.timeoutMs ?? 5_000;
+  const request = `${JSON.stringify({ id, token: connection.token, command, params, timeoutMs })}\n`;
 
   const response = await new Promise<BridgeEnvelope>((resolveResponse, reject) => {
     const socket = createConnection({ host: "127.0.0.1", port: connection.runtimeBridgePort });
@@ -404,6 +439,70 @@ export async function getRuntimeNode(
     runId: options.runId,
     node: result.node as RuntimeNodeResult["node"],
   };
+}
+
+export async function observeRuntime(
+  options: RuntimeObservationOptions,
+): Promise<RuntimeObservationResult> {
+  const result = await sendBridgeCommand(options, "observe", {
+    nodePaths: options.nodePaths,
+    properties: options.properties ?? [],
+  });
+  const nodes = Array.isArray(result.nodes) ? result.nodes : [];
+  return {
+    ok: true,
+    runId: options.runId,
+    count: Number(result.count ?? nodes.length),
+    nodes: nodes as RuntimeObservationResult["nodes"],
+  };
+}
+
+export async function simulateRuntimePhysics(
+  options: RuntimeSimulationOptions,
+): Promise<RuntimeSimulationResult> {
+  const result = await sendBridgeCommand(options, "simulate", {
+    nodePath: options.nodePath,
+    frames: options.frames ?? 1,
+    properties: options.properties ?? ["position", "global_position", "velocity"],
+    ...(options.action === undefined ? {} : { action: options.action }),
+    ...(options.strength === undefined ? {} : { strength: options.strength }),
+  });
+  return {
+    ok: true,
+    runId: options.runId,
+    nodePath: String(result.nodePath),
+    isolated: true,
+    framesRequested: Number(result.framesRequested),
+    physicsFramesAdvanced: Number(result.physicsFramesAdvanced),
+    pausedRestored: Boolean(result.pausedRestored),
+    action: typeof result.action === "string" ? result.action : null,
+    samples: (Array.isArray(result.samples) ? result.samples : []) as RuntimeSimulationResult["samples"],
+  };
+}
+
+export async function projectRuntime3D(
+  options: RuntimeProjection3DOptions,
+): Promise<RuntimeProjection3DResult> {
+  const result = await sendBridgeCommand(options, "project_3d", {
+    ...(options.cameraPath === undefined ? {} : { cameraPath: options.cameraPath }),
+    ...(options.nodePath === undefined ? {} : { nodePath: options.nodePath }),
+    ...(options.worldPosition === undefined ? {} : { worldPosition: options.worldPosition }),
+  });
+  return { ok: true, runId: options.runId, ...result } as RuntimeProjection3DResult;
+}
+
+export async function raycastRuntime3D(
+  options: RuntimeRaycast3DOptions,
+): Promise<RuntimeRaycast3DResult> {
+  const result = await sendBridgeCommand(options, "raycast_3d", {
+    screenPosition: options.screenPosition,
+    ...(options.cameraPath === undefined ? {} : { cameraPath: options.cameraPath }),
+    ...(options.maxDistance === undefined ? {} : { maxDistance: options.maxDistance }),
+    ...(options.collisionMask === undefined ? {} : { collisionMask: options.collisionMask }),
+    ...(options.collideWithBodies === undefined ? {} : { collideWithBodies: options.collideWithBodies }),
+    ...(options.collideWithAreas === undefined ? {} : { collideWithAreas: options.collideWithAreas }),
+  });
+  return { ok: true, runId: options.runId, ...result } as RuntimeRaycast3DResult;
 }
 
 export async function captureRuntimeScreenshot(

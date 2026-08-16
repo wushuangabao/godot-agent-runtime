@@ -7,9 +7,11 @@ import * as z from "zod/v4";
 import {
   checkProject,
   assertRuntime,
+  captureEditorScreenshot,
   captureRuntimeScreenshot,
   controlRuntime,
   connectEditorSignal,
+  createInheritedEditorScene,
   createEditorNode,
   createEditorResource,
   deleteEditorNode,
@@ -25,6 +27,9 @@ import {
   getManagedRunStatus,
   getRuntimeInfo,
   getRuntimeNode,
+  observeRuntime,
+  projectRuntime3D,
+  raycastRuntime3D,
   getRuntimeSceneTree,
   inspectProject,
   injectRuntimeInput,
@@ -41,6 +46,7 @@ import {
   stopManagedRun,
   saveEditorScene,
   saveEditorResource,
+  simulateRuntimePhysics,
   setEditorSelection,
   setEditorInstanceEditable,
   toRuntimeError,
@@ -56,6 +62,7 @@ import {
   AddonInstallResultSchema,
   EditorBridgeInfoSchema,
   EditorHistoryResultSchema,
+  EditorInheritedSceneResultSchema,
   EditorInstanceMutationResultSchema,
   EditorInstanceResultSchema,
   EditorMutationResultSchema,
@@ -66,6 +73,7 @@ import {
   EditorResourceSaveResultSchema,
   EditorSceneSaveResultSchema,
   EditorSceneTreeResultSchema,
+  EditorScreenshotResultSchema,
   EditorSelectionResultSchema,
   EditorSignalConnectionResultSchema,
   GodotLaunchResultSchema,
@@ -79,8 +87,12 @@ import {
   RuntimeInputResultSchema,
   RuntimeInputSequenceResultSchema,
   RuntimeNodeResultSchema,
+  RuntimeObservationResultSchema,
+  RuntimeProjection3DResultSchema,
+  RuntimeRaycast3DResultSchema,
   RuntimeSceneTreeResultSchema,
   RuntimeScreenshotResultSchema,
+  RuntimeSimulationResultSchema,
   RuntimeUiResultSchema,
   RuntimeWaitResultSchema,
   SafeFileReadResultSchema,
@@ -155,6 +167,39 @@ const RuntimeSceneTreeInputSchema = RuntimeLookupInputSchema.extend({
 const RuntimeNodeLookupInputSchema = RuntimeLookupInputSchema.extend({
   nodePath: z.string().min(1),
   properties: z.array(z.string().min(1)).max(100).default([]),
+});
+
+const RuntimeObserveInputSchema = RuntimeLookupInputSchema.extend({
+  nodePaths: z.array(z.string().min(1)).min(1).max(32),
+  properties: z.array(z.string().min(1)).max(32).default([]),
+});
+
+const RuntimeSimulationInputSchema = RuntimeLookupInputSchema.extend({
+  nodePath: z.string().min(1),
+  frames: z.number().int().min(1).max(120).default(1),
+  properties: z.array(z.string().min(1)).min(1).max(32)
+    .default(["position", "global_position", "velocity"]),
+  action: z.string().min(1).optional(),
+  strength: z.number().min(0).max(1).optional(),
+});
+
+const RuntimeProjection3DInputSchema = RuntimeLookupInputSchema.extend({
+  cameraPath: z.string().min(1).optional(),
+  nodePath: z.string().min(1).optional(),
+  worldPosition: z.object({ x: z.number(), y: z.number(), z: z.number() }).optional(),
+}).superRefine((value, context) => {
+  if ((value.nodePath === undefined) === (value.worldPosition === undefined)) {
+    context.addIssue({ code: "custom", message: "provide exactly one of nodePath or worldPosition" });
+  }
+});
+
+const RuntimeRaycast3DInputSchema = RuntimeLookupInputSchema.extend({
+  cameraPath: z.string().min(1).optional(),
+  screenPosition: z.object({ x: z.number(), y: z.number() }),
+  maxDistance: z.number().positive().max(100_000).default(1_000),
+  collisionMask: z.number().int().min(0).max(4_294_967_295).default(4_294_967_295),
+  collideWithBodies: z.boolean().default(true),
+  collideWithAreas: z.boolean().default(false),
 });
 
 const RuntimeInputSchema = RuntimeLookupInputSchema.extend({
@@ -284,6 +329,15 @@ const EditorSceneInstantiateInputSchema = RuntimeLookupInputSchema.extend({
   properties: EditorPropertiesSchema.default({}),
 });
 
+const EditorSceneInheritanceInputSchema = RuntimeLookupInputSchema.extend({
+  sourceScenePath: z.string().startsWith("res://").endsWith(".tscn"),
+  targetScenePath: z.string().startsWith("res://").endsWith(".tscn"),
+  rootName: z.string().min(1).optional(),
+  rootProperties: EditorPropertiesSchema.default({}),
+  open: z.boolean().default(false),
+  overwrite: z.boolean().default(false),
+});
+
 const EditorNodeUpdateInputSchema = RuntimeLookupInputSchema.extend({
   nodePath: z.string().min(1),
   name: z.string().min(1).optional(),
@@ -351,6 +405,11 @@ const EditorSelectionSetInputSchema = RuntimeLookupInputSchema.extend({
   focus: z.boolean().default(true),
 });
 
+const EditorScreenshotInputSchema = RuntimeLookupInputSchema.extend({
+  viewport: z.enum(["2d", "3d"]).default("2d"),
+  viewportIndex: z.number().int().min(0).max(3).default(0),
+});
+
 const EditorSignalConnectInputSchema = RuntimeLookupInputSchema.extend({
   sourcePath: z.string().min(1),
   signal: z.string().min(1),
@@ -411,7 +470,7 @@ export function createMcpServer(): McpServer {
     { name: "godot-agent-runtime", version: "0.1.0" },
     {
       instructions:
-        "Call godot_doctor before project operations. Use godot_project_check after file changes. Use godot_scene_run for bounded headless verification; use godot_scene_launch followed by godot_run_status and godot_run_stop for a visible interactive window.",
+        "Start with godot_doctor. After mutations, save and call godot_project_check. For interactive verification, launch the scene, observe structured state, capture screenshots only as visual evidence, inject bounded input, wait and assert the expected state, then always call godot_run_stop. Do not claim success from a screenshot alone.",
     },
   );
 
@@ -734,6 +793,98 @@ export function createMcpServer(): McpServer {
           runId,
           nodePath,
           properties,
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "godot_runtime_observe",
+    {
+      title: "Observe gameplay-focused runtime state",
+      description: "Returns bounded multi-node snapshots with transforms, velocity, animation, collision state, groups, metadata, and requested extra properties.",
+      inputSchema: RuntimeObserveInputSchema,
+      outputSchema: RuntimeObservationResultSchema,
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ projectPath, runId, timeoutMs, nodePaths, properties }) =>
+      await handle(async () =>
+        await observeRuntime({
+          projectPath,
+          runId,
+          nodePaths,
+          properties,
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "godot_runtime_simulate_physics",
+    {
+      title: "Simulate physics in an isolated world",
+      description: "Duplicates the current scene into private 2D/3D worlds, advances 1-120 physics frames with optional InputMap action, samples one node, and restores the live tree pause state.",
+      inputSchema: RuntimeSimulationInputSchema,
+      outputSchema: RuntimeSimulationResultSchema,
+      annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ projectPath, runId, timeoutMs, nodePath, frames, properties, action, strength }) =>
+      await handle(async () =>
+        await simulateRuntimePhysics({
+          projectPath,
+          runId,
+          nodePath,
+          frames,
+          properties,
+          ...(action === undefined ? {} : { action }),
+          ...(strength === undefined ? {} : { strength }),
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "godot_runtime_3d_project",
+    {
+      title: "Project a 3D point into the game viewport",
+      description: "Uses an active or explicitly selected Camera3D to map a Node3D or world position to screenshot pixel coordinates, including visibility and depth.",
+      inputSchema: RuntimeProjection3DInputSchema,
+      outputSchema: RuntimeProjection3DResultSchema,
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ projectPath, runId, timeoutMs, cameraPath, nodePath, worldPosition }) =>
+      await handle(async () =>
+        await projectRuntime3D({
+          projectPath,
+          runId,
+          ...(cameraPath === undefined ? {} : { cameraPath }),
+          ...(nodePath === undefined ? {} : { nodePath }),
+          ...(worldPosition === undefined ? {} : { worldPosition }),
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "godot_runtime_3d_raycast",
+    {
+      title: "Raycast from a game viewport pixel",
+      description: "Projects a screenshot pixel through Camera3D and performs a bounded physics ray query, returning the hit collider path, position, and normal.",
+      inputSchema: RuntimeRaycast3DInputSchema,
+      outputSchema: RuntimeRaycast3DResultSchema,
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ projectPath, runId, timeoutMs, cameraPath, screenPosition, maxDistance, collisionMask, collideWithBodies, collideWithAreas }) =>
+      await handle(async () =>
+        await raycastRuntime3D({
+          projectPath,
+          runId,
+          screenPosition,
+          maxDistance,
+          collisionMask,
+          collideWithBodies,
+          collideWithAreas,
+          ...(cameraPath === undefined ? {} : { cameraPath }),
           ...(timeoutMs === undefined ? {} : { timeoutMs }),
         }),
       ),
@@ -1086,6 +1237,31 @@ export function createMcpServer(): McpServer {
   );
 
   server.registerTool(
+    "godot_editor_scene_create_inherited",
+    {
+      title: "Create an inherited PackedScene",
+      description: "Uses Godot PackedScene and SceneState APIs to create a project-local inherited .tscn with optional root overrides; target file creation is not Undo/Redo-backed.",
+      inputSchema: EditorSceneInheritanceInputSchema,
+      outputSchema: EditorInheritedSceneResultSchema,
+      annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ projectPath, runId, timeoutMs, sourceScenePath, targetScenePath, rootName, rootProperties, open, overwrite }) =>
+      await handle(async () =>
+        await createInheritedEditorScene({
+          projectPath,
+          runId,
+          sourceScenePath,
+          targetScenePath,
+          rootProperties,
+          open,
+          overwrite,
+          ...(rootName === undefined ? {} : { rootName }),
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        }),
+      ),
+  );
+
+  server.registerTool(
     "godot_editor_instance_get",
     {
       title: "Read PackedScene instance editability",
@@ -1385,15 +1561,21 @@ export function createMcpServer(): McpServer {
   server.registerTool(
     "godot_editor_screenshot",
     {
-      title: "Capture the editor 2D viewport",
-      description: "Captures the managed editor's 2D viewport into the run-specific evidence directory.",
-      inputSchema: RuntimeLookupInputSchema,
-      outputSchema: RuntimeScreenshotResultSchema,
+      title: "Capture an editor 2D or 3D viewport",
+      description: "Captures the managed editor's 2D viewport or one of four 3D viewports and returns active 3D editor camera metadata with the PNG evidence.",
+      inputSchema: EditorScreenshotInputSchema,
+      outputSchema: EditorScreenshotResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs }) =>
+    async ({ projectPath, runId, timeoutMs, viewport, viewportIndex }) =>
       await handle(async () =>
-        await captureRuntimeScreenshot({ projectPath, runId, ...(timeoutMs === undefined ? {} : { timeoutMs }) }),
+        await captureEditorScreenshot({
+          projectPath,
+          runId,
+          viewport,
+          viewportIndex,
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        }),
       ),
   );
 

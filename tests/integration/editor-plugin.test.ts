@@ -6,8 +6,9 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
-  captureRuntimeScreenshot,
+  captureEditorScreenshot,
   connectEditorSignal,
+  createInheritedEditorScene,
   createEditorNode,
   createEditorResource,
   deleteEditorNode,
@@ -57,13 +58,15 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         editorRunId = launch.runId;
 
         const info = await getEditorInfo({ projectPath, runId: editorRunId });
-        expect(info.protocolVersion).toBe("0.1.0");
+        expect(info.protocolVersion).toBe("0.3.0");
         expect(info.capabilities).toEqual([
           "scene_tree",
           "selection",
           "screenshot",
+          "viewport_3d",
           "node_edit",
           "scene_instantiate",
+          "scene_inheritance",
           "instance_editable",
           "resource_edit",
           "resource_save",
@@ -72,6 +75,30 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           "scene_save",
           "undo_redo",
         ]);
+
+        const inheritedScene = await createInheritedEditorScene({
+          projectPath,
+          runId: editorRunId,
+          sourceScenePath: "res://main.tscn",
+          targetScenePath: "res://variants/inherited_main.tscn",
+          rootName: "InheritedMain",
+          rootProperties: { tooltip_text: "Milestone 2 inherited scene" },
+        });
+        expect(inheritedScene).toMatchObject({
+          created: true,
+          sourceScene: "res://main.tscn",
+          targetScene: "res://variants/inherited_main.tscn",
+          rootName: "InheritedMain",
+          overwritten: false,
+          undoable: false,
+        });
+        expect(inheritedScene.bytes).toBeGreaterThan(0);
+        await expect(createInheritedEditorScene({
+          projectPath,
+          runId: editorRunId,
+          sourceScenePath: "res://main.tscn",
+          targetScenePath: "res://variants/inherited_main.tscn",
+        })).rejects.toMatchObject({ payload: { code: "EDITOR_INHERITED_SCENE_EXISTS" } });
 
         const tree = await getEditorSceneTree({ projectPath, runId: editorRunId });
         expect(tree.root).toMatchObject({ name: "Main", type: "Control" });
@@ -449,10 +476,11 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         const saved = await saveEditorScene({ projectPath, runId: editorRunId });
         expect(saved).toMatchObject({ saved: true, scene: "res://main.tscn" });
 
-        const editorScreenshot = await captureRuntimeScreenshot({
+        const editorScreenshot = await captureEditorScreenshot({
           projectPath,
           runId: editorRunId,
         });
+        expect(editorScreenshot).toMatchObject({ viewport: "2d", viewportIndex: null, camera: null });
         expect(existsSync(editorScreenshot.path)).toBe(true);
         await stopManagedRun({ projectPath, runId: editorRunId, timeoutMs: 15_000 });
         editorRunId = null;
@@ -466,7 +494,17 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         expect(sceneSource).toContain('signal="pressed"');
         expect(await readFile(resolve(projectPath, "agent_button_style.tres"), "utf8")).toContain("StyleBoxFlat");
 
-        const runtime = await launchProject({ projectPath, configPath, timeoutMs: 20_000 });
+        const inheritedSource = await readFile(resolve(projectPath, "variants", "inherited_main.tscn"), "utf8");
+        expect(inheritedSource).toContain("main.tscn");
+        expect(inheritedSource).toContain("instance=ExtResource");
+        expect(inheritedSource).toContain('tooltip_text = "Milestone 2 inherited scene"');
+
+        const runtime = await launchProject({
+          projectPath,
+          configPath,
+          scene: "res://variants/inherited_main.tscn",
+          timeoutMs: 20_000,
+        });
         runtimeRunId = runtime.runId;
         expect((await findRuntimeUi({
           projectPath,
@@ -489,7 +527,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           projectPath,
           runId: runtimeRunId,
           kind: "property",
-          nodePath: "/root/Main",
+          nodePath: "/root/InheritedMain",
           property: "meta:started",
           expected: true,
         });
@@ -505,5 +543,69 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
       }
     },
     90_000,
+  );
+
+  it(
+    "captures a selected 3D editor viewport and active editor camera",
+    async () => {
+      const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-editor-3d-"));
+      await cp(resolve("examples", "physics-3d"), projectPath, {
+        recursive: true,
+        filter: (source) => !source.includes(`${resolve("examples", "physics-3d", ".godot")}`),
+      });
+      let runId: string | null = null;
+      try {
+        await installGodotAddon(projectPath);
+        const launch = await launchEditor({ projectPath, configPath, timeoutMs: 30_000 });
+        runId = launch.runId;
+        const screenshot = await captureEditorScreenshot({
+          projectPath,
+          runId,
+          viewport: "3d",
+          viewportIndex: 0,
+        });
+        expect(existsSync(screenshot.path)).toBe(true);
+        expect(screenshot).toMatchObject({
+          viewport: "3d",
+          viewportIndex: 0,
+          camera: { projection: "perspective" },
+        });
+        expect(screenshot.width).toBeGreaterThan(0);
+        expect(screenshot.height).toBeGreaterThan(0);
+      } finally {
+        if (runId !== null) await stopManagedRun({ projectPath, runId, timeoutMs: 15_000 });
+        await rm(projectPath, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "closes a generated inherited scene when the editor started without an open scene",
+    async () => {
+      const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-editor-empty-"));
+      await cp(resolve("tests", "fixtures", "editor-no-scene"), projectPath, { recursive: true });
+      let runId: string | null = null;
+      try {
+        await installGodotAddon(projectPath);
+        const launch = await launchEditor({ projectPath, configPath, timeoutMs: 30_000 });
+        runId = launch.runId;
+        expect((await getEditorSceneTree({ projectPath, runId })).root).toBeNull();
+
+        const inherited = await createInheritedEditorScene({
+          projectPath,
+          runId,
+          sourceScenePath: "res://base.tscn",
+          targetScenePath: "res://generated.tscn",
+          open: false,
+        });
+        expect(inherited.opened).toBe(false);
+        expect((await getEditorSceneTree({ projectPath, runId })).root).toBeNull();
+      } finally {
+        if (runId !== null) await stopManagedRun({ projectPath, runId, timeoutMs: 15_000 });
+        await rm(projectPath, { recursive: true, force: true });
+      }
+    },
+    60_000,
   );
 });

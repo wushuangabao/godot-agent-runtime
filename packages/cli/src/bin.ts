@@ -4,9 +4,11 @@ import {
   checkProject,
   configureClient,
   assertRuntime,
+  captureEditorScreenshot,
   captureRuntimeScreenshot,
   controlRuntime,
   connectEditorSignal,
+  createInheritedEditorScene,
   createEditorNode,
   createEditorResource,
   deleteEditorNode,
@@ -20,6 +22,9 @@ import {
   getEditorSelection,
   getManagedRunStatus,
   getRuntimeNode,
+  observeRuntime,
+  projectRuntime3D,
+  raycastRuntime3D,
   getRuntimeSceneTree,
   inspectProject,
   injectRuntimeInput,
@@ -35,6 +40,7 @@ import {
   stopManagedRun,
   saveEditorScene,
   saveEditorResource,
+  simulateRuntimePhysics,
   setEditorSelection,
   setEditorInstanceEditable,
   toRuntimeError,
@@ -44,6 +50,7 @@ import {
   waitForRuntime,
   type RuntimeInputStep,
 } from "@godot-agent-runtime/core";
+import { parseFiniteNumber, parseFiniteVector3, parseInteger } from "./numeric.js";
 
 function option(args: string[], name: string): string | undefined {
   const index = args.indexOf(name);
@@ -108,13 +115,14 @@ function printHelp(): void {
   process.stdout.write(`  launch PROJECT_PATH [--scene RES_PATH] [--config PATH] [--timeout MS]\n`);
   process.stdout.write(`  status PROJECT_PATH RUN_ID [--max-output BYTES]\n`);
   process.stdout.write(`  stop PROJECT_PATH RUN_ID [--timeout MS] [--max-output BYTES]\n`);
-  process.stdout.write(`  configure <codex|claude-code> [--project PATH] [--server PATH]\n`);
+  process.stdout.write(`  configure <codex|deepseek-harness|claude-code> [--project PATH] [--server PATH]\n`);
   process.stdout.write(`  addon-install PROJECT_PATH\n`);
   process.stdout.write(`  editor-launch PROJECT_PATH [--config PATH] [--timeout MS]\n`);
   process.stdout.write(`  editor-tree PROJECT_PATH RUN_ID\n`);
   process.stdout.write(`  editor-node-get PROJECT_PATH RUN_ID --node NODE_PATH [--properties JSON_ARRAY]\n`);
   process.stdout.write(`  editor-node-create PROJECT_PATH RUN_ID --parent NODE_PATH --type TYPE --name NAME [--properties JSON_OBJECT]\n`);
   process.stdout.write(`  editor-scene-instantiate PROJECT_PATH RUN_ID --parent NODE_PATH --scene RES_PATH [--name NAME] [--properties JSON_OBJECT]\n`);
+  process.stdout.write(`  editor-scene-inherit PROJECT_PATH RUN_ID --source RES_PATH --target RES_PATH [--root-name NAME] [--root-properties JSON_OBJECT] [--open true|false] [--overwrite true|false]\n`);
   process.stdout.write(`  editor-instance-get PROJECT_PATH RUN_ID --node NODE_PATH\n`);
   process.stdout.write(`  editor-instance-set-editable PROJECT_PATH RUN_ID --node NODE_PATH --editable true|false\n`);
   process.stdout.write(`  editor-node-update PROJECT_PATH RUN_ID --node NODE_PATH [--name NAME] [--properties JSON_OBJECT]\n`);
@@ -131,9 +139,14 @@ function printHelp(): void {
   process.stdout.write(`  editor-save PROJECT_PATH RUN_ID\n`);
   process.stdout.write(`  editor-undo PROJECT_PATH RUN_ID\n`);
   process.stdout.write(`  editor-redo PROJECT_PATH RUN_ID\n`);
+  process.stdout.write(`  editor-screenshot PROJECT_PATH RUN_ID [--viewport 2d|3d] [--viewport-index 0..3]\n`);
   process.stdout.write(`  runtime-ui PROJECT_PATH RUN_ID [--text TEXT] [--type TYPE] [--path NODE_PATH]\n`);
   process.stdout.write(`  runtime-tree PROJECT_PATH RUN_ID [--max-depth N] [--max-nodes N]\n`);
   process.stdout.write(`  runtime-node-get PROJECT_PATH RUN_ID --node NODE_PATH [--properties JSON_ARRAY]\n`);
+  process.stdout.write(`  runtime-observe PROJECT_PATH RUN_ID --nodes JSON_ARRAY [--properties JSON_ARRAY]\n`);
+  process.stdout.write(`  runtime-simulate PROJECT_PATH RUN_ID --node NODE_PATH [--frames N] [--properties JSON_ARRAY] [--action NAME] [--strength N]\n`);
+  process.stdout.write(`  runtime-3d-project PROJECT_PATH RUN_ID (--node NODE_PATH | --position JSON_OBJECT) [--camera NODE_PATH]\n`);
+  process.stdout.write(`  runtime-3d-raycast PROJECT_PATH RUN_ID --x N --y N [--camera NODE_PATH] [--max-distance N] [--collision-mask N]\n`);
   process.stdout.write(`  screenshot PROJECT_PATH RUN_ID\n`);
   process.stdout.write(`  click PROJECT_PATH RUN_ID --path NODE_PATH\n`);
   process.stdout.write(`  input-sequence PROJECT_PATH RUN_ID --steps JSON_ARRAY\n`);
@@ -147,7 +160,9 @@ async function main(): Promise<void> {
   const values = positional(args);
   const configPath = option(args, "--config");
   const timeout = option(args, "--timeout");
-  const timeoutMs = timeout ? Number.parseInt(timeout, 10) : undefined;
+  const timeoutMs = timeout === undefined
+    ? undefined
+    : parseInteger(timeout, "--timeout", { min: 100, max: 120_000 });
   const scene = option(args, "--scene");
 
   switch (command) {
@@ -160,11 +175,11 @@ async function main(): Promise<void> {
           ...(option(args, "--max-depth") === undefined
             ? {}
             : {
-                maxDepth: Number.parseInt(option(args, "--max-depth") ?? "", 10),
+                maxDepth: parseInteger(option(args, "--max-depth") ?? "", "--max-depth", { min: 0, max: 12 }),
               }),
           ...(option(args, "--limit") === undefined
             ? {}
-            : { maxProjects: Number.parseInt(option(args, "--limit") ?? "", 10) }),
+            : { maxProjects: parseInteger(option(args, "--limit") ?? "", "--limit", { min: 1, max: 500 }) }),
         }),
       );
       return;
@@ -215,10 +230,7 @@ async function main(): Promise<void> {
           ...(option(args, "--max-output") === undefined
             ? {}
             : {
-                maxOutputBytes: Number.parseInt(
-                  option(args, "--max-output") ?? "",
-                  10,
-                ),
+                maxOutputBytes: parseInteger(option(args, "--max-output") ?? "", "--max-output", { min: 1_024, max: 1_048_576 }),
               }),
         }),
       );
@@ -235,18 +247,15 @@ async function main(): Promise<void> {
           ...(option(args, "--max-output") === undefined
             ? {}
             : {
-                maxOutputBytes: Number.parseInt(
-                  option(args, "--max-output") ?? "",
-                  10,
-                ),
+                maxOutputBytes: parseInteger(option(args, "--max-output") ?? "", "--max-output", { min: 1_024, max: 1_048_576 }),
               }),
         }),
       );
       return;
     case "configure": {
       const target = values[0];
-      if (target !== "codex" && target !== "claude-code") {
-        throw new Error("configure requires codex or claude-code.");
+      if (target !== "codex" && target !== "deepseek-harness" && target !== "claude-code") {
+        throw new Error("configure requires codex, deepseek-harness, or claude-code.");
       }
       const projectPath = option(args, "--project");
       const serverPath = option(args, "--server");
@@ -328,6 +337,29 @@ async function main(): Promise<void> {
       }));
       return;
     }
+    case "editor-scene-inherit": {
+      if (!values[0] || !values[1]) throw new Error("editor-scene-inherit requires PROJECT_PATH and RUN_ID.");
+      const sourceScenePath = option(args, "--source");
+      const targetScenePath = option(args, "--target");
+      if (sourceScenePath === undefined || targetScenePath === undefined) {
+        throw new Error("editor-scene-inherit requires --source and --target.");
+      }
+      const rootName = option(args, "--root-name");
+      const rootProperties = parseJsonObject(option(args, "--root-properties"), "--root-properties");
+      const open = parseBoolean(option(args, "--open"), "--open");
+      const overwrite = parseBoolean(option(args, "--overwrite"), "--overwrite");
+      print(await createInheritedEditorScene({
+        projectPath: values[0],
+        runId: values[1],
+        sourceScenePath,
+        targetScenePath,
+        ...(rootName === undefined ? {} : { rootName }),
+        ...(rootProperties === undefined ? {} : { rootProperties }),
+        ...(open === undefined ? {} : { open }),
+        ...(overwrite === undefined ? {} : { overwrite }),
+      }));
+      return;
+    }
     case "editor-instance-get": {
       if (!values[0] || !values[1]) throw new Error("editor-instance-get requires PROJECT_PATH and RUN_ID.");
       const nodePath = option(args, "--node");
@@ -383,7 +415,7 @@ async function main(): Promise<void> {
         runId: values[1],
         nodePath,
         newParentPath,
-        ...(indexSource === undefined ? {} : { index: Number.parseInt(indexSource, 10) }),
+        ...(indexSource === undefined ? {} : { index: parseInteger(indexSource, "--index", { min: -1 }) }),
         ...(keepGlobalTransform === undefined ? {} : { keepGlobalTransform }),
       }));
       return;
@@ -492,7 +524,7 @@ async function main(): Promise<void> {
         signal,
         targetPath,
         method,
-        ...(flagsSource === undefined ? {} : { flags: Number.parseInt(flagsSource, 10) }),
+        ...(flagsSource === undefined ? {} : { flags: parseInteger(flagsSource, "--flags", { min: 0, max: 15 }) }),
       }));
       return;
     }
@@ -508,6 +540,21 @@ async function main(): Promise<void> {
       if (!values[0] || !values[1]) throw new Error("editor-redo requires PROJECT_PATH and RUN_ID.");
       print(await redoEditorAction({ projectPath: values[0], runId: values[1] }));
       return;
+    case "editor-screenshot": {
+      if (!values[0] || !values[1]) throw new Error("editor-screenshot requires PROJECT_PATH and RUN_ID.");
+      const viewport = option(args, "--viewport");
+      if (viewport !== undefined && viewport !== "2d" && viewport !== "3d") {
+        throw new Error("--viewport must be 2d or 3d.");
+      }
+      const indexSource = option(args, "--viewport-index");
+      print(await captureEditorScreenshot({
+        projectPath: values[0],
+        runId: values[1],
+        ...(viewport === undefined ? {} : { viewport }),
+        ...(indexSource === undefined ? {} : { viewportIndex: parseInteger(indexSource, "--viewport-index", { min: 0, max: 3 }) }),
+      }));
+      return;
+    }
     case "runtime-ui": {
       if (!values[0] || !values[1]) throw new Error("runtime-ui requires PROJECT_PATH and RUN_ID.");
       const text = option(args, "--text");
@@ -532,8 +579,8 @@ async function main(): Promise<void> {
       const maxNodes = option(args, "--max-nodes");
       print(await getRuntimeSceneTree({
         projectPath: values[0], runId: values[1],
-        ...(maxDepth === undefined ? {} : { maxDepth: Number.parseInt(maxDepth, 10) }),
-        ...(maxNodes === undefined ? {} : { maxNodes: Number.parseInt(maxNodes, 10) }),
+        ...(maxDepth === undefined ? {} : { maxDepth: parseInteger(maxDepth, "--max-depth", { min: 0, max: 64 }) }),
+        ...(maxNodes === undefined ? {} : { maxNodes: parseInteger(maxNodes, "--max-nodes", { min: 1, max: 5_000 }) }),
       }));
       return;
     }
@@ -545,6 +592,81 @@ async function main(): Promise<void> {
       print(await getRuntimeNode({
         projectPath: values[0], runId: values[1], nodePath,
         ...(properties === undefined ? {} : { properties }),
+      }));
+      return;
+    }
+    case "runtime-observe": {
+      if (!values[0] || !values[1]) throw new Error("runtime-observe requires PROJECT_PATH and RUN_ID.");
+      const nodePaths = parseJsonStringArray(option(args, "--nodes"), "--nodes");
+      if (nodePaths === undefined || nodePaths.length === 0) {
+        throw new Error("runtime-observe requires --nodes JSON_ARRAY.");
+      }
+      const properties = parseJsonStringArray(option(args, "--properties"), "--properties");
+      print(await observeRuntime({
+        projectPath: values[0],
+        runId: values[1],
+        nodePaths,
+        ...(properties === undefined ? {} : { properties }),
+      }));
+      return;
+    }
+    case "runtime-simulate": {
+      if (!values[0] || !values[1]) throw new Error("runtime-simulate requires PROJECT_PATH and RUN_ID.");
+      const nodePath = option(args, "--node");
+      if (nodePath === undefined) throw new Error("runtime-simulate requires --node NODE_PATH.");
+      const framesSource = option(args, "--frames");
+      const properties = parseJsonStringArray(option(args, "--properties"), "--properties");
+      const action = option(args, "--action");
+      const strengthSource = option(args, "--strength");
+      print(await simulateRuntimePhysics({
+        projectPath: values[0],
+        runId: values[1],
+        nodePath,
+        ...(framesSource === undefined ? {} : { frames: parseInteger(framesSource, "--frames", { min: 1, max: 120 }) }),
+        ...(properties === undefined ? {} : { properties }),
+        ...(action === undefined ? {} : { action }),
+        ...(strengthSource === undefined ? {} : { strength: parseFiniteNumber(strengthSource, "--strength", { min: 0, max: 1 }) }),
+      }));
+      return;
+    }
+    case "runtime-3d-project": {
+      if (!values[0] || !values[1]) throw new Error("runtime-3d-project requires PROJECT_PATH and RUN_ID.");
+      const nodePath = option(args, "--node");
+      const rawWorldPosition = parseJsonObject(option(args, "--position"), "--position");
+      const worldPosition = rawWorldPosition === undefined
+        ? undefined
+        : parseFiniteVector3(rawWorldPosition, "--position");
+      if ((nodePath === undefined) === (worldPosition === undefined)) {
+        throw new Error("runtime-3d-project requires exactly one of --node or --position.");
+      }
+      const cameraPath = option(args, "--camera");
+      print(await projectRuntime3D({
+        projectPath: values[0],
+        runId: values[1],
+        ...(nodePath === undefined ? {} : { nodePath }),
+        ...(worldPosition === undefined ? {} : { worldPosition }),
+        ...(cameraPath === undefined ? {} : { cameraPath }),
+      }));
+      return;
+    }
+    case "runtime-3d-raycast": {
+      if (!values[0] || !values[1]) throw new Error("runtime-3d-raycast requires PROJECT_PATH and RUN_ID.");
+      const xSource = option(args, "--x");
+      const ySource = option(args, "--y");
+      if (xSource === undefined || ySource === undefined) throw new Error("runtime-3d-raycast requires --x and --y.");
+      const cameraPath = option(args, "--camera");
+      const distanceSource = option(args, "--max-distance");
+      const maskSource = option(args, "--collision-mask");
+      print(await raycastRuntime3D({
+        projectPath: values[0],
+        runId: values[1],
+        screenPosition: {
+          x: parseFiniteNumber(xSource, "--x"),
+          y: parseFiniteNumber(ySource, "--y"),
+        },
+        ...(cameraPath === undefined ? {} : { cameraPath }),
+        ...(distanceSource === undefined ? {} : { maxDistance: parseFiniteNumber(distanceSource, "--max-distance", { min: Number.MIN_VALUE, max: 100_000 }) }),
+        ...(maskSource === undefined ? {} : { collisionMask: parseInteger(maskSource, "--collision-mask", { min: 0, max: 4_294_967_295 }) }),
       }));
       return;
     }
@@ -610,8 +732,8 @@ async function main(): Promise<void> {
         property,
         expected: JSON.parse(expectedSource),
         ...(operator === undefined ? {} : { operator }),
-        ...(waitTimeoutSource === undefined ? {} : { waitTimeoutMs: Number.parseInt(waitTimeoutSource, 10) }),
-        ...(pollFramesSource === undefined ? {} : { pollEveryFrames: Number.parseInt(pollFramesSource, 10) }),
+        ...(waitTimeoutSource === undefined ? {} : { waitTimeoutMs: parseInteger(waitTimeoutSource, "--wait-timeout", { min: 0, max: 30_000 }) }),
+        ...(pollFramesSource === undefined ? {} : { pollEveryFrames: parseInteger(pollFramesSource, "--poll-frames", { min: 1, max: 60 }) }),
       }));
       return;
     }
@@ -629,7 +751,7 @@ async function main(): Promise<void> {
           projectPath: values[0],
           runId: values[1],
           action,
-          ...(framesSource === undefined ? {} : { frames: Number.parseInt(framesSource, 10) }),
+          ...(framesSource === undefined ? {} : { frames: parseInteger(framesSource, "--frames", { min: 1, max: 120 }) }),
         }));
       } else {
         print(await controlRuntime({ projectPath: values[0], runId: values[1], action }));

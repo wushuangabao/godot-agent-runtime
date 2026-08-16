@@ -40,7 +40,7 @@ DeepSeek Harness（DSH）是本项目支持的可选外部客户端和基准测�
 
 - 在 `adapters/deepseek-harness/` 提供 MCP Client 配置、安装说明和可选的项目级操作说明，CLI 最终提供 `configure deepseek-harness`。
 - 在 `tests/agent-benchmarks/deepseek-harness/` 建立可重复的 headless 基准任务，覆盖项目诊断、场景启动、UI 发现、输入注入、截图和结构化断言。
-- 同一组任务应尽可能同时在 Codex、Claude Code 和 DSH 上执行，记录成功率、模型轮数、工具调用数、耗时、上下文消耗、错误恢复能力和验证证据。
+- 同一组任务应同时在 Codex 和 DSH 上执行，记录成功率、模型轮数、工具调用数、耗时、上下文消耗、错误恢复能力和验证证据。Claude Code 不作为当前本机里程碑的前置条件。
 - DSH 的事件日志只作为基准与故障分析证据，不演变为本项目自己的聊天或会话系统。
 - DSH 处于快速迭代阶段，适配层必须与核心协议隔离，并通过真实安装包和实际 MCP 启动路径测试兼容性。
 
@@ -76,6 +76,10 @@ DeepSeek Harness（DSH）是本项目支持的可选外部客户端和基准测�
 | `godot_runtime_ui_find` | 只读、幂等、最多 500 项 | 项目、`runId`、selector、limit | Control 路径、类型、文本、状态和矩形 | Control UI 发现测试 |
 | `godot_runtime_scene_tree` | 只读、幂等、最大 64 层/5000 节点 | 项目、`runId`、深度和节点上限 | 当前场景结构树与截断标志 | 真实运行场景树测试 |
 | `godot_runtime_node_get` | 只读、幂等、最多 100 个属性 | 节点路径、属性名 | 节点身份、父路径、源场景和序列化属性 | Label 属性及缺失属性测试 |
+| `godot_runtime_observe` | 只读、幂等、最多 32 个节点/32 个附加属性 | 节点路径数组、可选属性名 | 常用位置/速度/动画/可见性、CharacterBody 接触状态、分组、元数据和附加属性 | Control 与 CharacterBody2D 批量观察测试 |
+| `godot_runtime_simulate_physics` | 执行场景脚本、非幂等、最多 5000 节点/120 帧 | 节点、属性、帧数、可选 InputMap action | 私有 World2D/World3D 中场景副本的逐帧样本及暂停恢复状态 | 副本移动且真实 Player 位置不变测试 |
+| `godot_runtime_3d_project` | 只读、幂等 | 可选 Camera3D、Node3D 或世界坐标 | 屏幕像素、视口尺寸、深度、距离及可见性 | Player 世界坐标投影到真实 3D 截图测试 |
+| `godot_runtime_3d_raycast` | 只读、幂等、最大距离 100000 | 屏幕像素、可选 Camera3D、距离、碰撞层与 body/area 开关 | 射线、命中碰撞体路径、位置、法线和 shape | 投影像素反向命中 CharacterBody3D 测试 |
 | `godot_runtime_input` | 非幂等、输入最长 2 秒 | click/action/key 的受限参数 | 投递状态、目标和坐标 | 点击按钮并观察状态变化 |
 | `godot_runtime_input_sequence` | 非幂等、最多 32 步/5 秒 | click/action/key 步骤及步后延迟 | 每步投递结果和总耗时 | 点击+按键组合测试 |
 | `godot_runtime_assert` | 只读、幂等 | UI 存在或属性比较谓词 | `passed/expected/actual/evidence` | meta 与 Label 文本断言 |
@@ -87,6 +91,7 @@ DeepSeek Harness（DSH）是本项目支持的可选外部客户端和基准测�
 | `godot_editor_node_get` | 只读、幂等、最多 100 个属性 | 节点路径、属性名 | 节点描述与 tagged Variant | Vector2/文本读取测试 |
 | `godot_editor_node_create` | 写入、非幂等、原生 Undo/Redo | 父路径、类型、名称、属性 | 新节点、变更属性 | 创建后读取并删除 |
 | `godot_editor_scene_instantiate` | 写入、非幂等、原生 Undo/Redo | 父路径、`.tscn`、名称和覆盖属性 | 实例节点与源场景 | 实例化后撤销/重做并运行 |
+| `godot_editor_scene_create_inherited` | 创建/可选覆盖 `.tscn`，文件不可撤销 | 源场景、目标场景、根名称/属性、打开/覆盖标志 | 继承源、目标、摘要和 SHA-256 | 原生继承序列化、覆盖拒绝及派生场景运行测试 |
 | `godot_editor_instance_get` / `godot_editor_instance_set_editable` | 读取或修改 PackedScene Editable Children | 实例根路径、editable 标志 | 源场景、新旧状态 | 切换后撤销/重做并保存 |
 | `godot_editor_node_update` | 写入、非幂等、原生 Undo/Redo | 节点路径、新名称/属性 | 新旧路径与变更属性 | 修改、撤销、重做测试 |
 | `godot_editor_node_delete` | 写入、非幂等、可撤销 | 非根节点路径 | 被删除节点描述 | 临时节点删除测试 |
@@ -99,10 +104,10 @@ DeepSeek Harness（DSH）是本项目支持的可选外部客户端和基准测�
 | `godot_editor_signal_connect` | 写入、非幂等、持久连接 | 源/信号/目标/方法 | 连接描述 | 保存后运行时点击测试 |
 | `godot_editor_scene_save` | 写入、幂等 | 项目、`runId` | 保存状态与 `res://` 路径 | 保存文件内容检查 |
 | `godot_editor_undo` / `godot_editor_redo` | 写入、非幂等 | 项目、`runId` | 动作名与历史版本 | 实际回退并恢复属性 |
-| `godot_editor_screenshot` | 写入编辑器证据 | 项目、`runId`、超时 | 2D 视口 PNG 元数据 | 真实编辑器截图测试 |
+| `godot_editor_screenshot` | 写入编辑器证据并切换主屏 | 项目、`runId`、`2d/3d`、3D 视口索引 0–3、超时 | PNG、视口及活动 3D 编辑器相机元数据 | 真实 2D/3D 编辑器截图测试 |
 
 `godot_scene_run` 用于自动验证，不创建窗口，并在有限帧后自动退出。`godot_scene_launch` 用于人工观察或后续运行时交互：它创建可见窗口并返回 `runId`，调用方不应等待进程退出，而应使用 `godot_run_status` 和 `godot_run_stop` 管理生命周期。
 
-`godot_project_check`、`godot_scene_run` 与 `godot_scene_launch` 将 Godot 的宿主配置和缓存隔离到项目 `.godot/agent-runtime-host/`，不读写用户的 Godot 编辑器设置。持久运行元数据和有界日志位于项目 `.godot/agent-runtime/runs/`；停止请求使用每次运行随机生成、仅保存在元数据中的令牌，避免对后来复用同一 PID 的无关进程直接发信号。进程输出默认限制为 64 KiB；MCP 参数最多允许 1 MiB，超时最多 120 秒。
+`godot_project_check`、`godot_scene_run` 与 `godot_scene_launch` 将 Godot 的宿主配置和缓存隔离到项目 `.godot/agent-runtime-host/`，不读写用户的 Godot 编辑器设置。持久运行元数据和有界日志位于项目 `.godot/agent-runtime/runs/`；停止请求使用每次运行随机生成、仅保存在元数据中的令牌，避免对后来复用同一 PID 的无关进程直接发信号。进程输出默认限制为 64 KiB；MCP 参数最多允许 1 MiB，超时最多 120 秒。桥接响应超过 1 MiB 时返回 `RUNTIME_RESPONSE_TOO_LARGE` 或 `EDITOR_RESPONSE_TOO_LARGE`，不会静默丢弃响应并让调用方超时。
 
-运行时与编辑器桥接共用 loopback、随机令牌和 `runId`，但能力表彼此独立。握手严格验证 `protocolVersion` 并采用桥接实际返回的已知能力列表，不兼容时快速失败。两个桥都是固定命令表，不提供动态脚本执行。Runtime Bridge 的等待最长 30 秒，场景树最多 64 层/5000 节点，节点读取最多 100 个已声明属性；结构化属性断言在统一的有界 JSON 表示上比较，避免 Variant 与 JSON 表示不一致。输入序列最多 32 步/5 秒，单次推进最多 120 个 process 或 physics 帧且必须先暂停。EditorPlugin 场景写操作及 Resource 子属性更新进入 Godot 原生 Undo/Redo；所有 Resource 引用路径都经过项目边界和链接检查。外部 `.tres` 文件本身不可由场景历史删除，但其节点引用可撤销，且默认拒绝覆盖。选择/聚焦是非持久编辑器状态。完整边界见 [security.md](security.md)。
+运行时与编辑器桥接共用 loopback、随机令牌和 `runId`，但能力表彼此独立。握手严格验证 `protocolVersion` 并采用桥接实际返回的已知能力列表，不兼容时快速失败。两个桥都是固定命令表，不提供动态脚本执行。Runtime Bridge 的等待最长 30 秒，场景树最多 64 层/5000 节点，节点读取最多 100 个已声明属性，批量观察最多 32 个节点和 32 个附加属性；3D 投影只读取 Node3D/Camera3D 变换，3D 射线只查询当前 World3D 且距离不超过 100000。结构化属性断言在统一的有界 JSON 表示上比较，避免 Variant 与 JSON 表示不一致。输入序列最多 32 步/5 秒，单次推进最多 120 个 process 或 physics 帧且必须先暂停。输入注入、隔离模拟和暂停/推进控制共享排他执行区，并携带客户端超时；排队或执行中的请求在截止或断连后取消并清理输入/暂停状态。隔离物理采样最多复制 5000 个节点并推进 120 帧，使用 SubViewport 的独立 World2D/World3D；采样期间禁用真实场景节点处理并停用真实物理空间，让全局物理帧只推进副本世界，结束后恢复真实物理空间、节点处理模式、SceneTree 暂停状态及模拟前 Input action 强度。副本脚本仍会执行，因此它不是不可信代码沙箱。EditorPlugin 场景写操作及 Resource 子属性更新进入 Godot 原生 Undo/Redo；继承场景和外部 `.tres` 文件创建不可由场景历史删除，均默认拒绝覆盖。所有 Resource 引用路径都经过项目边界和链接检查。选择/聚焦是非持久编辑器状态；截图会切换到请求的 2D 或 3D 主屏。完整边界见 [security.md](security.md)。
