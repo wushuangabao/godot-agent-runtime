@@ -1,0 +1,12 @@
+# Machine-local development environment.
+/config/development.local.json
+
+# Node.js and test outputs.
+**/node_modules/
+/.pnpm-store/
+**/dist/
+/coverage/
+
+# Godot import caches and generated evidence.
+**/.godot/
+/artifacts/

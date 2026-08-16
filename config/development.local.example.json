@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "godot": {
+    "executable": "C:\\path\\to\\godot.windows.editor.x86_64.exe"
+  },
+  "deepseekHarness": {
+    "root": "C:\\path\\to\\deepseek-harness"
+  }
+}

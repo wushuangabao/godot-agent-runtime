@@ -1,0 +1,138 @@
+import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { RuntimeFailure } from "./errors.js";
+
+export type ClientTarget = "codex" | "claude-code";
+
+export interface ConfigureClientOptions {
+  readonly target: ClientTarget;
+  readonly projectPath?: string;
+  readonly serverPath?: string;
+}
+
+export interface ClientConfigurationResult {
+  readonly ok: true;
+  readonly target: ClientTarget;
+  readonly path: string;
+  readonly serverPath: string;
+  readonly operation: "created" | "updated" | "unchanged";
+}
+
+const CODEX_START = "# >>> godot-agent-runtime managed section >>>";
+const CODEX_END = "# <<< godot-agent-runtime managed section <<<";
+
+async function readOptional(path: string): Promise<string | null> {
+  try {
+    return await readFile(path, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function writeAtomic(path: string, content: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, content, { encoding: "utf8", flag: "wx" });
+  await rename(temporary, path);
+}
+
+function codexConfiguration(
+  existing: string | null,
+  serverPath: string,
+  projectPath: string,
+): string {
+  const block = [
+    CODEX_START,
+    "[mcp_servers.godot-agent-runtime]",
+    `command = ${JSON.stringify(process.execPath)}`,
+    `args = [${JSON.stringify(serverPath)}]`,
+    `cwd = ${JSON.stringify(projectPath)}`,
+    CODEX_END,
+  ].join("\n");
+  if (existing === null || existing.trim() === "") return `${block}\n`;
+
+  const start = existing.indexOf(CODEX_START);
+  const end = existing.indexOf(CODEX_END);
+  if ((start === -1) !== (end === -1) || (start !== -1 && end < start)) {
+    throw new RuntimeFailure({
+      code: "CLIENT_CONFIG_MANAGED_SECTION_INVALID",
+      stage: "configuration",
+      message: "The Codex configuration contains an incomplete managed section.",
+      details: { startMarker: CODEX_START, endMarker: CODEX_END },
+      recovery: ["Repair or remove only the godot-agent-runtime managed marker section, then retry."],
+    });
+  }
+  if (start !== -1) {
+    const after = end + CODEX_END.length;
+    return `${existing.slice(0, start)}${block}${existing.slice(after)}`;
+  }
+  return `${existing.trimEnd()}\n\n${block}\n`;
+}
+
+function claudeConfiguration(existing: string | null, serverPath: string): string {
+  let root: Record<string, unknown> = {};
+  if (existing !== null && existing.trim() !== "") {
+    try {
+      const parsed: unknown = JSON.parse(existing);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("root is not an object");
+      root = parsed as Record<string, unknown>;
+    } catch (error) {
+      throw new RuntimeFailure({
+        code: "CLIENT_CONFIG_INVALID_JSON",
+        stage: "configuration",
+        message: "The existing Claude Code .mcp.json is not a JSON object.",
+        details: { cause: error instanceof Error ? error.message : String(error) },
+        recovery: ["Fix .mcp.json before retrying so unrelated MCP server entries can be preserved."],
+      });
+    }
+  }
+  const existingServers = root.mcpServers;
+  const mcpServers =
+    typeof existingServers === "object" && existingServers !== null && !Array.isArray(existingServers)
+      ? { ...(existingServers as Record<string, unknown>) }
+      : {};
+  mcpServers["godot-agent-runtime"] = {
+    type: "stdio",
+    command: process.execPath,
+    args: [serverPath],
+  };
+  return `${JSON.stringify({ ...root, mcpServers }, null, 2)}\n`;
+}
+
+export async function configureClient(
+  options: ConfigureClientOptions,
+): Promise<ClientConfigurationResult> {
+  const projectPath = resolve(options.projectPath ?? process.cwd());
+  const serverPath = resolve(
+    options.serverPath ??
+      fileURLToPath(new URL("../../mcp-server/dist/bin.js", import.meta.url)),
+  );
+  const targetPath =
+    options.target === "codex"
+      ? resolve(projectPath, ".codex", "config.toml")
+      : resolve(projectPath, ".mcp.json");
+  try {
+    await access(serverPath, constants.R_OK);
+  } catch (error) {
+    throw new RuntimeFailure({
+      code: "CLIENT_SERVER_NOT_BUILT",
+      stage: "configuration",
+      message: `The MCP server entrypoint was not found at ${serverPath}.`,
+      details: { serverPath, cause: error instanceof Error ? error.message : String(error) },
+      recovery: ["Run the repository build, or pass --server with the absolute MCP server entrypoint."],
+    });
+  }
+  const existing = await readOptional(targetPath);
+  const content =
+    options.target === "codex"
+      ? codexConfiguration(existing, serverPath, projectPath)
+      : claudeConfiguration(existing, serverPath);
+  const operation = existing === null ? "created" : existing === content ? "unchanged" : "updated";
+  if (operation !== "unchanged") await writeAtomic(targetPath, content);
+  return { ok: true, target: options.target, path: targetPath, serverPath, operation };
+}

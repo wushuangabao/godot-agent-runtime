@@ -1,0 +1,7 @@
+# 示例项目
+
+这些最小 Godot 项目用于 headless 集成测试和 Agent 基准，独立采用 [MIT License](LICENSE)，可以复制到用户项目中。
+
+- `minimal-2d`：最小 Node2D 场景和启动标记。
+- `minimal-3d`：最小 Node3D、相机和网格场景。
+- `control-ui`：首个里程碑使用的按钮交互与结构化状态示例。

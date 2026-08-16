@@ -1,0 +1,28 @@
+{
+  "name": "godot-agent-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "benchmark:headless": "node tests/agent-benchmarks/headless-mvp/run.mjs",
+    "benchmark:milestone-1": "pnpm run build && node tests/agent-benchmarks/milestone-1/run.mjs",
+    "benchmark:runtime": "node tests/agent-benchmarks/runtime-loop/run.mjs",
+    "clean": "tsc -b --clean",
+    "doctor": "node packages/cli/dist/bin.js doctor",
+    "mcp": "node packages/mcp-server/dist/bin.js",
+    "test": "pnpm run build && vitest run",
+    "typecheck": "tsc -b --pretty false",
+    "check": "pnpm run typecheck && pnpm run test"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@types/node": "^20.19.43",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
