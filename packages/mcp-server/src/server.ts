@@ -30,6 +30,7 @@ import {
   getEditorResource,
   inspectEditorResourcePath,
   getManagedRunStatus,
+  getDiagnosticsSummary,
   getProjectContext,
   getRuntimeInfo,
   getRuntimeNode,
@@ -46,10 +47,12 @@ import {
   launchProject,
   moveEditorNode,
   openEditorScene,
+  readManagedLogs,
   readProjectFile,
   replaceProjectText,
   redoEditorAction,
   runDoctor,
+  createDebugReport,
   runProject,
   stopManagedRun,
   saveEditorScene,
@@ -69,6 +72,8 @@ import {
 } from "@godot-agent-runtime/core";
 import {
   DoctorResultSchema,
+  DebugReportResultSchema,
+  DiagnosticsSummarySchema,
   AddonInstallResultSchema,
   EditorBatchRequestSchema,
   EditorBatchResultSchema,
@@ -100,6 +105,8 @@ import {
   GodotLaunchResultSchema,
   GodotRunResultSchema,
   GodotRunStatusSchema,
+  LogCursorSchema,
+  LogReadResultSchema,
   ProjectDiscoveryResultSchema,
   ProjectContextSchema,
   ProjectInfoSchema,
@@ -176,6 +183,35 @@ const RunLookupInputSchema = z.object({
   runId: z.uuid(),
   maxOutputBytes: z.number().int().min(1_024).max(1_048_576).optional(),
 });
+
+const LogReadInputSchema = z.object({
+  projectPath: z.string().min(1),
+  runId: z.uuid(),
+  cursor: LogCursorSchema.optional(),
+  stream: z.enum(["stdout", "stderr", "combined"]).default("combined"),
+  minimumSeverity: z.enum(["error", "warning", "info"]).default("info"),
+  contains: z.string().min(1).max(1024).optional(),
+  maxLines: z.number().int().min(1).max(500).default(100),
+  deduplicate: z.boolean().default(false),
+  raw: z.boolean().default(false),
+}).strict();
+
+const DiagnosticsInputSchema = z.object({
+  projectPath: z.string().min(1),
+  runId: z.uuid(),
+  cursor: LogCursorSchema.optional(),
+  maxIssues: z.number().int().min(1).max(50).default(50),
+}).strict();
+
+const DebugReportInputSchema = z.object({
+  projectPath: z.string().min(1),
+  expectedProjectFingerprint: Sha256Schema,
+  issue: z.string().min(1).max(16_384),
+  runId: z.uuid().optional(),
+  reproduction: z.string().min(1).max(32_768).optional(),
+  cursor: LogCursorSchema.optional(),
+  format: z.enum(["markdown", "json"]).default("markdown"),
+}).strict();
 
 const StopInputSchema = RunLookupInputSchema.extend({
   timeoutMs: z.number().int().min(100).max(120_000).optional(),
@@ -642,13 +678,87 @@ function runtimeSelector(value: z.infer<typeof RuntimeSelectorSchema>): RuntimeU
 }
 
 async function handle<T extends Record<string, unknown>>(
+  tool: string,
   operation: () => Promise<T>,
 ): Promise<CallToolResult> {
+  const started = performance.now();
   try {
-    return success(await operation());
+    const result = await operation();
+    logMcpCall({
+      tool,
+      ok: true,
+      durationMs: Math.round(performance.now() - started),
+      code: null,
+      stage: null,
+    });
+    return success(result);
   } catch (error) {
+    const payload = toRuntimeError(error);
+    logMcpCall({
+      tool,
+      ok: false,
+      durationMs: Math.round(performance.now() - started),
+      code: payload.code,
+      stage: payload.stage,
+    });
     return failure(error);
   }
+}
+
+interface McpCallLog {
+  readonly tool: string;
+  readonly ok: boolean;
+  readonly durationMs: number;
+  readonly code: string | null;
+  readonly stage: string | null;
+}
+
+function logMcpCall(record: McpCallLog): void {
+  if (record.ok && process.env.GODOT_AGENT_RUNTIME_MCP_DEBUG !== "1") return;
+  process.stderr.write(`${JSON.stringify({
+    tool: record.tool,
+    ok: record.ok,
+    durationMs: record.durationMs,
+    code: record.code,
+    stage: record.stage,
+  })}\n`);
+}
+
+function loggedInputSchema<Schema extends StandardSchemaWithJSON>(tool: string, schema: Schema): Schema {
+  const standard = schema["~standard"];
+  const logged: StandardSchemaWithJSON = {
+    "~standard": {
+      version: 1,
+      vendor: "godot-agent-runtime",
+      validate: async (value, options) => {
+        const started = performance.now();
+        try {
+          const result = await standard.validate(value, options);
+          if (result.issues !== undefined) {
+            logMcpCall({
+              tool,
+              ok: false,
+              durationMs: Math.round(performance.now() - started),
+              code: "MCP_INPUT_INVALID",
+              stage: "validation",
+            });
+          }
+          return result;
+        } catch (error) {
+          logMcpCall({
+            tool,
+            ok: false,
+            durationMs: Math.round(performance.now() - started),
+            code: "MCP_INPUT_INVALID",
+            stage: "validation",
+          });
+          throw error;
+        }
+      },
+      jsonSchema: standard.jsonSchema,
+    },
+  };
+  return logged as Schema;
 }
 
 export function createMcpServer(): McpServer {
@@ -666,12 +776,12 @@ export function createMcpServer(): McpServer {
       title: "Diagnose Godot development environment",
       description:
         "Checks Node.js, local configuration, Godot, optional DeepSeek Harness, and loopback TCP readiness.",
-      inputSchema: ConfigInputSchema,
+      inputSchema: loggedInputSchema("godot_doctor", ConfigInputSchema),
       outputSchema: DoctorResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ configPath }) =>
-      await handle(async () => {
+      await handle("godot_doctor", async () => {
         const result = await runDoctor(configPath);
         return result;
       }),
@@ -683,12 +793,12 @@ export function createMcpServer(): McpServer {
       title: "Find Godot projects",
       description:
         "Searches a bounded directory tree for project.godot files and returns stable project metadata.",
-      inputSchema: ProjectDiscoveryInputSchema,
+      inputSchema: loggedInputSchema("godot_projects_find", ProjectDiscoveryInputSchema),
       outputSchema: ProjectDiscoveryResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ searchRoot, maxDepth, maxProjects }) =>
-      await handle(async () =>
+      await handle("godot_projects_find", async () =>
         await findProjects(searchRoot, { maxDepth, maxProjects }),
       ),
   );
@@ -699,11 +809,11 @@ export function createMcpServer(): McpServer {
       title: "Inspect a Godot project",
       description:
         "Reads project.godot and returns the project name, main scene, renderer, and enabled plugins.",
-      inputSchema: ProjectInputSchema,
+      inputSchema: loggedInputSchema("godot_project_inspect", ProjectInputSchema),
       outputSchema: ProjectInfoSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
-    async ({ projectPath }) => await handle(async () => await inspectProject(projectPath)),
+    async ({ projectPath }) => await handle("godot_project_inspect", async () => await inspectProject(projectPath)),
   );
 
   server.registerTool(
@@ -712,12 +822,12 @@ export function createMcpServer(): McpServer {
       title: "Get explicit Godot project context",
       description:
         "Returns project metadata and identity, plus editor/runtime bridge information only for explicitly supplied run IDs.",
-      inputSchema: ProjectContextInputSchema,
+      inputSchema: loggedInputSchema("godot_project_context", ProjectContextInputSchema),
       outputSchema: ProjectContextSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, editorRunId, runtimeRunId }) =>
-      await handle(async () =>
+      await handle("godot_project_context", async () =>
         await getProjectContext({
           projectPath,
           ...(editorRunId === undefined ? {} : { editorRunId }),
@@ -732,12 +842,12 @@ export function createMcpServer(): McpServer {
       title: "Import and validate a Godot project",
       description:
         "Starts the configured Godot editor in headless mode, imports the project, and returns bounded diagnostics.",
-      inputSchema: GodotOperationInputSchema,
+      inputSchema: loggedInputSchema("godot_project_check", GodotOperationInputSchema),
       outputSchema: GodotRunResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: true },
     },
     async ({ projectPath, configPath, timeoutMs, maxOutputBytes }) =>
-      await handle(async () =>
+      await handle("godot_project_check", async () =>
         await checkProject({
           projectPath,
           ...(configPath === undefined ? {} : { configPath }),
@@ -753,12 +863,12 @@ export function createMcpServer(): McpServer {
       title: "Check one GDScript file",
       description:
         "Runs the configured Godot editor with --script and --check-only for one project-internal, non-linked .gd file.",
-      inputSchema: ScriptCheckInputSchema,
+      inputSchema: loggedInputSchema("godot_script_check", ScriptCheckInputSchema),
       outputSchema: ScriptCheckResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: true },
     },
     async ({ projectPath, path, configPath, timeoutMs, maxOutputBytes }) =>
-      await handle(async () =>
+      await handle("godot_script_check", async () =>
         await checkScript({
           projectPath,
           path,
@@ -775,12 +885,12 @@ export function createMcpServer(): McpServer {
       title: "Read a Godot project text file",
       description:
         "Reads a bounded UTF-8 Godot project file without following symlinks. Returns SHA-256 for conflict-safe writes.",
-      inputSchema: FileReadInputSchema,
+      inputSchema: loggedInputSchema("godot_file_read", FileReadInputSchema),
       outputSchema: SafeFileReadResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, path, maxBytes }) =>
-      await handle(async () =>
+      await handle("godot_file_read", async () =>
         await readProjectFile({
           projectPath,
           path,
@@ -795,7 +905,7 @@ export function createMcpServer(): McpServer {
       title: "Safely write a Godot project text file",
       description:
         "Creates or updates an allowlisted UTF-8 project file under an explicit create or SHA-256 match guard. The lease coordinates participating MCP/CLI processes; external editors do not honor it, so the SHA-256 is rechecked immediately before publish and this is not a general cross-process filesystem transaction.",
-      inputSchema: FileWriteInputSchema,
+      inputSchema: loggedInputSchema("godot_file_write", FileWriteInputSchema),
       outputSchema: SafeFileWriteResultSchema,
       annotations: {
         readOnlyHint: false,
@@ -814,7 +924,7 @@ export function createMcpServer(): McpServer {
       createDirectories,
       maxBytes,
     }) =>
-      await handle(async () =>
+      await handle("godot_file_write", async () =>
         await writeProjectFile({
           projectPath,
           path,
@@ -836,7 +946,7 @@ export function createMcpServer(): McpServer {
       title: "Replace text in a Godot project file",
       description:
         "Reads and replaces oldText under the expected project fingerprint and a server-side SHA-256 match guard. By default oldText must occur exactly once; replaceAll opts into replacing every bounded match.",
-      inputSchema: FileReplaceInputSchema,
+      inputSchema: loggedInputSchema("godot_file_replace", FileReplaceInputSchema),
       outputSchema: SafeTextReplaceResultSchema,
       annotations: {
         readOnlyHint: false,
@@ -854,7 +964,7 @@ export function createMcpServer(): McpServer {
       replaceAll,
       maxBytes,
     }) =>
-      await handle(async () =>
+      await handle("godot_file_replace", async () =>
         await replaceProjectText({
           projectPath,
           path,
@@ -872,12 +982,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Install the Godot Agent Runtime addon",
       description: "Copies the versioned EditorPlugin into the project and enables it while preserving existing enabled plugins.",
-      inputSchema: ProjectInputSchema,
+      inputSchema: loggedInputSchema("godot_addon_install", ProjectInputSchema),
       outputSchema: AddonInstallResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath }) =>
-      await handle(async () => ({ ...(await installGodotAddon(projectPath)) })),
+      await handle("godot_addon_install", async () => ({ ...(await installGodotAddon(projectPath)) })),
   );
 
   server.registerTool(
@@ -886,12 +996,12 @@ export function createMcpServer(): McpServer {
       title: "Run a Godot scene headlessly",
       description:
         "Runs the main or specified scene for a bounded number of frames and returns console output and diagnostics.",
-      inputSchema: RunInputSchema,
+      inputSchema: loggedInputSchema("godot_scene_run", RunInputSchema),
       outputSchema: GodotRunResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: true },
     },
     async ({ projectPath, configPath, timeoutMs, maxOutputBytes, scene }) =>
-      await handle(async () =>
+      await handle("godot_scene_run", async () =>
         await runProject({
           projectPath,
           ...(configPath === undefined ? {} : { configPath }),
@@ -908,7 +1018,7 @@ export function createMcpServer(): McpServer {
       title: "Launch a visible Godot scene",
       description:
         "Starts the main or specified scene in a persistent visible window and returns a runId for status and stop operations.",
-      inputSchema: LaunchInputSchema,
+      inputSchema: loggedInputSchema("godot_scene_launch", LaunchInputSchema),
       outputSchema: GodotLaunchResultSchema,
       annotations: {
         readOnlyHint: false,
@@ -918,7 +1028,7 @@ export function createMcpServer(): McpServer {
       },
     },
     async ({ projectPath, configPath, scene, startupTimeoutMs }) =>
-      await handle(async () =>
+      await handle("godot_scene_launch", async () =>
         await launchProject({
           projectPath,
           ...(configPath === undefined ? {} : { configPath }),
@@ -936,16 +1046,84 @@ export function createMcpServer(): McpServer {
       title: "Read a visible Godot run",
       description:
         "Returns persistent process state plus bounded stdout, stderr, and diagnostics for a runId.",
-      inputSchema: RunLookupInputSchema,
+      inputSchema: loggedInputSchema("godot_run_status", RunLookupInputSchema),
       outputSchema: GodotRunStatusSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, maxOutputBytes }) =>
-      await handle(async () =>
+      await handle("godot_run_status", async () =>
         await getManagedRunStatus({
           projectPath,
           runId,
           ...(maxOutputBytes === undefined ? {} : { maxOutputBytes }),
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "godot_log_read",
+    {
+      title: "Read bounded managed-run logs",
+      description: "Reads stdout and stderr with independent raw-byte cursors, bounded shaping, filtering, and deduplication. Combined results are stdout then stderr blocks, not reconstructed interleaving.",
+      inputSchema: loggedInputSchema("godot_log_read", LogReadInputSchema),
+      outputSchema: LogReadResultSchema,
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ projectPath, runId, cursor, stream, minimumSeverity, contains, maxLines, deduplicate, raw }) =>
+      await handle("godot_log_read", async () =>
+        await readManagedLogs({
+          projectPath,
+          runId,
+          ...(cursor === undefined ? {} : { cursor }),
+          stream,
+          minimumSeverity,
+          ...(contains === undefined ? {} : { contains }),
+          maxLines,
+          deduplicate,
+          raw,
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "godot_diagnostics",
+    {
+      title: "Summarize managed-run diagnostics",
+      description: "Returns bounded observed error and warning counts, deduplicated issues, cursors, and evidence-based next actions.",
+      inputSchema: loggedInputSchema("godot_diagnostics", DiagnosticsInputSchema),
+      outputSchema: DiagnosticsSummarySchema,
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ projectPath, runId, cursor, maxIssues }) =>
+      await handle("godot_diagnostics", async () =>
+        await getDiagnosticsSummary({
+          projectPath,
+          runId,
+          ...(cursor === undefined ? {} : { cursor }),
+          maxIssues,
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "godot_debug_report",
+    {
+      title: "Create a redacted debug report",
+      description: "Creates a bounded, redacted, create-only Markdown or JSON report under the project and requires review before sharing.",
+      inputSchema: loggedInputSchema("godot_debug_report", DebugReportInputSchema),
+      outputSchema: DebugReportResultSchema,
+      annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ projectPath, expectedProjectFingerprint, issue, runId, reproduction, cursor, format }) =>
+      await handle("godot_debug_report", async () =>
+        await createDebugReport({
+          projectPath,
+          expectedProjectFingerprint,
+          issue,
+          ...(runId === undefined ? {} : { runId }),
+          ...(reproduction === undefined ? {} : { reproduction }),
+          ...(cursor === undefined ? {} : { cursor }),
+          format,
         }),
       ),
   );
@@ -956,7 +1134,7 @@ export function createMcpServer(): McpServer {
       title: "Stop a visible Godot run",
       description:
         "Requests a token-authenticated stop for a runId and waits for a terminal state. Repeated calls are safe.",
-      inputSchema: StopInputSchema,
+      inputSchema: loggedInputSchema("godot_run_stop", StopInputSchema),
       outputSchema: GodotRunStatusSchema,
       annotations: {
         readOnlyHint: false,
@@ -966,7 +1144,7 @@ export function createMcpServer(): McpServer {
       },
     },
     async ({ projectPath, runId, maxOutputBytes, timeoutMs }) =>
-      await handle(async () =>
+      await handle("godot_run_stop", async () =>
         await stopManagedRun({
           projectPath,
           runId,
@@ -981,12 +1159,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Inspect the runtime bridge",
       description: "Authenticates to a managed run and returns its negotiated runtime capabilities and active scene.",
-      inputSchema: RuntimeLookupInputSchema,
+      inputSchema: loggedInputSchema("godot_runtime_status", RuntimeLookupInputSchema),
       outputSchema: RuntimeBridgeInfoSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, timeoutMs }) =>
-      await handle(async () =>
+      await handle("godot_runtime_status", async () =>
         await getRuntimeInfo({ projectPath, runId, ...(timeoutMs === undefined ? {} : { timeoutMs }) }),
       ),
   );
@@ -996,12 +1174,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Capture the running game",
       description: "Captures the root viewport to a PNG under the run-specific evidence directory and returns path, dimensions, size, and SHA-256.",
-      inputSchema: RuntimeLookupInputSchema,
+      inputSchema: loggedInputSchema("godot_runtime_screenshot", RuntimeLookupInputSchema),
       outputSchema: RuntimeScreenshotResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs }) =>
-      await handle(async () =>
+      await handle("godot_runtime_screenshot", async () =>
         await captureRuntimeScreenshot({ projectPath, runId, ...(timeoutMs === undefined ? {} : { timeoutMs }) }),
       ),
   );
@@ -1011,12 +1189,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Find visible runtime UI",
       description: "Returns bounded Control nodes with stable paths, types, text, visibility, disabled state, and global rectangles.",
-      inputSchema: RuntimeUiInputSchema,
+      inputSchema: loggedInputSchema("godot_runtime_ui_find", RuntimeUiInputSchema),
       outputSchema: RuntimeUiResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, timeoutMs, selector, limit }) =>
-      await handle(async () =>
+      await handle("godot_runtime_ui_find", async () =>
         await findRuntimeUi({
           projectPath,
           runId,
@@ -1032,12 +1210,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Read the runtime scene tree",
       description: "Returns the current running scene as a depth- and node-bounded structural tree without exposing the bridge node.",
-      inputSchema: RuntimeSceneTreeInputSchema,
+      inputSchema: loggedInputSchema("godot_runtime_scene_tree", RuntimeSceneTreeInputSchema),
       outputSchema: RuntimeSceneTreeResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, timeoutMs, maxDepth, maxNodes }) =>
-      await handle(async () =>
+      await handle("godot_runtime_scene_tree", async () =>
         await getRuntimeSceneTree({
           projectPath,
           runId,
@@ -1053,12 +1231,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Read a runtime node",
       description: "Reads identity and up to 100 declared properties from one running node; no methods or arbitrary code can be invoked.",
-      inputSchema: RuntimeNodeLookupInputSchema,
+      inputSchema: loggedInputSchema("godot_runtime_node_get", RuntimeNodeLookupInputSchema),
       outputSchema: RuntimeNodeResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, timeoutMs, nodePath, properties }) =>
-      await handle(async () =>
+      await handle("godot_runtime_node_get", async () =>
         await getRuntimeNode({
           projectPath,
           runId,
@@ -1074,12 +1252,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Observe gameplay-focused runtime state",
       description: "Returns bounded multi-node snapshots with transforms, velocity, animation, collision state, groups, metadata, and requested extra properties.",
-      inputSchema: RuntimeObserveInputSchema,
+      inputSchema: loggedInputSchema("godot_runtime_observe", RuntimeObserveInputSchema),
       outputSchema: RuntimeObservationResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, timeoutMs, nodePaths, properties }) =>
-      await handle(async () =>
+      await handle("godot_runtime_observe", async () =>
         await observeRuntime({
           projectPath,
           runId,
@@ -1095,12 +1273,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Simulate physics in an isolated world",
       description: "Duplicates the current scene into private 2D/3D worlds, advances 1-120 physics frames with optional InputMap action, samples one node, and restores the live tree pause state.",
-      inputSchema: RuntimeSimulationInputSchema,
+      inputSchema: loggedInputSchema("godot_runtime_simulate_physics", RuntimeSimulationInputSchema),
       outputSchema: RuntimeSimulationResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, nodePath, frames, properties, action, strength }) =>
-      await handle(async () =>
+      await handle("godot_runtime_simulate_physics", async () =>
         await simulateRuntimePhysics({
           projectPath,
           runId,
@@ -1119,12 +1297,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Project a 3D point into the game viewport",
       description: "Uses an active or explicitly selected Camera3D to map a Node3D or world position to screenshot pixel coordinates, including visibility and depth.",
-      inputSchema: RuntimeProjection3DInputSchema,
+      inputSchema: loggedInputSchema("godot_runtime_3d_project", RuntimeProjection3DInputSchema),
       outputSchema: RuntimeProjection3DResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, timeoutMs, cameraPath, nodePath, worldPosition }) =>
-      await handle(async () =>
+      await handle("godot_runtime_3d_project", async () =>
         await projectRuntime3D({
           projectPath,
           runId,
@@ -1141,12 +1319,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Raycast from a game viewport pixel",
       description: "Projects a screenshot pixel through Camera3D and performs a bounded physics ray query, returning the hit collider path, position, and normal.",
-      inputSchema: RuntimeRaycast3DInputSchema,
+      inputSchema: loggedInputSchema("godot_runtime_3d_raycast", RuntimeRaycast3DInputSchema),
       outputSchema: RuntimeRaycast3DResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, timeoutMs, cameraPath, screenPosition, maxDistance, collisionMask, collideWithBodies, collideWithAreas }) =>
-      await handle(async () =>
+      await handle("godot_runtime_3d_raycast", async () =>
         await raycastRuntime3D({
           projectPath,
           runId,
@@ -1166,12 +1344,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Inject bounded runtime input",
       description: "Clicks a Control path or coordinates, pulses an InputMap action, or sends a numeric keycode. Hold duration is capped at 2 seconds.",
-      inputSchema: RuntimeInputSchema,
+      inputSchema: loggedInputSchema("godot_runtime_input", RuntimeInputSchema),
       outputSchema: RuntimeInputResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async (value) =>
-      await handle(async () => {
+      await handle("godot_runtime_input", async () => {
         const common = {
           projectPath: value.projectPath,
           runId: value.runId,
@@ -1210,12 +1388,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Inject a bounded runtime input sequence",
       description: "Runs 1-32 validated click/action/key steps in order with bounded holds and delays totaling at most 5 seconds.",
-      inputSchema: RuntimeInputSequenceSchema,
+      inputSchema: loggedInputSchema("godot_runtime_input_sequence", RuntimeInputSequenceSchema),
       outputSchema: RuntimeInputSequenceResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, steps }) =>
-      await handle(async () => {
+      await handle("godot_runtime_input_sequence", async () => {
         const normalizedSteps = steps.map((step) => {
           if (step.kind === "click") {
             return {
@@ -1257,12 +1435,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Assert structured runtime state",
       description: "Evaluates a bounded UI-existence or node-property predicate and returns passed, expected, actual, and structured evidence.",
-      inputSchema: RuntimeAssertInputSchema,
+      inputSchema: loggedInputSchema("godot_runtime_assert", RuntimeAssertInputSchema),
       outputSchema: RuntimeAssertionResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async (value) =>
-      await handle(async () => {
+      await handle("godot_runtime_assert", async () => {
         const common = {
           projectPath: value.projectPath,
           runId: value.runId,
@@ -1292,12 +1470,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Wait for structured runtime state",
       description: "Polls a bounded UI or property predicate on process frames until it passes or the wait timeout expires, returning the last structured observation.",
-      inputSchema: RuntimeWaitInputSchema,
+      inputSchema: loggedInputSchema("godot_runtime_wait", RuntimeWaitInputSchema),
       outputSchema: RuntimeWaitResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async (value) =>
-      await handle(async () => {
+      await handle("godot_runtime_wait", async () => {
         const common = {
           projectPath: value.projectPath,
           runId: value.runId,
@@ -1329,12 +1507,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Pause, resume, or step the runtime",
       description: "Pauses/resumes the SceneTree or advances 1-120 process frames while paused. Step requires an explicit prior pause.",
-      inputSchema: RuntimeControlInputSchema,
+      inputSchema: loggedInputSchema("godot_runtime_control", RuntimeControlInputSchema),
       outputSchema: RuntimeControlResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, action, frames }) =>
-      await handle(async () => {
+      await handle("godot_runtime_control", async () => {
         const common = {
           projectPath,
           runId,
@@ -1356,12 +1534,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Launch a managed Godot editor",
       description: "Starts an enabled EditorPlugin in a visible managed editor and returns a runId shared by editor status, scene-tree, screenshot, and stop tools.",
-      inputSchema: GodotOperationInputSchema.omit({ maxOutputBytes: true }),
+      inputSchema: loggedInputSchema("godot_editor_launch", GodotOperationInputSchema.omit({ maxOutputBytes: true })),
       outputSchema: GodotLaunchResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, configPath, timeoutMs }) =>
-      await handle(async () =>
+      await handle("godot_editor_launch", async () =>
         await launchEditor({
           projectPath,
           ...(configPath === undefined ? {} : { configPath }),
@@ -1375,12 +1553,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Inspect the EditorPlugin bridge",
       description: "Authenticates to a managed editor and reports the open scene and read-only editor capabilities.",
-      inputSchema: RuntimeLookupInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_status", RuntimeLookupInputSchema),
       outputSchema: EditorBridgeInfoSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, timeoutMs }) =>
-      await handle(async () =>
+      await handle("godot_editor_status", async () =>
         await getEditorInfo({ projectPath, runId, ...(timeoutMs === undefined ? {} : { timeoutMs }) }),
       ),
   );
@@ -1390,12 +1568,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Read an allowlisted project setting",
       description: "Reads one existing bounded project setting from the managed editor's loaded ProjectSettings state.",
-      inputSchema: EditorProjectSettingGetInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_project_setting_get", EditorProjectSettingGetInputSchema),
       outputSchema: EditorProjectSettingResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, timeoutMs, key }) =>
-      await handle(async () => await getEditorProjectSetting({
+      await handle("godot_editor_project_setting_get", async () => await getEditorProjectSetting({
         projectPath,
         runId,
         key,
@@ -1408,12 +1586,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Set an allowlisted project setting",
       description: "Changes one existing bounded project setting under project fingerprint, project.godot SHA-256, managed-run, and cross-process lease guards.",
-      inputSchema: EditorProjectSettingSetInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_project_setting_set", EditorProjectSettingSetInputSchema),
       outputSchema: EditorProjectSettingMutationResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedProjectFileSha256, key, value }) =>
-      await handle(async () => await setEditorProjectSetting({
+      await handle("godot_editor_project_setting_set", async () => await setEditorProjectSetting({
         projectPath,
         runId,
         expectedProjectFingerprint,
@@ -1429,12 +1607,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Upsert a typed InputMap action",
       description: "Persists one bounded typed InputMap action under the same project.godot identity, SHA-256, and lease guards as project settings.",
-      inputSchema: EditorInputActionUpsertInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_input_action_upsert", EditorInputActionUpsertInputSchema),
       outputSchema: EditorInputActionMutationResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedProjectFileSha256, name, deadzone, replaceEvents, events }) =>
-      await handle(async () => await upsertEditorInputAction({
+      await handle("godot_editor_input_action_upsert", async () => await upsertEditorInputAction({
         projectPath,
         runId,
         expectedProjectFingerprint,
@@ -1452,12 +1630,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Inspect an external Godot Resource",
       description: "Loads one project-internal non-linked .tres/.res and returns a bounded class/path/property summary without modifying it.",
-      inputSchema: EditorResourceInspectInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_resource_inspect", EditorResourceInspectInputSchema),
       outputSchema: EditorResourceInspectionResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, timeoutMs, path, properties }) =>
-      await handle(async () => await inspectEditorResourcePath({
+      await handle("godot_editor_resource_inspect", async () => await inspectEditorResourcePath({
         projectPath,
         runId,
         path,
@@ -1471,12 +1649,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Open an editor scene",
       description: "Explicitly opens one project-local .tscn after validating project identity, then returns the active scene's native history version.",
-      inputSchema: EditorSceneOpenInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_scene_open", EditorSceneOpenInputSchema),
       outputSchema: EditorSceneOpenResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, scenePath }) =>
-      await handle(async () =>
+      await handle("godot_editor_scene_open", async () =>
         await openEditorScene({
           projectPath,
           runId,
@@ -1492,12 +1670,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Read the edited scene tree",
       description: "Returns the currently edited scene as a bounded-depth structural tree of paths, names, types, and owners.",
-      inputSchema: RuntimeLookupInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_scene_tree", RuntimeLookupInputSchema),
       outputSchema: EditorSceneTreeResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, timeoutMs }) =>
-      await handle(async () =>
+      await handle("godot_editor_scene_tree", async () =>
         await getEditorSceneTree({ projectPath, runId, ...(timeoutMs === undefined ? {} : { timeoutMs }) }),
       ),
   );
@@ -1507,12 +1685,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Read an edited scene node",
       description: "Reads one edited-scene node and up to 100 named properties. Godot Variants use tagged JSON objects such as {$type:'Vector2',x,y}.",
-      inputSchema: EditorNodeLookupInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_node_get", EditorNodeLookupInputSchema),
       outputSchema: EditorNodeResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, timeoutMs, nodePath, properties }) =>
-      await handle(async () =>
+      await handle("godot_editor_node_get", async () =>
         await getEditorNode({
           projectPath,
           runId,
@@ -1528,12 +1706,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Read the editor selection",
       description: "Returns selected edited-scene node paths and the focused node path.",
-      inputSchema: RuntimeLookupInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_selection_get", RuntimeLookupInputSchema),
       outputSchema: EditorSelectionResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, timeoutMs }) =>
-      await handle(async () =>
+      await handle("godot_editor_selection_get", async () =>
         await getEditorSelection({
           projectPath,
           runId,
@@ -1547,12 +1725,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Select and focus edited-scene nodes",
       description: "Replaces the editor selection with up to 100 scene nodes and optionally focuses the first node in the Inspector.",
-      inputSchema: EditorSelectionSetInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_selection_set", EditorSelectionSetInputSchema),
       outputSchema: EditorSelectionResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, paths, focus }) =>
-      await handle(async () =>
+      await handle("godot_editor_selection_set", async () =>
         await setEditorSelection({
           projectPath,
           runId,
@@ -1568,12 +1746,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Apply an atomic editor scene batch",
       description: "Validates 1-32 typed scene operations, then applies them as one native Undo/Redo action without saving. Creation-only batches do not delete content; this tool is statically marked destructive because node_delete is supported.",
-      inputSchema: EditorBatchInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_batch", EditorBatchInputSchema),
       outputSchema: EditorBatchResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, actionName, operations, confirmDestructive }) =>
-      await handle(async () =>
+      await handle("godot_editor_batch", async () =>
         await batchEditorScene({
           projectPath,
           runId,
@@ -1592,12 +1770,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Create an edited scene node",
       description: "Creates an instantiable Godot Node under parentPath, sets owner to the edited root, applies validated properties, and records one native Undo/Redo action.",
-      inputSchema: EditorNodeCreateHandlerInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_node_create", EditorNodeCreateHandlerInputSchema),
       outputSchema: EditorMutationResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, parentPath, type, name, properties }) =>
-      await handle(async () =>
+      await handle("godot_editor_node_create", async () =>
         await createEditorNode({
           projectPath,
           runId,
@@ -1617,12 +1795,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Instantiate a PackedScene",
       description: "Loads a project-local .tscn and adds an editable scene instance below a parent as one native Undo/Redo action.",
-      inputSchema: EditorSceneInstantiateHandlerInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_scene_instantiate", EditorSceneInstantiateHandlerInputSchema),
       outputSchema: EditorMutationResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, parentPath, scenePath, name, properties }) =>
-      await handle(async () =>
+      await handle("godot_editor_scene_instantiate", async () =>
         await instantiateEditorScene({
           projectPath,
           runId,
@@ -1642,12 +1820,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Create an inherited PackedScene",
       description: "Uses Godot PackedScene and SceneState APIs to create a project-local inherited .tscn with optional root overrides; target file creation is not Undo/Redo-backed.",
-      inputSchema: EditorSceneInheritanceInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_scene_create_inherited", EditorSceneInheritanceInputSchema),
       outputSchema: EditorInheritedSceneResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, sourceScenePath, targetScenePath, rootName, rootProperties, open, overwrite }) =>
-      await handle(async () =>
+      await handle("godot_editor_scene_create_inherited", async () =>
         await createInheritedEditorScene({
           projectPath,
           runId,
@@ -1667,12 +1845,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Read PackedScene instance editability",
       description: "Reports the source scene and editable-children state of an instantiated PackedScene root.",
-      inputSchema: EditorInstanceLookupInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_instance_get", EditorInstanceLookupInputSchema),
       outputSchema: EditorInstanceResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, timeoutMs, nodePath }) =>
-      await handle(async () =>
+      await handle("godot_editor_instance_get", async () =>
         await getEditorInstance({
           projectPath,
           runId,
@@ -1687,12 +1865,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Set PackedScene editable children",
       description: "Enables or disables editable children through Node.set_editable_instance as one native Godot Undo/Redo action.",
-      inputSchema: EditorInstanceSetEditableHandlerInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_instance_set_editable", EditorInstanceSetEditableHandlerInputSchema),
       outputSchema: EditorInstanceMutationResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, nodePath, editable }) =>
-      await handle(async () =>
+      await handle("godot_editor_instance_set_editable", async () =>
         await setEditorInstanceEditable({
           projectPath,
           runId,
@@ -1710,12 +1888,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Update an edited scene node",
       description: "Renames a node and/or applies validated Godot properties as one native Undo/Redo action. Structural owner and scene path properties are rejected.",
-      inputSchema: EditorNodeUpdateHandlerInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_node_update", EditorNodeUpdateHandlerInputSchema),
       outputSchema: EditorMutationResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, nodePath, name, properties }) =>
-      await handle(async () =>
+      await handle("godot_editor_node_update", async () =>
         await updateEditorNode({
           projectPath,
           runId,
@@ -1734,12 +1912,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Delete an edited scene node",
       description: "Removes a non-root node while retaining it for native Undo/Redo restoration.",
-      inputSchema: EditorNodeDeleteHandlerInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_node_delete", EditorNodeDeleteHandlerInputSchema),
       outputSchema: EditorMutationResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, nodePath }) =>
-      await handle(async () =>
+      await handle("godot_editor_node_delete", async () =>
         await deleteEditorNode({
           projectPath,
           runId,
@@ -1756,12 +1934,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Move an edited scene node",
       description: "Reparents and/or reorders a non-root node as one native Undo/Redo action, rejecting cycles and name conflicts.",
-      inputSchema: EditorNodeMoveHandlerInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_node_move", EditorNodeMoveHandlerInputSchema),
       outputSchema: EditorMutationResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, nodePath, newParentPath, index, keepGlobalTransform }) =>
-      await handle(async () =>
+      await handle("godot_editor_node_move", async () =>
         await moveEditorNode({
           projectPath,
           runId,
@@ -1781,12 +1959,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Create an inline Godot resource",
       description: "Creates a validated Resource, applies tagged Variant properties, and assigns it to one edited-scene node property as a native Undo/Redo action.",
-      inputSchema: EditorResourceCreateHandlerInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_resource_create", EditorResourceCreateHandlerInputSchema),
       outputSchema: EditorResourceResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, nodePath, property, type, properties }) =>
-      await handle(async () =>
+      await handle("godot_editor_resource_create", async () =>
         await createEditorResource({
           projectPath,
           runId,
@@ -1806,12 +1984,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Read a Godot resource",
       description: "Reads up to 100 declared properties from the Resource stored in one edited-scene node property.",
-      inputSchema: EditorResourceLookupInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_resource_get", EditorResourceLookupInputSchema),
       outputSchema: EditorResourceReadResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectPath, runId, timeoutMs, nodePath, property, properties }) =>
-      await handle(async () =>
+      await handle("godot_editor_resource_get", async () =>
         await getEditorResource({
           projectPath,
           runId,
@@ -1828,12 +2006,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Update a Godot resource",
       description: "Applies validated Resource subproperties as one native Godot Undo/Redo action; it does not invoke methods or save an external file.",
-      inputSchema: EditorResourceUpdateHandlerInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_resource_update", EditorResourceUpdateHandlerInputSchema),
       outputSchema: EditorResourceResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, nodePath, property, properties }) =>
-      await handle(async () =>
+      await handle("godot_editor_resource_update", async () =>
         await updateEditorResource({
           projectPath,
           runId,
@@ -1852,12 +2030,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Save an external Godot resource",
       description: "Saves a node's Resource property as a project-local .tres. Overwrite is rejected by default; the filesystem side effect is not undoable.",
-      inputSchema: EditorResourceSaveHandlerInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_resource_save", EditorResourceSaveHandlerInputSchema),
       outputSchema: EditorResourceSaveResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, nodePath, property, path, overwrite }) =>
-      await handle(async () =>
+      await handle("godot_editor_resource_save", async () =>
         await saveEditorResource({
           projectPath,
           runId,
@@ -1877,12 +2055,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Focus a project resource",
       description: "Selects a validated project-local resource in the FileSystem dock and opens it through EditorInterface.",
-      inputSchema: EditorResourceFocusInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_resource_focus", EditorResourceFocusInputSchema),
       outputSchema: EditorResourceFocusResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, path }) =>
-      await handle(async () =>
+      await handle("godot_editor_resource_focus", async () =>
         await focusEditorResource({
           projectPath,
           runId,
@@ -1897,12 +2075,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Connect an edited scene signal",
       description: "Creates a persistent signal-to-method connection between edited-scene nodes as one native Undo/Redo action.",
-      inputSchema: EditorSignalConnectHandlerInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_signal_connect", EditorSignalConnectHandlerInputSchema),
       outputSchema: EditorSignalConnectionResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, sourcePath, signal, targetPath, method, flags }) =>
-      await handle(async () =>
+      await handle("godot_editor_signal_connect", async () =>
         await connectEditorSignal({
           projectPath,
           runId,
@@ -1923,12 +2101,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Save the edited scene",
       description: "Saves the active edited scene through EditorInterface and returns the res:// path and Godot error code.",
-      inputSchema: EditorSceneSaveHandlerInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_scene_save", EditorSceneSaveHandlerInputSchema),
       outputSchema: EditorSceneSaveResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, expectedHistoryVersion }) =>
-      await handle(async () =>
+      await handle("godot_editor_scene_save", async () =>
         await saveEditorScene({
           projectPath,
           runId,
@@ -1945,12 +2123,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Undo an edited scene action",
       description: "Undoes the latest action in the active scene's native Godot Undo/Redo history.",
-      inputSchema: EditorHistoryMutationHandlerInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_undo", EditorHistoryMutationHandlerInputSchema),
       outputSchema: EditorHistoryResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, expectedHistoryVersion, expectedActionName }) =>
-      await handle(async () =>
+      await handle("godot_editor_undo", async () =>
         await undoEditorAction({
           projectPath,
           runId,
@@ -1968,12 +2146,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Redo an edited scene action",
       description: "Redoes the next action in the active scene's native Godot Undo/Redo history.",
-      inputSchema: EditorHistoryMutationHandlerInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_redo", EditorHistoryMutationHandlerInputSchema),
       outputSchema: EditorHistoryResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, expectedHistoryVersion, expectedActionName }) =>
-      await handle(async () =>
+      await handle("godot_editor_redo", async () =>
         await redoEditorAction({
           projectPath,
           runId,
@@ -1991,12 +2169,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Capture an editor 2D or 3D viewport",
       description: "Captures the managed editor's 2D viewport or one of four 3D viewports and returns active 3D editor camera metadata with the PNG evidence.",
-      inputSchema: EditorScreenshotInputSchema,
+      inputSchema: loggedInputSchema("godot_editor_screenshot", EditorScreenshotInputSchema),
       outputSchema: EditorScreenshotResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ projectPath, runId, timeoutMs, viewport, viewportIndex }) =>
-      await handle(async () =>
+      await handle("godot_editor_screenshot", async () =>
         await captureEditorScreenshot({
           projectPath,
           runId,

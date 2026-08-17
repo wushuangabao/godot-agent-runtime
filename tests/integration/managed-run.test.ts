@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -9,6 +9,10 @@ import {
   launchManagedProcess,
   stopManagedRun,
 } from "../../packages/core/src/managed-run.js";
+import {
+  getDiagnosticsSummary,
+  readManagedLogs,
+} from "../../packages/core/src/diagnostics.js";
 import { RuntimeFailure } from "../../packages/core/src/errors.js";
 import {
   findLoopbackPort,
@@ -176,6 +180,56 @@ describe("managed run lifecycle", () => {
     expect(stoppedAgain.state).toBe("stopped");
     expect(stoppedAgain.stdout).toContain("MANAGED_PROCESS_READY");
     expect(stoppedAgain.endedAt).not.toBeNull();
+  });
+
+  it("reads appended logs incrementally and derives diagnostics only from observed run facts", async () => {
+    const projectPath = resolve("tests", "fixtures", "managed-process");
+    const childScript = resolve(projectPath, "child.mjs");
+    const launch = await launchManagedProcess({
+      projectPath,
+      executable: process.execPath,
+      args: [childScript],
+      env: { ...process.env },
+      scene: null,
+    });
+    try {
+      let first = await readManagedLogs({ projectPath, runId: launch.runId, maxLines: 100 });
+      for (let attempt = 0; attempt < 20 && first.nextCursor.stdoutBytes === 0; attempt += 1) {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+        first = await readManagedLogs({ projectPath, runId: launch.runId, maxLines: 100 });
+      }
+      await appendFile(launch.stderrPath, "SCRIPT ERROR: Parse Error at res://broken.gd\n", "utf8");
+      const incremental = await readManagedLogs({
+        projectPath,
+        runId: launch.runId,
+        cursor: first.nextCursor,
+        minimumSeverity: "warning",
+        maxLines: 100,
+      });
+      expect(incremental.entries).toEqual([
+        expect.objectContaining({
+          stream: "stderr",
+          severity: "error",
+          message: "SCRIPT ERROR: Parse Error at res://broken.gd",
+        }),
+      ]);
+
+      const summary = await getDiagnosticsSummary({
+        projectPath,
+        runId: launch.runId,
+        cursor: first.nextCursor,
+      });
+      expect(summary).toMatchObject({
+        state: "running",
+        counts: { errors: 1, warnings: 0, unique: 1, repeated: 0 },
+        nextActions: expect.arrayContaining([
+          { tool: "godot_script_check", required: true, reason: expect.any(String) },
+          { tool: "godot_run_stop", required: false, reason: expect.any(String) },
+        ]),
+      });
+    } finally {
+      await stopManagedRun({ projectPath, runId: launch.runId });
+    }
   });
 
   it("fails fast when a managed runtime bridge process exits", async () => {

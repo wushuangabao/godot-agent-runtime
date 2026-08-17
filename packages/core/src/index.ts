@@ -10,6 +10,27 @@ export type {
 export { findProjects } from "./discovery.js";
 export type { FindProjectsOptions } from "./discovery.js";
 export { runDoctor } from "./doctor.js";
+export {
+  classifyLogLine,
+  getDiagnosticsSummary,
+  readManagedLogs,
+  shapeLogLines,
+} from "./diagnostics.js";
+export type {
+  DiagnosticsOptions,
+  LogSeverity,
+  LogStream,
+  ReadManagedLogsOptions,
+  ShapeLogOptions,
+  ShapedLogLine,
+  ShapedLogLines,
+} from "./diagnostics.js";
+export {
+  createDebugReport,
+  redactDebugText,
+  renderDebugReport,
+} from "./debug-report.js";
+export type { CreateDebugReportOptions } from "./debug-report.js";
 export { RuntimeFailure, toRuntimeError } from "./errors.js";
 export {
   batchEditorScene,

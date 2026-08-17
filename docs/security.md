@@ -17,6 +17,14 @@ Godot 项目本身可以执行任意本机代码。本项目的安全目标不�
 - 停止先请求 `SIGTERM`，5 秒后仍未退出则升级为 `SIGKILL`；重复停止返回同一个终态。
 - Godot 的数据/配置/缓存目录隔离在项目 `.godot/agent-runtime-host/`，不读写用户编辑器的全局设置。
 
+## 诊断、日志与调试报告
+
+- 受管日志读取使用 stdout/stderr 独立原始字节游标；单次合计最多 1 MiB、最多 500 行。组合结果固定为 stdout 块后接 stderr 块，每条记录标明来源，不声称恢复两个文件的真实交错时序。
+- 游标只越过完整 UTF-8 code point；过滤、严重级别整形和去重不删除或改写原始日志文件。诊断读取每次最多消费 `maxIssues` 条原始日志行，不让 `nextCursor` 越过本次未返回的不同问题；截断时要求继续调用 `godot_log_read`。诊断建议只依据当前可观察到的运行状态、日志、截断与错误事实；“日志干净”不等于交互验证成功。
+- 调试报告先校验项目 fingerprint，再经项目 mutation lease 以 create-only 方式发布到 `.godot/agent-runtime/reports/`。报告总量有界，只汇总 doctor、独立 Editor/Runtime 协议版本、能力、诊断、过滤日志和用户提供的问题/复现说明，不读取项目源码，也不收集环境变量值或完整 MCP 参数。
+- 常见 token、密码、secret、API key 和 Bearer 授权值在 Markdown/JSON 报告中统一脱敏；receipt 始终标记 `reviewRequired: true`，调用方发送报告前仍需人工检查。
+- MCP 调用诊断日志只写 stderr。默认记录已注册工具的失败（包括 handler 运行前的输入 Schema 校验失败），`GODOT_AGENT_RUNTIME_MCP_DEBUG=1` 时记录其全部调用；每条 JSON 仅含 `tool/ok/durationMs/code/stage`，不记录参数、令牌或项目内容，stdout 始终保留给 MCP 协议帧。未知工具名由 MCP SDK 在匹配已注册工具前拒绝，不属于这项调用日志契约。
+
 ## EditorPlugin 与 Runtime Bridge
 
 - 只绑定 `127.0.0.1`，端口由操作系统临时分配；不监听局域网或公网接口。

@@ -63,6 +63,13 @@ export interface ManagedRunConnection {
   readonly runtimeBridgePort: number;
 }
 
+export interface ManagedRunLogFiles {
+  readonly projectPath: string;
+  readonly runId: string;
+  readonly stdoutPath: string;
+  readonly stderrPath: string;
+}
+
 const RUN_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TERMINAL_STATES = new Set<GodotRunStatus["state"]>([
@@ -394,6 +401,18 @@ export async function getManagedRunStatus(
     truncated: stdout.truncated || stderr.truncated,
     diagnostics: diagnostics(stdout.text, stderr.text),
     runtimeBridgePort: metadata.runtimeBridgePort,
+  };
+}
+
+export async function getManagedRunLogFiles(
+  options: ManagedRunLookupOptions,
+): Promise<ManagedRunLogFiles> {
+  const metadata = await readMetadata(options.projectPath, options.runId);
+  return {
+    projectPath: metadata.projectPath,
+    runId: metadata.runId,
+    stdoutPath: metadata.stdoutPath,
+    stderrPath: metadata.stderrPath,
   };
 }
 

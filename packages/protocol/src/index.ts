@@ -179,6 +179,92 @@ export const GodotRunStatusSchema = z.object({
 
 export type GodotRunStatus = z.infer<typeof GodotRunStatusSchema>;
 
+export const LogCursorSchema = z.object({
+  stdoutBytes: z.number().int().nonnegative(),
+  stderrBytes: z.number().int().nonnegative(),
+}).strict();
+
+export type LogCursor = z.infer<typeof LogCursorSchema>;
+
+export const LogEntrySchema = z.object({
+  stream: z.enum(["stdout", "stderr"]),
+  severity: z.enum(["error", "warning", "info"]),
+  message: z.string(),
+  count: z.number().int().positive(),
+}).strict();
+
+export type LogEntry = z.infer<typeof LogEntrySchema>;
+
+export const LogHiddenSchema = z.object({
+  belowSeverity: z.number().int().nonnegative(),
+  contains: z.number().int().nonnegative(),
+  duplicates: z.number().int().nonnegative(),
+}).strict();
+
+export const LogReadResultSchema = z.object({
+  ok: z.literal(true),
+  projectPath: z.string().min(1),
+  runId: z.uuid(),
+  stream: z.enum(["stdout", "stderr", "combined"]),
+  order: z.literal("stdout_then_stderr_blocks"),
+  cursor: LogCursorSchema,
+  nextCursor: LogCursorSchema,
+  entries: z.array(LogEntrySchema).max(500),
+  hidden: LogHiddenSchema,
+  bytesRead: z.number().int().nonnegative().max(1_048_576),
+  truncated: z.boolean(),
+  raw: z.boolean(),
+}).strict();
+
+export type LogReadResult = z.infer<typeof LogReadResultSchema>;
+
+export const NextActionSchema = z.object({
+  tool: z.string().startsWith("godot_"),
+  reason: z.string().min(1),
+  required: z.boolean(),
+}).strict();
+
+export const DiagnosticsSummarySchema = z.object({
+  ok: z.literal(true),
+  projectPath: z.string().min(1),
+  runId: z.uuid(),
+  state: ManagedRunStateSchema,
+  counts: z.object({
+    errors: z.number().int().nonnegative(),
+    warnings: z.number().int().nonnegative(),
+    unique: z.number().int().nonnegative(),
+    repeated: z.number().int().nonnegative(),
+  }).strict(),
+  issues: z.array(LogEntrySchema).max(50),
+  nextCursor: LogCursorSchema,
+  truncated: z.boolean(),
+  nextActions: z.array(NextActionSchema),
+}).strict();
+
+export type DiagnosticsSummary = z.infer<typeof DiagnosticsSummarySchema>;
+
+export const DebugReportResultSchema = z.object({
+  ok: z.literal(true),
+  projectPath: z.string().min(1),
+  path: z.string().startsWith("res://").regex(/\.(?:md|json)$/),
+  bytes: z.number().int().positive(),
+  sha256: Sha256Schema,
+  includedSections: z.array(z.enum([
+    "doctor",
+    "protocolVersions",
+    "engine",
+    "capabilities",
+    "diagnostics",
+    "logs",
+    "runId",
+    "issue",
+    "reproduction",
+  ])),
+  reviewRequired: z.literal(true),
+}).strict();
+
+export type DebugReportResult = z.infer<typeof DebugReportResultSchema>;
+
 export const ToolErrorResultSchema = z.object({
   ok: z.literal(false),
   error: RuntimeErrorSchema,

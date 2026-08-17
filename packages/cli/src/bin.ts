@@ -26,6 +26,7 @@ import {
   getEditorSceneTree,
   getEditorSelection,
   getManagedRunStatus,
+  getDiagnosticsSummary,
   getProjectContext,
   getRuntimeNode,
   observeRuntime,
@@ -41,10 +42,12 @@ import {
   launchProject,
   moveEditorNode,
   openEditorScene,
+  readManagedLogs,
   readProjectFile,
   redoEditorAction,
   replaceProjectText,
   runDoctor,
+  createDebugReport,
   runProject,
   stopManagedRun,
   saveEditorScene,
@@ -83,6 +86,29 @@ function positional(args: string[]): string[] {
     values.push(args[index] ?? "");
   }
   return values;
+}
+
+function assertCommandShape(
+  args: string[],
+  command: string,
+  positionalCount: number,
+  allowedOptions: ReadonlySet<string>,
+): void {
+  let actualPositionals = 0;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index] ?? "";
+    if (!argument.startsWith("--")) {
+      actualPositionals += 1;
+      continue;
+    }
+    if (!allowedOptions.has(argument)) throw new Error(`${command} does not support ${argument}.`);
+    const value = args[index + 1];
+    if (value === undefined || value.startsWith("--")) throw new Error(`${argument} requires a value.`);
+    index += 1;
+  }
+  if (actualPositionals !== positionalCount) {
+    throw new Error(`${command} received ${actualPositionals} positional arguments; expected ${positionalCount}.`);
+  }
 }
 
 function sha256Option(args: string[], name: string): string | undefined {
@@ -127,6 +153,22 @@ function parseBoolean(source: string | undefined, optionName: string): boolean |
   if (source === "true") return true;
   if (source === "false") return false;
   throw new Error(`${optionName} must be true or false.`);
+}
+
+function parseLogCursor(source: string | undefined): { stdoutBytes: number; stderrBytes: number } | undefined {
+  const value = parseJsonObject(source, "--cursor");
+  if (value === undefined) return undefined;
+  if (
+    Object.keys(value).some((key) => key !== "stdoutBytes" && key !== "stderrBytes") ||
+    !Number.isInteger(value.stdoutBytes) || Number(value.stdoutBytes) < 0 ||
+    !Number.isInteger(value.stderrBytes) || Number(value.stderrBytes) < 0
+  ) {
+    throw new Error("--cursor must be a strict JSON object with non-negative integer stdoutBytes and stderrBytes.");
+  }
+  return {
+    stdoutBytes: Number(value.stdoutBytes),
+    stderrBytes: Number(value.stderrBytes),
+  };
 }
 
 function editorMutationGuard(args: string[]): {
@@ -187,6 +229,9 @@ function printHelp(): void {
   process.stdout.write(`  run PROJECT_PATH [--scene RES_PATH] [--config PATH] [--timeout MS]  # headless\n`);
   process.stdout.write(`  launch PROJECT_PATH [--scene RES_PATH] [--config PATH] [--timeout MS]\n`);
   process.stdout.write(`  status PROJECT_PATH RUN_ID [--max-output BYTES]\n`);
+  process.stdout.write(`  log-read PROJECT_PATH RUN_ID [--cursor JSON] [--stream stdout|stderr|combined] [--minimum-severity error|warning|info] [--contains TEXT] [--max-lines N] [--deduplicate true|false] [--raw true|false]\n`);
+  process.stdout.write(`  diagnostics PROJECT_PATH RUN_ID [--cursor JSON] [--max-issues N]\n`);
+  process.stdout.write(`  debug-report PROJECT_PATH --project-fingerprint HASH --issue TEXT [--run-id RUN_ID] [--reproduction TEXT] [--cursor JSON] [--format markdown|json]\n`);
   process.stdout.write(`  stop PROJECT_PATH RUN_ID [--timeout MS] [--max-output BYTES]\n`);
   process.stdout.write(`  configure <codex|deepseek-harness|claude-code> [--project PATH] [--server PATH]\n`);
   process.stdout.write(`  addon-install PROJECT_PATH\n`);
@@ -391,6 +436,96 @@ async function main(): Promise<void> {
         }),
       );
       return;
+    case "log-read": {
+      assertCommandShape(args, "log-read", 2, new Set([
+        "--cursor",
+        "--stream",
+        "--minimum-severity",
+        "--contains",
+        "--max-lines",
+        "--deduplicate",
+        "--raw",
+      ]));
+      if (!values[0] || !values[1]) throw new Error("log-read requires PROJECT_PATH and RUN_ID.");
+      const cursor = parseLogCursor(option(args, "--cursor"));
+      const stream = option(args, "--stream");
+      if (stream !== undefined && stream !== "stdout" && stream !== "stderr" && stream !== "combined") {
+        throw new Error("--stream must be stdout, stderr, or combined.");
+      }
+      const minimumSeverity = option(args, "--minimum-severity");
+      if (minimumSeverity !== undefined && minimumSeverity !== "error" && minimumSeverity !== "warning" && minimumSeverity !== "info") {
+        throw new Error("--minimum-severity must be error, warning, or info.");
+      }
+      const contains = option(args, "--contains");
+      if (contains !== undefined && (contains.length === 0 || contains.length > 1024)) {
+        throw new Error("--contains must contain 1 through 1024 characters.");
+      }
+      const maxLines = option(args, "--max-lines");
+      const deduplicate = parseBoolean(option(args, "--deduplicate"), "--deduplicate");
+      const raw = parseBoolean(option(args, "--raw"), "--raw");
+      print(await readManagedLogs({
+        projectPath: values[0],
+        runId: values[1],
+        ...(cursor === undefined ? {} : { cursor }),
+        ...(stream === undefined ? {} : { stream }),
+        ...(minimumSeverity === undefined ? {} : { minimumSeverity }),
+        ...(contains === undefined ? {} : { contains }),
+        ...(maxLines === undefined ? {} : { maxLines: parseInteger(maxLines, "--max-lines", { min: 1, max: 500 }) }),
+        ...(deduplicate === undefined ? {} : { deduplicate }),
+        ...(raw === undefined ? {} : { raw }),
+      }));
+      return;
+    }
+    case "diagnostics": {
+      assertCommandShape(args, "diagnostics", 2, new Set(["--cursor", "--max-issues"]));
+      if (!values[0] || !values[1]) throw new Error("diagnostics requires PROJECT_PATH and RUN_ID.");
+      const cursor = parseLogCursor(option(args, "--cursor"));
+      const maxIssues = option(args, "--max-issues");
+      print(await getDiagnosticsSummary({
+        projectPath: values[0],
+        runId: values[1],
+        ...(cursor === undefined ? {} : { cursor }),
+        ...(maxIssues === undefined ? {} : { maxIssues: parseInteger(maxIssues, "--max-issues", { min: 1, max: 50 }) }),
+      }));
+      return;
+    }
+    case "debug-report": {
+      assertCommandShape(args, "debug-report", 1, new Set([
+        "--project-fingerprint",
+        "--issue",
+        "--run-id",
+        "--reproduction",
+        "--cursor",
+        "--format",
+      ]));
+      if (!values[0]) throw new Error("debug-report requires PROJECT_PATH.");
+      const expectedProjectFingerprint = sha256Option(args, "--project-fingerprint");
+      const issue = option(args, "--issue");
+      if (expectedProjectFingerprint === undefined || issue === undefined || issue.length === 0) {
+        throw new Error("debug-report requires --project-fingerprint HASH and --issue TEXT.");
+      }
+      if (issue.length > 16_384) throw new Error("--issue must not exceed 16384 characters.");
+      const runId = option(args, "--run-id");
+      const reproduction = option(args, "--reproduction");
+      if (reproduction !== undefined && (reproduction.length === 0 || reproduction.length > 32_768)) {
+        throw new Error("--reproduction must contain 1 through 32768 characters.");
+      }
+      const cursor = parseLogCursor(option(args, "--cursor"));
+      const format = option(args, "--format");
+      if (format !== undefined && format !== "markdown" && format !== "json") {
+        throw new Error("--format must be markdown or json.");
+      }
+      print(await createDebugReport({
+        projectPath: values[0],
+        expectedProjectFingerprint,
+        issue,
+        ...(runId === undefined ? {} : { runId }),
+        ...(reproduction === undefined ? {} : { reproduction }),
+        ...(cursor === undefined ? {} : { cursor }),
+        ...(format === undefined ? {} : { format }),
+      }));
+      return;
+    }
     case "stop":
       if (!values[0] || !values[1]) {
         throw new Error("stop requires PROJECT_PATH and RUN_ID.");

@@ -1,6 +1,6 @@
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -92,6 +92,9 @@ describe("MCP server", () => {
       "godot_scene_run",
       "godot_scene_launch",
       "godot_run_status",
+      "godot_log_read",
+      "godot_diagnostics",
+      "godot_debug_report",
       "godot_run_stop",
       "godot_runtime_status",
       "godot_runtime_screenshot",
@@ -154,6 +157,9 @@ describe("MCP server", () => {
     const editorNodeCreate = tools.find(({ name }) => name === "godot_editor_node_create");
     const editorBatch = tools.find(({ name }) => name === "godot_editor_batch");
     const editorSceneSave = tools.find(({ name }) => name === "godot_editor_scene_save");
+    const logRead = tools.find(({ name }) => name === "godot_log_read");
+    const diagnostics = tools.find(({ name }) => name === "godot_diagnostics");
+    const debugReport = tools.find(({ name }) => name === "godot_debug_report");
     expect(projectContext?.inputSchema.additionalProperties).toBe(false);
     expect(projectContext?.outputSchema?.additionalProperties).toBe(false);
     expect(projectContext?.annotations).toEqual({
@@ -218,6 +224,14 @@ describe("MCP server", () => {
       "expectedScenePath",
       "expectedHistoryVersion",
     ]));
+    expect(logRead?.inputSchema.additionalProperties).toBe(false);
+    expect(diagnostics?.inputSchema.additionalProperties).toBe(false);
+    expect(debugReport?.inputSchema.required).toEqual(expect.arrayContaining([
+      "projectPath",
+      "expectedProjectFingerprint",
+      "issue",
+    ]));
+    expect(debugReport?.inputSchema.additionalProperties).toBe(false);
     expect(fileWrite?.inputSchema.additionalProperties).toBe(false);
     expect(fileWrite?.annotations).toMatchObject({
       readOnlyHint: false,
@@ -614,6 +628,131 @@ describe("MCP server", () => {
       ok: false,
       error: { code: "RUN_NOT_FOUND", stage: "discovery" },
     });
+  });
+
+  it("offers equivalent bounded log and diagnostic results through MCP and CLI", async () => {
+    const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-mcp-diagnostics-"));
+    try {
+      await writeFile(resolve(projectPath, "project.godot"), "config_version=5\n", "utf8");
+      const runId = "00000000-0000-4000-8000-000000000017";
+      const directory = resolve(projectPath, ".godot", "agent-runtime", "runs");
+      await mkdir(directory, { recursive: true });
+      const stdoutPath = resolve(directory, `${runId}.stdout.log`);
+      const stderrPath = resolve(directory, `${runId}.stderr.log`);
+      await writeFile(stdoutPath, "READY\n", "utf8");
+      await writeFile(stderrPath, "ERROR: token=transport-secret\n", "utf8");
+      await writeFile(resolve(directory, `${runId}.json`), `${JSON.stringify({
+        schemaVersion: 1,
+        runId,
+        token: "metadata-secret",
+        state: "exited",
+        projectPath,
+        scene: null,
+        processId: null,
+        supervisorProcessId: process.pid,
+        startedAt: new Date(0).toISOString(),
+        endedAt: new Date(1).toISOString(),
+        exitCode: 0,
+        signal: null,
+        command: ["godot", "--path", projectPath],
+        stdoutPath,
+        stderrPath,
+        runtimeBridgePort: null,
+        failure: null,
+      }, null, 2)}\n`, "utf8");
+
+      const log = await client.callTool({
+        name: "godot_log_read",
+        arguments: { projectPath, runId, minimumSeverity: "warning", deduplicate: true },
+      });
+      const logCli = await runCli(["log-read", projectPath, runId, "--minimum-severity", "warning", "--deduplicate", "true"]);
+      expect(log.isError).not.toBe(true);
+      expect(logCli).toMatchObject({ code: 0, payload: log.structuredContent });
+
+      const diagnostic = await client.callTool({
+        name: "godot_diagnostics",
+        arguments: { projectPath, runId },
+      });
+      const diagnosticCli = await runCli(["diagnostics", projectPath, runId]);
+      expect(diagnostic.isError).not.toBe(true);
+      expect(diagnosticCli).toMatchObject({ code: 0, payload: diagnostic.structuredContent });
+
+      const identity = await getProjectIdentity(projectPath);
+      const oversizedCliIssue = await runCli([
+        "debug-report",
+        projectPath,
+        "--project-fingerprint",
+        identity.projectFingerprint,
+        "--issue",
+        "x".repeat(16_385),
+      ]);
+      expect(oversizedCliIssue).toMatchObject({ code: 1, payload: { ok: false } });
+      const report = await client.callTool({
+        name: "godot_debug_report",
+        arguments: {
+          projectPath,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          issue: "Runtime log error",
+          runId,
+          reproduction: "token=mcp-report-secret",
+          format: "json",
+        },
+      });
+      const reportCli = await runCli([
+        "debug-report",
+        projectPath,
+        "--project-fingerprint",
+        identity.projectFingerprint,
+        "--issue",
+        "Runtime log error",
+        "--run-id",
+        runId,
+        "--reproduction",
+        "token=cli-report-secret",
+        "--format",
+        "json",
+      ]);
+      expect(report.isError).not.toBe(true);
+      expect(report.structuredContent).toMatchObject({ reviewRequired: true, path: expect.stringMatching(/\.json$/) });
+      expect(reportCli).toMatchObject({ code: 0, payload: { reviewRequired: true, path: expect.stringMatching(/\.json$/) } });
+      for (const receipt of [report.structuredContent, reportCli.payload] as Array<{ path: string }>) {
+        const contents = await readFile(resolve(projectPath, receipt.path.slice("res://".length)), "utf8");
+        expect(contents).not.toContain("report-secret");
+        expect(contents).toContain("[REDACTED]");
+      }
+    } finally {
+      await rm(projectPath, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves managed-run stable errors for all diagnostic tools", async () => {
+    const projectPath = resolveProject("examples/minimal-2d");
+    const runId = "00000000-0000-4000-8000-000000000000";
+    for (const name of ["godot_log_read", "godot_diagnostics"] as const) {
+      const result = await client.callTool({ name, arguments: { projectPath, runId } });
+      expect(result).toMatchObject({
+        isError: true,
+        structuredContent: { ok: false, error: { code: "RUN_NOT_FOUND", stage: "discovery" } },
+      });
+    }
+  });
+
+  it("rejects unknown options and extra positionals for every new CLI command", async () => {
+    const projectPath = resolveProject("examples/minimal-2d");
+    const runId = "00000000-0000-4000-8000-000000000000";
+    const fingerprint = (await getProjectIdentity(projectPath)).projectFingerprint;
+    const cases = [
+      ["log-read", projectPath, runId, "--maximum-lines", "1"],
+      ["log-read", projectPath, runId, "extra"],
+      ["diagnostics", projectPath, runId, "--maximum-issues", "1"],
+      ["diagnostics", projectPath, runId, "extra"],
+      ["debug-report", projectPath, "--project-fingerprint", fingerprint, "--issue", "issue", "--unknown", "value"],
+      ["debug-report", projectPath, "extra", "--project-fingerprint", fingerprint, "--issue", "issue"],
+    ];
+    for (const args of cases) {
+      const result = await runCli(args);
+      expect(result).toMatchObject({ code: 1, payload: { ok: false } });
+    }
   });
 });
 
