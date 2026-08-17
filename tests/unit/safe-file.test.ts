@@ -522,6 +522,16 @@ describe("safe project files", () => {
       }, async () => "second-owner")).rejects.toMatchObject({
         payload: { code: "FILE_MUTATION_BUSY" },
       });
+      await expect(withProjectMutationLock({
+        projectPath,
+        path: "main.gd",
+        indeterminateErrorCode: "PROJECT_MUTATION_INDETERMINATE",
+      }, async () => "second-owner")).rejects.toMatchObject({
+        payload: {
+          code: "PROJECT_MUTATION_INDETERMINATE",
+          details: { leaseState: "publishing", quarantineUntil: expect.any(String) },
+        },
+      });
     });
     expect(await run.result).toMatchObject({ code: 0, stderr: "" });
   });
@@ -572,7 +582,7 @@ describe("safe project files", () => {
     const timing = {
       heartbeatMs: 20,
       staleTtlMs: 60,
-      quarantineMs: 60,
+      quarantineMs: 150,
       acquireTimeoutMs: 25,
       pollMs: 5,
     };
@@ -591,8 +601,18 @@ describe("safe project files", () => {
         projectPath,
         path: "main.gd",
       }, async () => undefined)).rejects.toMatchObject({ payload: { code: "FILE_MUTATION_BUSY" } });
+      await expect(withProjectMutationLock({
+        projectPath,
+        path: "main.gd",
+        indeterminateErrorCode: "PROJECT_MUTATION_INDETERMINATE",
+      }, async () => undefined)).rejects.toMatchObject({
+        payload: {
+          code: "PROJECT_MUTATION_INDETERMINATE",
+          details: { leaseState: "quarantined", quarantineUntil: expect.any(String) },
+        },
+      });
     });
-    await new Promise((complete) => setTimeout(complete, 70));
+    await new Promise((complete) => setTimeout(complete, 170));
     await withSafeFileTestHooks(
       { timing: { ...timing, acquireTimeoutMs: 80 } },
       async () => await expect(withProjectMutationLock({

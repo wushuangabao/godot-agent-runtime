@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
 
@@ -6,8 +6,22 @@ import {
   EDITOR_PROTOCOL_VERSION,
   EditorBatchRequestSchema,
   EditorBatchResultSchema,
+  EditorInputActionMutationResultSchema,
+  EditorInputActionUpsertRequestSchema,
+  EditorProjectSettingGetRequestSchema,
+  EditorProjectSettingMutationResultSchema,
+  EditorProjectSettingResultSchema,
+  EditorProjectSettingSetRequestSchema,
+  EditorResourceInspectRequestSchema,
+  EditorResourceInspectionResultSchema,
   type EditorBatchOperation,
   type EditorBatchResult,
+  type EditorInputActionMutationResult,
+  type EditorInputBinding,
+  type EditorProjectSettingMutationResult,
+  type EditorProjectSettingResult,
+  type EditorProjectSettingValue,
+  type EditorResourceInspectionResult,
   type EditorSceneOpenResult,
   type EditorBridgeInfo,
   type EditorHistoryResult,
@@ -40,6 +54,7 @@ import {
   stopManagedRun,
 } from "./managed-run.js";
 import { assertProjectFingerprint, inspectProject } from "./project.js";
+import { withProjectMutationLock, type ProjectMutationLease } from "./safe-file.js";
 import {
   findLoopbackPort,
   sendBridgeCommand,
@@ -64,7 +79,12 @@ const EDITOR_CAPABILITIES = [
   "scene_open",
   "scene_batch",
   "undo_redo",
+  "project_settings",
+  "input_map",
+  "resource_inspect",
 ] as const;
+
+const PROJECT_SETTINGS_DEADLINE_MS = 30_000;
 
 export async function getEditorInfo(options: RuntimeLookupOptions): Promise<EditorBridgeInfo> {
   const result = await sendBridgeCommand(options, "hello");
@@ -354,6 +374,304 @@ export interface EditorSignalConnectOptions extends EditorMutationLookupOptions 
 export interface EditorScreenshotOptions extends RuntimeLookupOptions {
   readonly viewport?: "2d" | "3d";
   readonly viewportIndex?: number;
+}
+
+export interface EditorProjectSettingGetOptions extends RuntimeLookupOptions {
+  readonly key: string;
+}
+
+export interface EditorProjectSettingSetOptions extends RuntimeLookupOptions {
+  readonly expectedProjectFingerprint: string;
+  readonly expectedProjectFileSha256: string;
+  readonly key: string;
+  readonly value: EditorProjectSettingValue;
+}
+
+export interface EditorInputActionUpsertOptions extends RuntimeLookupOptions {
+  readonly expectedProjectFingerprint: string;
+  readonly expectedProjectFileSha256: string;
+  readonly name: string;
+  readonly deadzone: number;
+  readonly replaceEvents: boolean;
+  readonly events: readonly EditorInputBinding[];
+}
+
+export interface EditorResourceInspectOptions extends RuntimeLookupOptions {
+  readonly path: string;
+  readonly properties?: readonly string[];
+}
+
+function editorInputFailure(code: string, message: string, issues: unknown): RuntimeFailure {
+  return new RuntimeFailure({
+    code,
+    stage: "validation",
+    message,
+    details: { issues },
+    recovery: ["Use only the documented bounded project configuration fields."],
+  });
+}
+
+function runtimeFailureFromReceipt(value: unknown): RuntimeFailure {
+  const receipt = value as {
+    readonly code?: unknown;
+    readonly message?: unknown;
+    readonly details?: unknown;
+  };
+  return new RuntimeFailure({
+    code: typeof receipt.code === "string" ? receipt.code : "EDITOR_PROJECT_SETTING_OPERATION_FAILED",
+    stage: "run",
+    message: typeof receipt.message === "string"
+      ? receipt.message
+      : "The editor project-setting operation failed.",
+    ...(receipt.details !== null && typeof receipt.details === "object"
+      ? { details: receipt.details as Record<string, unknown> }
+      : {}),
+    recovery: ["Read the current project context and project.godot SHA-256 before retrying."],
+  });
+}
+
+function uncertainBridgeFailure(error: unknown): boolean {
+  return error instanceof RuntimeFailure && [
+    "RUNTIME_BRIDGE_TIMEOUT",
+    "RUNTIME_BRIDGE_CONNECTION_FAILED",
+  ].includes(error.payload.code);
+}
+
+async function projectFileSha256(projectPath: string): Promise<string> {
+  return createHash("sha256")
+    .update(await readFile(resolve(projectPath, "project.godot")))
+    .digest("hex");
+}
+
+async function reconcileProjectSettingOperation(
+  options: RuntimeLookupOptions,
+  operationId: string,
+  deadline: number,
+): Promise<Record<string, unknown> | null> {
+  while (Date.now() < deadline) {
+    try {
+      const status = await sendBridgeCommand(
+        { ...options, timeoutMs: Math.min(750, Math.max(100, deadline - Date.now())) },
+        "project_setting_operation_status",
+        { operationId },
+      );
+      if (status.state === "succeeded" && status.result !== null && typeof status.result === "object") {
+        return status.result as Record<string, unknown>;
+      }
+      if (status.state === "failed") throw runtimeFailureFromReceipt(status.error);
+    } catch (error) {
+      if (!uncertainBridgeFailure(error)) throw error;
+    }
+    await new Promise((complete) => setTimeout(complete, 100));
+  }
+  return null;
+}
+
+async function runProjectSettingsMutation(
+  options: RuntimeLookupOptions & {
+    readonly expectedProjectFingerprint: string;
+    readonly expectedProjectFileSha256: string;
+  },
+  capability: "project_settings" | "input_map",
+  command: "project_setting_set" | "input_action_upsert",
+  params: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  await assertProjectFingerprint(options.projectPath, options.expectedProjectFingerprint);
+  const info = await getEditorInfo(options);
+  assertEditorCapability(info.capabilities, capability);
+  const operationId = randomUUID();
+  return await withProjectMutationLock({
+    projectPath: options.projectPath,
+    path: "project.godot",
+    expectedProjectFingerprint: options.expectedProjectFingerprint,
+    indeterminateErrorCode: "PROJECT_MUTATION_INDETERMINATE",
+  }, async (lease: ProjectMutationLease) => {
+    const deadline = Date.now() + PROJECT_SETTINGS_DEADLINE_MS;
+    await lease.prepareResultUnknown();
+    try {
+      return await sendBridgeCommand(
+        {
+          projectPath: options.projectPath,
+          runId: options.runId,
+          timeoutMs: Math.min(options.timeoutMs ?? PROJECT_SETTINGS_DEADLINE_MS, PROJECT_SETTINGS_DEADLINE_MS),
+        },
+        command,
+        {
+          ...params,
+          operationId,
+          expectedProjectFileSha256: options.expectedProjectFileSha256,
+        },
+      );
+    } catch (error) {
+      if (!uncertainBridgeFailure(error)) throw error;
+      const reconciled = await reconcileProjectSettingOperation(options, operationId, deadline);
+      if (reconciled !== null) return reconciled;
+
+      try {
+        const stopped = await stopManagedRun({
+          projectPath: options.projectPath,
+          runId: options.runId,
+          timeoutMs: 10_000,
+        });
+        const diskSha256 = await projectFileSha256(options.projectPath);
+        throw new RuntimeFailure({
+          code: "EDITOR_PROJECT_SETTING_RESULT_UNKNOWN",
+          stage: "run",
+          message: "The editor operation result could not be recovered after the managed editor stopped.",
+          details: {
+            operationId,
+            state: stopped.state,
+            beforeSha256: options.expectedProjectFileSha256,
+            diskSha256,
+            applied: diskSha256 !== options.expectedProjectFileSha256,
+          },
+          recovery: ["Read project.godot and restart the managed editor before deciding whether to retry."],
+        });
+      } catch (stopError) {
+        if (stopError instanceof RuntimeFailure && stopError.payload.code === "EDITOR_PROJECT_SETTING_RESULT_UNKNOWN") {
+          throw stopError;
+        }
+        const quarantineUntil = lease.markResultUnknown();
+        throw new RuntimeFailure({
+          code: "PROJECT_MUTATION_INDETERMINATE",
+          stage: "run",
+          message: "The editor operation and managed process could not be reconciled safely.",
+          details: {
+            operationId,
+            quarantineUntil,
+            cause: stopError instanceof Error ? stopError.message : String(stopError),
+          },
+          recovery: ["Do not write project.godot again until quarantineUntil, then reconcile its SHA-256."],
+        });
+      }
+    }
+  });
+}
+
+export async function getEditorProjectSetting(
+  options: EditorProjectSettingGetOptions,
+): Promise<EditorProjectSettingResult> {
+  const parsed = EditorProjectSettingGetRequestSchema.safeParse({ key: options.key });
+  if (!parsed.success) {
+    throw editorInputFailure(
+      "EDITOR_PROJECT_SETTING_INPUT_INVALID",
+      "Project setting input is invalid.",
+      parsed.error.issues,
+    );
+  }
+  const info = await getEditorInfo(options);
+  assertEditorCapability(info.capabilities, "project_settings");
+  const result = EditorProjectSettingResultSchema.safeParse({
+    ok: true,
+    runId: options.runId,
+    ...await sendBridgeCommand(options, "project_setting_get", parsed.data),
+  });
+  if (!result.success) throw editorInputFailure(
+    "EDITOR_PROJECT_SETTING_RESULT_INVALID",
+    "Editor returned an invalid project setting result.",
+    result.error.issues,
+  );
+  return result.data;
+}
+
+export async function setEditorProjectSetting(
+  options: EditorProjectSettingSetOptions,
+): Promise<EditorProjectSettingMutationResult> {
+  const parsed = EditorProjectSettingSetRequestSchema.safeParse({
+    expectedProjectFingerprint: options.expectedProjectFingerprint,
+    expectedProjectFileSha256: options.expectedProjectFileSha256,
+    key: options.key,
+    value: options.value,
+  });
+  if (!parsed.success) throw editorInputFailure(
+    "EDITOR_PROJECT_SETTING_INPUT_INVALID",
+    "Project setting input is invalid.",
+    parsed.error.issues,
+  );
+  const raw = await runProjectSettingsMutation(
+    options,
+    "project_settings",
+    "project_setting_set",
+    { key: parsed.data.key, value: parsed.data.value },
+  );
+  const result = EditorProjectSettingMutationResultSchema.safeParse({
+    ok: true,
+    runId: options.runId,
+    ...raw,
+  });
+  if (!result.success) throw editorInputFailure(
+    "EDITOR_PROJECT_SETTING_RESULT_INVALID",
+    "Editor returned an invalid project setting mutation result.",
+    result.error.issues,
+  );
+  return result.data;
+}
+
+export async function upsertEditorInputAction(
+  options: EditorInputActionUpsertOptions,
+): Promise<EditorInputActionMutationResult> {
+  const parsed = EditorInputActionUpsertRequestSchema.safeParse({
+    expectedProjectFingerprint: options.expectedProjectFingerprint,
+    expectedProjectFileSha256: options.expectedProjectFileSha256,
+    name: options.name,
+    deadzone: options.deadzone,
+    replaceEvents: options.replaceEvents,
+    events: options.events,
+  });
+  if (!parsed.success) throw editorInputFailure(
+    "EDITOR_INPUT_ACTION_INPUT_INVALID",
+    "Input action input is invalid.",
+    parsed.error.issues,
+  );
+  const raw = await runProjectSettingsMutation(
+    options,
+    "input_map",
+    "input_action_upsert",
+    {
+      name: parsed.data.name,
+      deadzone: parsed.data.deadzone,
+      replaceEvents: parsed.data.replaceEvents,
+      events: parsed.data.events,
+    },
+  );
+  const result = EditorInputActionMutationResultSchema.safeParse({
+    ok: true,
+    runId: options.runId,
+    ...raw,
+  });
+  if (!result.success) throw editorInputFailure(
+    "EDITOR_INPUT_ACTION_RESULT_INVALID",
+    "Editor returned an invalid InputMap result.",
+    result.error.issues,
+  );
+  return result.data;
+}
+
+export async function inspectEditorResourcePath(
+  options: EditorResourceInspectOptions,
+): Promise<EditorResourceInspectionResult> {
+  const parsed = EditorResourceInspectRequestSchema.safeParse({
+    path: options.path,
+    ...(options.properties === undefined ? {} : { properties: options.properties }),
+  });
+  if (!parsed.success) throw editorInputFailure(
+    "EDITOR_RESOURCE_INSPECT_INPUT_INVALID",
+    "Resource inspection input is invalid.",
+    parsed.error.issues,
+  );
+  const info = await getEditorInfo(options);
+  assertEditorCapability(info.capabilities, "resource_inspect");
+  const result = EditorResourceInspectionResultSchema.safeParse({
+    ok: true,
+    runId: options.runId,
+    ...await sendBridgeCommand(options, "resource_inspect", parsed.data),
+  });
+  if (!result.success) throw editorInputFailure(
+    "EDITOR_RESOURCE_INSPECT_RESULT_INVALID",
+    "Editor returned an invalid resource inspection result.",
+    result.error.issues,
+  );
+  return result.data;
 }
 
 async function prepareEditorMutation(options: EditorMutationLookupOptions): Promise<void> {

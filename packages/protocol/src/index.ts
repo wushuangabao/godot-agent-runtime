@@ -1,6 +1,6 @@
 import * as z from "zod/v4";
 
-export const EDITOR_PROTOCOL_VERSION = "0.5.0";
+export const EDITOR_PROTOCOL_VERSION = "0.6.0";
 export const RUNTIME_PROTOCOL_VERSION = "0.3.0";
 /** @deprecated Use EDITOR_PROTOCOL_VERSION or RUNTIME_PROTOCOL_VERSION explicitly. */
 export const PROTOCOL_VERSION = RUNTIME_PROTOCOL_VERSION;
@@ -593,6 +593,143 @@ export const EditorBatchResultSchema = z.object({
 
 export type EditorBatchResult = z.infer<typeof EditorBatchResultSchema>;
 
+const EditorProjectSettingStringSchema = z.string().refine(
+  (value) => new TextEncoder().encode(value).byteLength <= 16 * 1024,
+  "Project setting strings must not exceed 16 KiB of UTF-8.",
+);
+
+export const EditorProjectSettingValueSchema = z.union([
+  z.boolean(),
+  z.number().finite().refine(
+    (value) => Math.abs(value) <= Number.MAX_SAFE_INTEGER,
+    "Project setting numbers must remain within JavaScript's safe numeric range.",
+  ),
+  EditorProjectSettingStringSchema,
+  z.array(EditorProjectSettingStringSchema).max(256),
+]);
+
+export type EditorProjectSettingValue = z.infer<typeof EditorProjectSettingValueSchema>;
+
+export const EditorProjectSettingGetRequestSchema = z.object({
+  key: z.string().min(1).max(256),
+}).strict();
+
+export const EditorProjectSettingSetRequestSchema = z.object({
+  expectedProjectFingerprint: Sha256Schema,
+  expectedProjectFileSha256: Sha256Schema,
+  key: z.string().min(1).max(256),
+  value: EditorProjectSettingValueSchema,
+}).strict();
+
+const EditorInputKeyBindingSchema = z.object({
+  type: z.literal("key"),
+  keycode: z.number().int().positive().max(4_294_967_295).optional(),
+  physicalKeycode: z.number().int().positive().max(4_294_967_295).optional(),
+  shift: z.boolean().optional(),
+  alt: z.boolean().optional(),
+  ctrl: z.boolean().optional(),
+  meta: z.boolean().optional(),
+}).strict().superRefine((value, context) => {
+  if ((value.keycode === undefined) === (value.physicalKeycode === undefined)) {
+    context.addIssue({
+      code: "custom",
+      message: "A key event requires exactly one of keycode or physicalKeycode.",
+    });
+  }
+});
+
+const EditorInputMouseButtonBindingSchema = z.object({
+  type: z.literal("mouse_button"),
+  buttonIndex: z.number().int().min(1).max(9),
+}).strict();
+
+const EditorInputJoypadButtonBindingSchema = z.object({
+  type: z.literal("joypad_button"),
+  buttonIndex: z.number().int().min(0).max(127),
+  device: z.number().int().min(-1).max(15).optional(),
+}).strict();
+
+export const EditorInputBindingSchema = z.discriminatedUnion("type", [
+  EditorInputKeyBindingSchema,
+  EditorInputMouseButtonBindingSchema,
+  EditorInputJoypadButtonBindingSchema,
+]);
+
+export type EditorInputBinding = z.infer<typeof EditorInputBindingSchema>;
+
+export const EditorInputActionUpsertRequestSchema = z.object({
+  expectedProjectFingerprint: Sha256Schema,
+  expectedProjectFileSha256: Sha256Schema,
+  name: z.string().regex(/^[A-Za-z0-9_.-]{1,64}$/),
+  deadzone: z.number().min(0).max(1),
+  replaceEvents: z.boolean(),
+  events: z.array(EditorInputBindingSchema).min(1).max(32),
+}).strict();
+
+export const EditorResourceInspectRequestSchema = z.object({
+  path: z.string().startsWith("res://").regex(/\.(?:tres|res)$/i),
+  properties: z.array(z.string().min(1).max(256)).max(100).optional(),
+}).strict();
+
+export const EditorProjectSettingResultSchema = z.object({
+  ok: z.literal(true),
+  runId: z.uuid(),
+  key: z.string().min(1),
+  value: EditorProjectSettingValueSchema,
+}).strict();
+
+export type EditorProjectSettingResult = z.infer<typeof EditorProjectSettingResultSchema>;
+
+export const EditorProjectSettingMutationResultSchema = z.object({
+  ok: z.literal(true),
+  runId: z.uuid(),
+  operationId: z.uuid(),
+  key: z.string().min(1),
+  changed: z.boolean(),
+  previousValue: EditorProjectSettingValueSchema,
+  value: EditorProjectSettingValueSchema,
+  beforeSha256: Sha256Schema,
+  afterSha256: Sha256Schema,
+  undoable: z.literal(false),
+}).strict();
+
+export type EditorProjectSettingMutationResult = z.infer<
+  typeof EditorProjectSettingMutationResultSchema
+>;
+
+export const EditorInputActionMutationResultSchema = z.object({
+  ok: z.literal(true),
+  runId: z.uuid(),
+  operationId: z.uuid(),
+  name: z.string().regex(/^[A-Za-z0-9_.-]{1,64}$/),
+  deadzone: z.number().min(0).max(1),
+  replaceEvents: z.boolean(),
+  events: z.array(EditorInputBindingSchema).min(1).max(32),
+  changed: z.boolean(),
+  beforeSha256: Sha256Schema,
+  afterSha256: Sha256Schema,
+  undoable: z.literal(false),
+}).strict();
+
+export type EditorInputActionMutationResult = z.infer<
+  typeof EditorInputActionMutationResultSchema
+>;
+
+export const EditorResourceInspectionResultSchema = z.object({
+  ok: z.literal(true),
+  runId: z.uuid(),
+  resource: z.object({
+    path: z.string().startsWith("res://").regex(/\.(?:tres|res)$/i),
+    class: z.string().min(1),
+    editableProperties: z.array(z.string().min(1)).max(1000),
+    properties: z.record(z.string(), z.unknown()),
+  }).strict(),
+}).strict();
+
+export type EditorResourceInspectionResult = z.infer<
+  typeof EditorResourceInspectionResultSchema
+>;
+
 export const EditorBridgeInfoSchema = z.object({
   ok: z.literal(true),
   runId: z.uuid(),
@@ -618,6 +755,9 @@ export const EditorBridgeInfoSchema = z.object({
       "scene_open",
       "scene_batch",
       "undo_redo",
+      "project_settings",
+      "input_map",
+      "resource_inspect",
     ]),
   ),
 });

@@ -16,6 +16,7 @@ import {
   deleteEditorNode,
   findRuntimeUi,
   focusEditorResource,
+  getEditorProjectSetting,
   getEditorInstance,
   getEditorInfo,
   getEditorNode,
@@ -36,10 +37,14 @@ import {
   saveEditorResource,
   setEditorSelection,
   setEditorInstanceEditable,
+  setEditorProjectSetting,
   stopManagedRun,
   updateEditorNode,
   updateEditorResource,
+  upsertEditorInputAction,
   undoEditorAction,
+  inspectEditorResourcePath,
+  writeProjectFile,
 } from "../../packages/core/src/index.js";
 
 const configPath = resolve("config", "development.local.json");
@@ -96,6 +101,249 @@ async function blockSceneSave(path: string): Promise<() => Promise<void>> {
 
 describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
   it(
+    "holds the shared project.godot lease while reconciling a timed-out Bridge response",
+    async () => {
+      const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-editor-settings-lease-"));
+      await cp(resolve("examples", "control-ui"), projectPath, {
+        recursive: true,
+        filter: (source) => !source.includes(`${resolve("examples", "control-ui", ".godot")}`),
+      });
+      const previousDelay = process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_DELAY_MS;
+      process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_DELAY_MS = "700";
+      let runId: string | null = null;
+      try {
+        await installGodotAddon(projectPath);
+        const launch = await launchEditor({ projectPath, configPath, timeoutMs: 30_000 });
+        runId = launch.runId;
+        const identity = await getProjectIdentity(projectPath);
+        const source = await readFile(resolve(projectPath, "project.godot"), "utf8");
+
+        const setting = setEditorProjectSetting({
+          projectPath,
+          runId,
+          timeoutMs: 100,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedProjectFileSha256: identity.projectFileSha256,
+          key: "display/window/size/viewport_width",
+          value: 800,
+        });
+        await new Promise((complete) => setTimeout(complete, 150));
+        let writerSettled = false;
+        const writer = writeProjectFile({
+          projectPath,
+          path: "project.godot",
+          content: `${source}\n; competing Task 2 writer\n`,
+          expectedSha256: identity.projectFileSha256,
+          expectedProjectFingerprint: identity.projectFingerprint,
+        }).finally(() => { writerSettled = true; });
+        await new Promise((complete) => setTimeout(complete, 200));
+        expect(writerSettled).toBe(false);
+
+        const changed = await setting;
+        expect(changed).toMatchObject({
+          value: 800,
+          beforeSha256: identity.projectFileSha256,
+          afterSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+        });
+        await expect(writer).rejects.toMatchObject({ payload: { code: "FILE_WRITE_CONFLICT" } });
+      } finally {
+        if (previousDelay === undefined) {
+          delete process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_DELAY_MS;
+        } else {
+          process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_DELAY_MS = previousDelay;
+        }
+        if (runId !== null) await stopManagedRun({ projectPath, runId, timeoutMs: 15_000 });
+        await rm(projectPath, { recursive: true, force: true });
+      }
+    },
+    90_000,
+  );
+
+  it(
+    "persists guarded project settings and InputMap while inspecting external resources read-only",
+    async () => {
+      const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-editor-settings-"));
+      await cp(resolve("examples", "control-ui"), projectPath, {
+        recursive: true,
+        filter: (source) => !source.includes(`${resolve("examples", "control-ui", ".godot")}`),
+      });
+      await writeFile(
+        resolve(projectPath, "agent_style.tres"),
+        '[gd_resource type="StyleBoxFlat" format=3]\n\n[resource]\nbg_color = Color(0.2, 0.4, 0.8, 1)\n',
+        "utf8",
+      );
+      const previousDelay = process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_DELAY_MS;
+      process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_DELAY_MS = "700";
+      let runId: string | null = null;
+      try {
+        await installGodotAddon(projectPath);
+        const launch = await launchEditor({ projectPath, configPath, timeoutMs: 30_000 });
+        runId = launch.runId;
+        let identity = await getProjectIdentity(projectPath);
+
+        expect(await getEditorInfo({ projectPath, runId })).toMatchObject({
+          protocolVersion: "0.6.0",
+          capabilities: expect.arrayContaining(["project_settings", "input_map", "resource_inspect"]),
+        });
+        expect(await getEditorProjectSetting({
+          projectPath,
+          runId,
+          key: "display/window/size/viewport_width",
+        })).toMatchObject({ key: "display/window/size/viewport_width", value: 640 });
+        await expect(getEditorProjectSetting({
+          projectPath,
+          runId,
+          key: "autoload/Unsafe",
+        })).rejects.toMatchObject({ payload: { code: "EDITOR_PROJECT_SETTING_RESTRICTED" } });
+        await expect(setEditorProjectSetting({
+          projectPath,
+          runId,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedProjectFileSha256: identity.projectFileSha256,
+          key: "display/window/size/viewport_width",
+          value: 0.5,
+        })).rejects.toMatchObject({ payload: { code: "EDITOR_PROJECT_SETTING_TYPE_MISMATCH" } });
+
+        const changed = await setEditorProjectSetting({
+          projectPath,
+          runId,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedProjectFileSha256: identity.projectFileSha256,
+          key: "display/window/size/viewport_width",
+          value: 960,
+        });
+        expect(changed).toMatchObject({
+          changed: true,
+          previousValue: 640,
+          value: 960,
+          beforeSha256: identity.projectFileSha256,
+          afterSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+          undoable: false,
+        });
+
+        identity = await getProjectIdentity(projectPath);
+        const input = await upsertEditorInputAction({
+          projectPath,
+          runId,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedProjectFileSha256: identity.projectFileSha256,
+          name: "agent_jump",
+          deadzone: 0.5,
+          replaceEvents: true,
+          events: [{ type: "key", physicalKeycode: 32 }],
+        });
+        expect(input).toMatchObject({
+          name: "agent_jump",
+          deadzone: 0.5,
+          events: [{ type: "key", physicalKeycode: 32 }],
+          undoable: false,
+        });
+        const projectSource = await readFile(resolve(projectPath, "project.godot"), "utf8");
+        expect(projectSource).toContain("[input]");
+        expect(projectSource).toContain("agent_jump={");
+
+        identity = await getProjectIdentity(projectPath);
+        const unchangedStartedAt = Date.now();
+        const unchangedInput = await upsertEditorInputAction({
+          projectPath,
+          runId,
+          timeoutMs: 100,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedProjectFileSha256: identity.projectFileSha256,
+          name: "agent_jump",
+          deadzone: 0.5,
+          replaceEvents: true,
+          events: [{ type: "key", physicalKeycode: 32 }],
+        });
+        expect(unchangedInput).toMatchObject({
+          name: "agent_jump",
+          deadzone: 0.5,
+          replaceEvents: true,
+          events: [{ type: "key", physicalKeycode: 32 }],
+          changed: false,
+          beforeSha256: identity.projectFileSha256,
+          afterSha256: identity.projectFileSha256,
+          undoable: false,
+        });
+        expect(Date.now() - unchangedStartedAt).toBeLessThan(500);
+
+        await stopManagedRun({ projectPath, runId, timeoutMs: 15_000 });
+        runId = null;
+        const restarted = await launchEditor({ projectPath, configPath, timeoutMs: 30_000 });
+        runId = restarted.runId;
+        identity = await getProjectIdentity(projectPath);
+        const appended = await upsertEditorInputAction({
+          projectPath,
+          runId,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedProjectFileSha256: identity.projectFileSha256,
+          name: "agent_jump",
+          deadzone: 0.5,
+          replaceEvents: false,
+          events: [{ type: "mouse_button", buttonIndex: 1 }],
+        });
+        expect(appended.events).toHaveLength(2);
+        expect(appended.events).toEqual(expect.arrayContaining([
+          expect.objectContaining({ type: "key", physicalKeycode: 32 }),
+          { type: "mouse_button", buttonIndex: 1 },
+        ]));
+
+        const resource = await inspectEditorResourcePath({
+          projectPath,
+          runId,
+          path: "res://agent_style.tres",
+          properties: ["bg_color"],
+        });
+        expect(resource).toMatchObject({
+          resource: {
+            class: "StyleBoxFlat",
+            path: "res://agent_style.tres",
+            properties: { bg_color: { $type: "Color" } },
+          },
+        });
+        await expect(inspectEditorResourcePath({
+          projectPath,
+          runId,
+          path: "res://../agent_style.tres",
+        })).rejects.toMatchObject({ payload: { code: "EDITOR_RESOURCE_PATH_ESCAPE" } });
+
+        const beforeExternal = await getProjectIdentity(projectPath);
+        await writeFile(
+          resolve(projectPath, "project.godot"),
+          `${await readFile(resolve(projectPath, "project.godot"), "utf8")}\n; external change\n`,
+          "utf8",
+        );
+        const afterExternal = await getProjectIdentity(projectPath);
+        await expect(setEditorProjectSetting({
+          projectPath,
+          runId,
+          expectedProjectFingerprint: afterExternal.projectFingerprint,
+          expectedProjectFileSha256: beforeExternal.projectFileSha256,
+          key: "display/window/size/viewport_height",
+          value: 540,
+        })).rejects.toMatchObject({ payload: { code: "PROJECT_FILE_CONFLICT" } });
+        await expect(setEditorProjectSetting({
+          projectPath,
+          runId,
+          expectedProjectFingerprint: afterExternal.projectFingerprint,
+          expectedProjectFileSha256: afterExternal.projectFileSha256,
+          key: "display/window/size/viewport_height",
+          value: 540,
+        })).rejects.toMatchObject({ payload: { code: "EDITOR_PROJECT_SETTINGS_STALE" } });
+      } finally {
+        if (previousDelay === undefined) {
+          delete process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_DELAY_MS;
+        } else {
+          process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_DELAY_MS = previousDelay;
+        }
+        if (runId !== null) await stopManagedRun({ projectPath, runId, timeoutMs: 15_000 });
+        await rm(projectPath, { recursive: true, force: true });
+      }
+    },
+    90_000,
+  );
+
+  it(
     "applies typed batches as one action with logical-path validation and honest persistence state",
     async () => {
       const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-editor-batch-"));
@@ -120,7 +368,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         } as const;
 
         expect(await getEditorInfo({ projectPath, runId: editorRunId })).toMatchObject({
-          protocolVersion: "0.5.0",
+          protocolVersion: "0.6.0",
           capabilities: expect.arrayContaining(["scene_batch"]),
         });
 
@@ -470,7 +718,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
 
         const initial = await getEditorInfo({ projectPath, runId: editorRunId });
         expect(initial).toMatchObject({
-          protocolVersion: "0.5.0",
+          protocolVersion: "0.6.0",
           scene: "res://main.tscn",
           historyVersion: expect.any(Number),
         });
@@ -706,7 +954,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         };
 
         const info = await getEditorInfo({ projectPath, runId: editorRunId });
-        expect(info.protocolVersion).toBe("0.5.0");
+        expect(info.protocolVersion).toBe("0.6.0");
         expect(info.historyVersion).toEqual(expect.any(Number));
         expect(info.capabilities).toEqual([
           "scene_tree",
@@ -725,6 +973,9 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           "scene_open",
           "scene_batch",
           "undo_redo",
+          "project_settings",
+          "input_map",
+          "resource_inspect",
         ]);
 
         const inheritedScene = await createInheritedEditorScene({

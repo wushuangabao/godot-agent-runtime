@@ -109,6 +109,10 @@ describe("MCP server", () => {
       "godot_runtime_control",
       "godot_editor_launch",
       "godot_editor_status",
+      "godot_editor_project_setting_get",
+      "godot_editor_project_setting_set",
+      "godot_editor_input_action_upsert",
+      "godot_editor_resource_inspect",
       "godot_editor_scene_open",
       "godot_editor_scene_tree",
       "godot_editor_node_get",
@@ -143,6 +147,9 @@ describe("MCP server", () => {
     const projectContext = tools.find(({ name }) => name === "godot_project_context");
     const scriptCheck = tools.find(({ name }) => name === "godot_script_check");
     const editorStatus = tools.find(({ name }) => name === "godot_editor_status");
+    const projectSettingSet = tools.find(({ name }) => name === "godot_editor_project_setting_set");
+    const inputActionUpsert = tools.find(({ name }) => name === "godot_editor_input_action_upsert");
+    const resourceInspect = tools.find(({ name }) => name === "godot_editor_resource_inspect");
     const editorSceneOpen = tools.find(({ name }) => name === "godot_editor_scene_open");
     const editorNodeCreate = tools.find(({ name }) => name === "godot_editor_node_create");
     const editorBatch = tools.find(({ name }) => name === "godot_editor_batch");
@@ -160,6 +167,31 @@ describe("MCP server", () => {
       idempotentHint: true,
     });
     expect(editorStatus?.outputSchema?.properties).toHaveProperty("historyVersion");
+    expect(projectSettingSet?.inputSchema.required).toEqual(expect.arrayContaining([
+      "expectedProjectFingerprint",
+      "expectedProjectFileSha256",
+      "key",
+      "value",
+    ]));
+    expect(projectSettingSet?.inputSchema.additionalProperties).toBe(false);
+    expect(projectSettingSet?.annotations).toMatchObject({
+      readOnlyHint: false,
+      idempotentHint: false,
+      destructiveHint: false,
+      openWorldHint: false,
+    });
+    expect(inputActionUpsert?.inputSchema.required).toEqual(expect.arrayContaining([
+      "expectedProjectFingerprint",
+      "expectedProjectFileSha256",
+      "name",
+      "events",
+    ]));
+    expect(inputActionUpsert?.inputSchema.additionalProperties).toBe(false);
+    expect(resourceInspect?.inputSchema.additionalProperties).toBe(false);
+    expect(resourceInspect?.annotations).toMatchObject({
+      readOnlyHint: true,
+      idempotentHint: true,
+    });
     expect(editorSceneOpen?.inputSchema.required).toEqual(expect.arrayContaining([
       "expectedProjectFingerprint",
       "scenePath",

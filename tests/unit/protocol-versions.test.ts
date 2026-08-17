@@ -13,7 +13,7 @@ import {
 
 describe("bridge protocol versions", () => {
   it("evolves the editor protocol without changing runtime compatibility", () => {
-    expect(EDITOR_PROTOCOL_VERSION).toBe("0.5.0");
+    expect(EDITOR_PROTOCOL_VERSION).toBe("0.6.0");
     expect(RUNTIME_PROTOCOL_VERSION).toBe("0.3.0");
     expect(PROTOCOL_VERSION).toBe(RUNTIME_PROTOCOL_VERSION);
 
@@ -24,7 +24,7 @@ describe("bridge protocol versions", () => {
       engineVersion: "4.4",
       scene: null,
       historyVersion: null,
-      capabilities: ["scene_open", "scene_batch"],
+      capabilities: ["scene_open", "scene_batch", "project_settings", "input_map", "resource_inspect"],
     }).success).toBe(true);
     expect(EditorBridgeInfoSchema.safeParse({
       ok: true,
@@ -109,5 +109,46 @@ describe("bridge protocol versions", () => {
       confirmDestructive: true,
     }).success).toBe(true);
     expect(requestSchema.safeParse({ ...request, save: true }).success).toBe(false);
+  });
+
+  it("defines bounded project-setting values and strict InputMap events", () => {
+    const setting = (Protocol as unknown as {
+      EditorProjectSettingValueSchema?: { safeParse(value: unknown): { success: boolean } };
+    }).EditorProjectSettingValueSchema;
+    const input = (Protocol as unknown as {
+      EditorInputActionUpsertRequestSchema?: { safeParse(value: unknown): { success: boolean } };
+    }).EditorInputActionUpsertRequestSchema;
+    expect(setting).toBeDefined();
+    expect(input).toBeDefined();
+    if (setting === undefined || input === undefined) return;
+
+    expect(setting.safeParse(true).success).toBe(true);
+    expect(setting.safeParse(960).success).toBe(true);
+    expect(setting.safeParse(0.5).success).toBe(true);
+    expect(setting.safeParse(Number.MAX_SAFE_INTEGER + 1).success).toBe(false);
+    expect(setting.safeParse("res://main.tscn").success).toBe(true);
+    expect(setting.safeParse(["a", "b"]).success).toBe(true);
+    expect(setting.safeParse("x".repeat(16 * 1024 + 1)).success).toBe(false);
+    expect(setting.safeParse(Array(257).fill("x")).success).toBe(false);
+    expect(setting.safeParse({ unsafe: true }).success).toBe(false);
+
+    const request = {
+      expectedProjectFingerprint: "a".repeat(64),
+      expectedProjectFileSha256: "b".repeat(64),
+      name: "agent_jump",
+      deadzone: 0.5,
+      replaceEvents: true,
+      events: [{ type: "key", physicalKeycode: 32 }],
+    };
+    expect(input.safeParse(request).success).toBe(true);
+    expect(input.safeParse({ ...request, name: "bad action" }).success).toBe(false);
+    expect(input.safeParse({ ...request, deadzone: 2 }).success).toBe(false);
+    expect(input.safeParse({ ...request, events: [] }).success).toBe(false);
+    expect(input.safeParse({ ...request, events: Array(33).fill(request.events[0]) }).success).toBe(false);
+    expect(input.safeParse({ ...request, events: [{ type: "key" }] }).success).toBe(false);
+    expect(input.safeParse({ ...request, events: [{ type: "key", keycode: 32, physicalKeycode: 32 }] }).success).toBe(false);
+    expect(input.safeParse({ ...request, events: [{ type: "key", keycode: 32, unknown: true }] }).success).toBe(false);
+    expect(input.safeParse({ ...request, events: [{ type: "mouse_button", buttonIndex: 10 }] }).success).toBe(false);
+    expect(input.safeParse({ ...request, events: [{ type: "joypad_button", buttonIndex: 128 }] }).success).toBe(false);
   });
 });

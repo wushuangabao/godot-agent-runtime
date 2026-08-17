@@ -21,12 +21,14 @@ import {
   findProjects,
   findRuntimeUi,
   focusEditorResource,
+  getEditorProjectSetting,
   getEditorInstance,
   getEditorInfo,
   getEditorNode,
   getEditorSceneTree,
   getEditorSelection,
   getEditorResource,
+  inspectEditorResourcePath,
   getManagedRunStatus,
   getProjectContext,
   getRuntimeInfo,
@@ -54,11 +56,13 @@ import {
   saveEditorResource,
   simulateRuntimePhysics,
   setEditorSelection,
+  setEditorProjectSetting,
   setEditorInstanceEditable,
   toRuntimeError,
   writeProjectFile,
   updateEditorNode,
   updateEditorResource,
+  upsertEditorInputAction,
   undoEditorAction,
   waitForRuntime,
   type RuntimeUiSelector,
@@ -68,14 +72,22 @@ import {
   AddonInstallResultSchema,
   EditorBatchRequestSchema,
   EditorBatchResultSchema,
+  EditorInputActionMutationResultSchema,
+  EditorInputActionUpsertRequestSchema,
   EditorBridgeInfoSchema,
   EditorHistoryResultSchema,
   EditorInheritedSceneResultSchema,
   EditorInstanceMutationResultSchema,
   EditorInstanceResultSchema,
   EditorMutationResultSchema,
+  EditorProjectSettingGetRequestSchema,
+  EditorProjectSettingMutationResultSchema,
+  EditorProjectSettingResultSchema,
+  EditorProjectSettingSetRequestSchema,
   EditorNodeResultSchema,
   EditorResourceResultSchema,
+  EditorResourceInspectRequestSchema,
+  EditorResourceInspectionResultSchema,
   EditorResourceReadResultSchema,
   EditorResourceFocusResultSchema,
   EditorResourceSaveResultSchema,
@@ -463,6 +475,30 @@ const EditorSignalConnectInputSchema = EditorMutationLookupInputSchema.extend({
 });
 
 const EditorBatchInputSchema = EditorBatchRequestSchema.safeExtend({
+  projectPath: z.string().min(1),
+  runId: z.uuid(),
+  timeoutMs: z.number().int().min(100).max(30_000).optional(),
+});
+
+const EditorProjectSettingGetInputSchema = EditorProjectSettingGetRequestSchema.safeExtend({
+  projectPath: z.string().min(1),
+  runId: z.uuid(),
+  timeoutMs: z.number().int().min(100).max(30_000).optional(),
+});
+
+const EditorProjectSettingSetInputSchema = EditorProjectSettingSetRequestSchema.safeExtend({
+  projectPath: z.string().min(1),
+  runId: z.uuid(),
+  timeoutMs: z.number().int().min(100).max(30_000).optional(),
+});
+
+const EditorInputActionUpsertInputSchema = EditorInputActionUpsertRequestSchema.safeExtend({
+  projectPath: z.string().min(1),
+  runId: z.uuid(),
+  timeoutMs: z.number().int().min(100).max(30_000).optional(),
+});
+
+const EditorResourceInspectInputSchema = EditorResourceInspectRequestSchema.safeExtend({
   projectPath: z.string().min(1),
   runId: z.uuid(),
   timeoutMs: z.number().int().min(100).max(30_000).optional(),
@@ -1347,6 +1383,87 @@ export function createMcpServer(): McpServer {
       await handle(async () =>
         await getEditorInfo({ projectPath, runId, ...(timeoutMs === undefined ? {} : { timeoutMs }) }),
       ),
+  );
+
+  server.registerTool(
+    "godot_editor_project_setting_get",
+    {
+      title: "Read an allowlisted project setting",
+      description: "Reads one existing bounded project setting from the managed editor's loaded ProjectSettings state.",
+      inputSchema: EditorProjectSettingGetInputSchema,
+      outputSchema: EditorProjectSettingResultSchema,
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ projectPath, runId, timeoutMs, key }) =>
+      await handle(async () => await getEditorProjectSetting({
+        projectPath,
+        runId,
+        key,
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      })),
+  );
+
+  server.registerTool(
+    "godot_editor_project_setting_set",
+    {
+      title: "Set an allowlisted project setting",
+      description: "Changes one existing bounded project setting under project fingerprint, project.godot SHA-256, managed-run, and cross-process lease guards.",
+      inputSchema: EditorProjectSettingSetInputSchema,
+      outputSchema: EditorProjectSettingMutationResultSchema,
+      annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedProjectFileSha256, key, value }) =>
+      await handle(async () => await setEditorProjectSetting({
+        projectPath,
+        runId,
+        expectedProjectFingerprint,
+        expectedProjectFileSha256,
+        key,
+        value,
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      })),
+  );
+
+  server.registerTool(
+    "godot_editor_input_action_upsert",
+    {
+      title: "Upsert a typed InputMap action",
+      description: "Persists one bounded typed InputMap action under the same project.godot identity, SHA-256, and lease guards as project settings.",
+      inputSchema: EditorInputActionUpsertInputSchema,
+      outputSchema: EditorInputActionMutationResultSchema,
+      annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedProjectFileSha256, name, deadzone, replaceEvents, events }) =>
+      await handle(async () => await upsertEditorInputAction({
+        projectPath,
+        runId,
+        expectedProjectFingerprint,
+        expectedProjectFileSha256,
+        name,
+        deadzone,
+        replaceEvents,
+        events,
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      })),
+  );
+
+  server.registerTool(
+    "godot_editor_resource_inspect",
+    {
+      title: "Inspect an external Godot Resource",
+      description: "Loads one project-internal non-linked .tres/.res and returns a bounded class/path/property summary without modifying it.",
+      inputSchema: EditorResourceInspectInputSchema,
+      outputSchema: EditorResourceInspectionResultSchema,
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ projectPath, runId, timeoutMs, path, properties }) =>
+      await handle(async () => await inspectEditorResourcePath({
+        projectPath,
+        runId,
+        path,
+        ...(properties === undefined ? {} : { properties }),
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      })),
   );
 
   server.registerTool(

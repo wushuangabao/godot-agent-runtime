@@ -40,7 +40,7 @@ describe("bridge handshake negotiation", () => {
         payload: {
           code: "EDITOR_PROTOCOL_VERSION_MISMATCH",
           stage: "protocol",
-          details: { expected: "0.5.0", actual: "0.4.0" },
+          details: { expected: "0.6.0", actual: "0.4.0" },
         },
       });
     }
@@ -75,5 +75,19 @@ describe("bridge handshake negotiation", () => {
     );
     expect(() => assertEditorCapability(["scene_open", "scene_batch"], "scene_batch"))
       .not.toThrow();
+  });
+
+  it("requires the project configuration capability group", () => {
+    expect(() => Editor.assertEditorCapability(["scene_batch"], "project_settings"))
+      .toThrowError(expect.objectContaining({
+        payload: expect.objectContaining({
+          code: "EDITOR_CAPABILITY_UNAVAILABLE",
+          details: { capability: "project_settings", capabilities: ["scene_batch"] },
+        }),
+      }));
+    expect(() => Editor.assertEditorCapability(
+      ["project_settings", "input_map", "resource_inspect"],
+      "resource_inspect",
+    )).not.toThrow();
   });
 });

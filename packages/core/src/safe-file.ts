@@ -75,6 +75,7 @@ export interface SafeTextReplaceOptions extends SafeFileOptions {
 
 export interface ProjectMutationLockOptions extends SafeFileOptions {
   readonly expectedProjectFingerprint?: string;
+  readonly indeterminateErrorCode?: string;
 }
 
 export interface SafeFileTestHooks {
@@ -597,6 +598,7 @@ function startLeaseHeartbeat(
 async function acquireMutationLease(
   target: SafeProjectTarget,
   timing: MutationLeaseTiming,
+  indeterminateErrorCode?: string,
 ): Promise<AcquiredMutationLease> {
   const lockDirectory = await ensureSafeProjectDirectory(
     target.projectRoot,
@@ -648,6 +650,26 @@ async function acquireMutationLease(
     }
 
     if (Date.now() >= deadline) {
+      const indeterminateCode = indeterminateErrorCode;
+      const blocking = indeterminateCode === undefined
+        ? null
+        : await readLeaseRecord(lockPath).catch(() => null);
+      if (indeterminateCode !== undefined && blocking !== null && blocking.state !== "active") {
+        const quarantineUntil = blocking.quarantineUntil === null
+          ? null
+          : new Date(blocking.quarantineUntil).toISOString();
+        throw fileFailure(
+          indeterminateCode,
+          `The mutation result for res://${target.relativePath} is still indeterminate.`,
+          {
+            path: `res://${target.relativePath}`,
+            leaseState: blocking.state,
+            ownerPid: blocking.ownerPid,
+            quarantineUntil,
+          },
+          ["Wait until quarantineUntil, then read and reconcile the target before retrying."],
+        );
+      }
       throw fileFailure(
         "FILE_MUTATION_BUSY",
         `Timed out waiting for the mutation lease for res://${target.relativePath}.`,
@@ -665,7 +687,11 @@ export async function withProjectMutationLock<T>(
 ): Promise<T> {
   await assertProjectFingerprint(options.projectPath, options.expectedProjectFingerprint);
   const target = await resolveSafeTarget(options.projectPath, options.path, true);
-  const acquired = await acquireMutationLease(target, mutationTiming());
+  const acquired = await acquireMutationLease(
+    target,
+    mutationTiming(),
+    options.indeterminateErrorCode,
+  );
   let resultUnknown = false;
   let quarantineUntil = 0;
   let heartbeatStopped = false;

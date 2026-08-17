@@ -17,10 +17,12 @@ import {
   findProjects,
   findRuntimeUi,
   focusEditorResource,
+  getEditorProjectSetting,
   getEditorInstance,
   getEditorInfo,
   getEditorNode,
   getEditorResource,
+  inspectEditorResourcePath,
   getEditorSceneTree,
   getEditorSelection,
   getManagedRunStatus,
@@ -49,15 +51,19 @@ import {
   saveEditorResource,
   simulateRuntimePhysics,
   setEditorSelection,
+  setEditorProjectSetting,
   setEditorInstanceEditable,
   toRuntimeError,
   undoEditorAction,
   updateEditorNode,
   updateEditorResource,
+  upsertEditorInputAction,
   waitForRuntime,
   writeProjectFile,
   type RuntimeInputStep,
   type EditorBatchOptions,
+  type EditorInputActionUpsertOptions,
+  type EditorProjectSettingSetOptions,
   RuntimeFailure,
 } from "@godot-agent-runtime/core";
 import { parseFiniteNumber, parseFiniteVector3, parseInteger } from "./numeric.js";
@@ -186,6 +192,10 @@ function printHelp(): void {
   process.stdout.write(`  addon-install PROJECT_PATH\n`);
   process.stdout.write(`  editor-launch PROJECT_PATH [--config PATH] [--timeout MS]\n`);
   process.stdout.write(`  editor-status PROJECT_PATH RUN_ID\n`);
+  process.stdout.write(`  editor-project-setting-get PROJECT_PATH RUN_ID --key NAME\n`);
+  process.stdout.write(`  editor-project-setting-set PROJECT_PATH RUN_ID --project-fingerprint HASH --project-sha256 HASH --key NAME --value JSON\n`);
+  process.stdout.write(`  editor-input-action-upsert PROJECT_PATH RUN_ID --project-fingerprint HASH --project-sha256 HASH --name NAME --deadzone N --replace-events true|false --events JSON_ARRAY\n`);
+  process.stdout.write(`  editor-resource-inspect PROJECT_PATH RUN_ID --path RES_PATH [--properties JSON_ARRAY]\n`);
   process.stdout.write(`  editor-scene-open PROJECT_PATH RUN_ID --project-fingerprint HASH --scene RES_PATH\n`);
   process.stdout.write(`  editor-tree PROJECT_PATH RUN_ID\n`);
   process.stdout.write(`  editor-node-get PROJECT_PATH RUN_ID --node NODE_PATH [--properties JSON_ARRAY]\n`);
@@ -432,6 +442,76 @@ async function main(): Promise<void> {
       if (!values[0] || !values[1]) throw new Error("editor-status requires PROJECT_PATH and RUN_ID.");
       print(await getEditorInfo({ projectPath: values[0], runId: values[1] }));
       return;
+    case "editor-project-setting-get": {
+      if (!values[0] || !values[1]) throw new Error("editor-project-setting-get requires PROJECT_PATH and RUN_ID.");
+      const key = option(args, "--key");
+      if (key === undefined) throw new Error("editor-project-setting-get requires --key NAME.");
+      print(await getEditorProjectSetting({
+        projectPath: values[0],
+        runId: values[1],
+        key,
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      }));
+      return;
+    }
+    case "editor-project-setting-set": {
+      if (!values[0] || !values[1]) throw new Error("editor-project-setting-set requires PROJECT_PATH and RUN_ID.");
+      const expectedProjectFingerprint = sha256Option(args, "--project-fingerprint");
+      const expectedProjectFileSha256 = sha256Option(args, "--project-sha256");
+      const key = option(args, "--key");
+      const source = option(args, "--value");
+      if (expectedProjectFingerprint === undefined || expectedProjectFileSha256 === undefined || key === undefined || source === undefined) {
+        throw new Error("editor-project-setting-set requires --project-fingerprint, --project-sha256, --key, and --value.");
+      }
+      print(await setEditorProjectSetting({
+        projectPath: values[0],
+        runId: values[1],
+        expectedProjectFingerprint,
+        expectedProjectFileSha256,
+        key,
+        value: JSON.parse(source) as EditorProjectSettingSetOptions["value"],
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      }));
+      return;
+    }
+    case "editor-input-action-upsert": {
+      if (!values[0] || !values[1]) throw new Error("editor-input-action-upsert requires PROJECT_PATH and RUN_ID.");
+      const expectedProjectFingerprint = sha256Option(args, "--project-fingerprint");
+      const expectedProjectFileSha256 = sha256Option(args, "--project-sha256");
+      const name = option(args, "--name");
+      const deadzoneSource = option(args, "--deadzone");
+      const replaceEvents = parseBoolean(option(args, "--replace-events"), "--replace-events");
+      const events = parseJsonArray(option(args, "--events"), "--events");
+      if (expectedProjectFingerprint === undefined || expectedProjectFileSha256 === undefined || name === undefined || deadzoneSource === undefined || replaceEvents === undefined || events === undefined) {
+        throw new Error("editor-input-action-upsert requires project guards, --name, --deadzone, --replace-events, and --events.");
+      }
+      print(await upsertEditorInputAction({
+        projectPath: values[0],
+        runId: values[1],
+        expectedProjectFingerprint,
+        expectedProjectFileSha256,
+        name,
+        deadzone: parseFiniteNumber(deadzoneSource, "--deadzone", { min: 0, max: 1 }),
+        replaceEvents,
+        events: events as EditorInputActionUpsertOptions["events"],
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      }));
+      return;
+    }
+    case "editor-resource-inspect": {
+      if (!values[0] || !values[1]) throw new Error("editor-resource-inspect requires PROJECT_PATH and RUN_ID.");
+      const path = option(args, "--path");
+      if (path === undefined) throw new Error("editor-resource-inspect requires --path RES_PATH.");
+      const properties = parseJsonStringArray(option(args, "--properties"), "--properties");
+      print(await inspectEditorResourcePath({
+        projectPath: values[0],
+        runId: values[1],
+        path,
+        ...(properties === undefined ? {} : { properties }),
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      }));
+      return;
+    }
     case "editor-scene-open": {
       if (!values[0] || !values[1]) throw new Error("editor-scene-open requires PROJECT_PATH and RUN_ID.");
       const expectedProjectFingerprint = sha256Option(args, "--project-fingerprint");

@@ -26,6 +26,9 @@ Godot 项目本身可以执行任意本机代码。本项目的安全目标不�
 - EditorPlugin 只允许创建可实例化的 `Node`/`Resource` 类型；节点名、移动环路、目标节点、属性描述符、只读标志、Resource 类兼容性、值类型、信号和目标方法均在 Godot 内验证。`owner`、`scene_file_path`、`resource_path` 等结构属性不能作为普通属性写入。
 - 编辑器增删改、Resource 子属性更新、PackedScene Editable Children 和信号连接均记录到当前场景的 Godot 原生 Undo/Redo 历史；保存必须单独显式调用。Resource 更新只允许已声明、非只读属性，不允许动态方法调用。
 - `godot_editor_batch` 先在逻辑场景索引中验证全部操作及前序 rename/move/delete 后的路径，再创建且只创建一个原生 Undo/Redo action；任一步失败都不会修改真实场景或历史。删除必须显式 `confirmDestructive: true`。批处理没有保存字段且永不落盘；随后保存失败只表示未持久化，不会自动回滚已经应用、仍可整体撤销的内存动作。
+- 项目设置写入只允许已有的 `application/config/*`、`application/run/main_scene`、`display/window/*`、`rendering/*`、`physics/2d/*`、`physics/3d/*`，并限制为 bool/int/float、16 KiB 字符串或最多 256 项的字符串数组；`autoload/*`、`editor_plugins/*`、`filesystem/import/*` 与通用 `input/*` 必须走其他专用流程。InputMap 只接受有界的 key、mouse button、joypad button union，每次最多 32 个事件。
+- `project.godot` 的持久设置和 InputMap 写入同时校验项目 fingerprint、调用方 SHA-256、Bridge 启动时缓存的 SHA-256，并在整个 Bridge 往返期间复用文本写入的同一 mutation lease。客户端先超时时通过有界 operation receipt 调和；无法证明操作终态或受管 Editor 已退出时保留 quarantine，阻止第二个参与写入者插入。该协调面向正常本地开发中的并发、超时与崩溃，不把同用户恶意进程作为威胁模型。
+- 外部 Resource 检查是只读接口，只加载项目内非链接 `.tres/.res`；未请求属性时仅返回类、路径与可编辑属性名，请求时最多编码 100 个属性。
 - 继承场景创建复用 Godot `EditorInterface.open_scene_from_path(..., true)` 与原生场景保存，不手写 `.tscn` 内部字段。目标必须是项目内规范化 `.tscn` 路径且默认拒绝覆盖；创建出的文件不属于当前场景 Undo/Redo，调用方应使用 Git 恢复或删除。
 - PackedScene、外部 Resource 以及 tagged Variant 中的 Resource 引用都必须是规范化的项目内 `res://` 路径，并逐段拒绝符号链接、目录联接点及其他重解析点。加载 Resource 时还会验证其类型与目标属性声明兼容。外部资源只写 `.tres` 且默认拒绝覆盖；Undo/Redo 可恢复节点引用，但不会删除已经创建的文件。
 - Runtime 与 Editor 握手必须报告完全匹配的协议版本和该版本已知的能力名；版本、能力或握手结构不兼容时立即返回稳定协议错误，不继续发送业务命令。

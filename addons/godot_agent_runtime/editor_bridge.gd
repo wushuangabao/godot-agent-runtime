@@ -1,8 +1,9 @@
 @tool
 extends Node
 
-const PROTOCOL_VERSION := "0.5.0"
+const PROTOCOL_VERSION := "0.6.0"
 const MAX_MESSAGE_BYTES := 1024 * 1024
+const MAX_PROJECT_SETTING_OPERATIONS := 128
 
 var _editor: EditorInterface
 var _undo_redo: EditorUndoRedoManager
@@ -12,6 +13,9 @@ var _token := ""
 var _run_id := ""
 var _peers: Array[Dictionary] = []
 var _batch_dirty_versions := {}
+var _loaded_project_file_sha256 := ""
+var _project_setting_operations := {}
+var _project_setting_operation_order: Array[String] = []
 
 
 func configure(editor: EditorInterface, undo_redo: EditorUndoRedoManager) -> void:
@@ -23,6 +27,7 @@ func _ready() -> void:
 	_port = int(OS.get_environment("GODOT_AGENT_RUNTIME_PORT"))
 	_token = OS.get_environment("GODOT_AGENT_RUNTIME_TOKEN")
 	_run_id = OS.get_environment("GODOT_AGENT_RUNTIME_RUN_ID")
+	_loaded_project_file_sha256 = FileAccess.get_sha256("res://project.godot")
 	if _editor == null or _undo_redo == null or _port < 1 or _token.is_empty() or _run_id.is_empty():
 		push_error("GODOT_AGENT_EDITOR_BRIDGE_CONFIG_INVALID")
 		return
@@ -90,8 +95,18 @@ func _handle(peer: Dictionary, line: String) -> void:
 				"engineVersion": Engine.get_version_info().get("string", "unknown"),
 				"scene": root.scene_file_path if root != null else null,
 				"historyVersion": _history_version(root) if root != null else null,
-				"capabilities": ["scene_tree", "selection", "screenshot", "viewport_3d", "node_edit", "scene_instantiate", "scene_inheritance", "instance_editable", "resource_edit", "resource_save", "resource_focus", "signal_connect", "scene_save", "scene_open", "scene_batch", "undo_redo"],
+				"capabilities": ["scene_tree", "selection", "screenshot", "viewport_3d", "node_edit", "scene_instantiate", "scene_inheritance", "instance_editable", "resource_edit", "resource_save", "resource_focus", "signal_connect", "scene_save", "scene_open", "scene_batch", "undo_redo", "project_settings", "input_map", "resource_inspect"],
 			})
+		"project_setting_get":
+			_send_ok(peer, request_id, _project_setting_get(params))
+		"project_setting_set":
+			_send_ok(peer, request_id, await _project_setting_set(params))
+		"project_setting_operation_status":
+			_send_ok(peer, request_id, _project_setting_operation_status(params))
+		"input_action_upsert":
+			_send_ok(peer, request_id, await _input_action_upsert(params))
+		"resource_inspect":
+			_send_ok(peer, request_id, _resource_inspect(params))
 		"scene_open":
 			_send_ok(peer, request_id, await _scene_open(params))
 		"scene_tree":
@@ -152,6 +167,438 @@ func _handle(peer: Dictionary, line: String) -> void:
 func _history_for_root(root: Node) -> UndoRedo:
 	var history_id := _undo_redo.get_object_history_id(root)
 	return _undo_redo.get_history_undo_redo(history_id)
+
+
+func _project_setting_key_allowed(key: String) -> bool:
+	if key in ["application/run/main_scene"]:
+		return true
+	for prefix in [
+		"application/config/",
+		"display/window/",
+		"rendering/",
+		"physics/2d/",
+		"physics/3d/",
+	]:
+		if key.begins_with(prefix):
+			return true
+	return false
+
+
+func _project_setting_value_supported(value: Variant) -> bool:
+	if typeof(value) in [TYPE_BOOL, TYPE_INT, TYPE_FLOAT]:
+		return true
+	if typeof(value) == TYPE_STRING:
+		return str(value).to_utf8_buffer().size() <= 16 * 1024
+	if typeof(value) in [TYPE_ARRAY, TYPE_PACKED_STRING_ARRAY]:
+		if value.size() > 256:
+			return false
+		for item in value:
+			if typeof(item) != TYPE_STRING or str(item).to_utf8_buffer().size() > 16 * 1024:
+				return false
+		return true
+	return false
+
+
+func _encode_project_setting_value(value: Variant) -> Variant:
+	if typeof(value) == TYPE_PACKED_STRING_ARRAY:
+		return Array(value)
+	return value
+
+
+func _coerce_project_setting_value(key: String, value: Variant, previous: Variant) -> Dictionary:
+	if not _project_setting_value_supported(value):
+		return _failure("EDITOR_PROJECT_SETTING_VALUE_UNSUPPORTED", "Project setting value must be a bounded bool, int, float, string, or string array.", {"key": key, "actualType": typeof(value)})
+	var expected_type := typeof(previous)
+	var actual_type := typeof(value)
+	if expected_type == TYPE_INT and actual_type in [TYPE_INT, TYPE_FLOAT] and float(value) == floor(float(value)) and abs(float(value)) <= 9007199254740991.0:
+		return {"value": int(value)}
+	if expected_type == TYPE_FLOAT and actual_type in [TYPE_INT, TYPE_FLOAT]:
+		return {"value": float(value)}
+	if expected_type == TYPE_PACKED_STRING_ARRAY and actual_type == TYPE_ARRAY:
+		for item in value:
+			if typeof(item) != TYPE_STRING:
+				return _failure("EDITOR_PROJECT_SETTING_TYPE_MISMATCH", "Project setting string arrays may contain only strings.", {"key": key})
+		return {"value": PackedStringArray(value)}
+	if expected_type != actual_type:
+		return _failure("EDITOR_PROJECT_SETTING_TYPE_MISMATCH", "Project setting value type does not match the existing Godot Variant type.", {
+			"key": key,
+			"expectedType": expected_type,
+			"actualType": actual_type,
+		})
+	return {"value": value}
+
+
+func _validate_project_setting_key(key: String) -> Dictionary:
+	if not _project_setting_key_allowed(key):
+		return _failure("EDITOR_PROJECT_SETTING_RESTRICTED", "Project setting key is outside the structured allowlist.", {"key": key})
+	if not ProjectSettings.has_setting(key):
+		return _failure("EDITOR_PROJECT_SETTING_NOT_FOUND", "Only existing project settings may be changed.", {"key": key})
+	return {"key": key}
+
+
+func _project_setting_get(params: Dictionary) -> Dictionary:
+	var key := str(params.get("key", ""))
+	var allowed := _validate_project_setting_key(key)
+	if allowed.has("_error"):
+		return allowed
+	var value = ProjectSettings.get_setting(key)
+	if not _project_setting_value_supported(value):
+		return _failure("EDITOR_PROJECT_SETTING_VALUE_UNSUPPORTED", "Existing project setting type is not supported by this bounded tool.", {"key": key, "actualType": typeof(value)})
+	return {"key": key, "value": _encode_project_setting_value(value)}
+
+
+func _remember_project_setting_operation(operation_id: String, receipt: Dictionary) -> void:
+	if not _project_setting_operations.has(operation_id):
+		_project_setting_operation_order.append(operation_id)
+	_project_setting_operations[operation_id] = receipt
+	while _project_setting_operation_order.size() > MAX_PROJECT_SETTING_OPERATIONS:
+		var expired := _project_setting_operation_order.pop_front()
+		_project_setting_operations.erase(expired)
+
+
+func _begin_project_setting_operation(params: Dictionary) -> Dictionary:
+	var operation_id := str(params.get("operationId", ""))
+	if operation_id.is_empty() or operation_id.length() > 64:
+		return _failure("EDITOR_PROJECT_SETTING_OPERATION_ID_INVALID", "operationId is required and must be bounded.")
+	if _project_setting_operations.has(operation_id):
+		var existing: Dictionary = _project_setting_operations[operation_id]
+		if str(existing.state) == "succeeded":
+			return {"operationId": operation_id, "replayed": true, "result": existing.result}
+		if str(existing.state) == "failed":
+			return {"operationId": operation_id, "replayed": true, "failure": existing.error}
+		return _failure("EDITOR_PROJECT_SETTING_OPERATION_RUNNING", "The project-setting operation is already running.", {"operationId": operation_id})
+	_remember_project_setting_operation(operation_id, {
+		"state": "running",
+		"result": null,
+		"error": null,
+	})
+	return {"operationId": operation_id, "replayed": false}
+
+
+func _finish_project_setting_operation(operation_id: String, result: Dictionary) -> Dictionary:
+	if result.has("_error"):
+		_remember_project_setting_operation(operation_id, {
+			"state": "failed",
+			"result": null,
+			"error": result._error,
+		})
+		return result
+	_remember_project_setting_operation(operation_id, {
+		"state": "succeeded",
+		"result": result,
+		"error": null,
+	})
+	return result
+
+
+func _project_setting_operation_status(params: Dictionary) -> Dictionary:
+	var operation_id := str(params.get("operationId", ""))
+	if not _project_setting_operations.has(operation_id):
+		return {"operationId": operation_id, "state": "unknown", "result": null, "error": null}
+	var receipt: Dictionary = _project_setting_operations[operation_id]
+	return {
+		"operationId": operation_id,
+		"state": receipt.state,
+		"result": receipt.result,
+		"error": receipt.error,
+	}
+
+
+func _project_file_write_guard(params: Dictionary) -> Dictionary:
+	var expected_sha := str(params.get("expectedProjectFileSha256", ""))
+	if expected_sha.length() != 64:
+		return _failure("PROJECT_FILE_SHA256_REQUIRED", "expectedProjectFileSha256 is required for project setting mutations.")
+	var disk_sha := FileAccess.get_sha256("res://project.godot")
+	if expected_sha != disk_sha:
+		return _failure("PROJECT_FILE_CONFLICT", "project.godot changed after the caller obtained its SHA-256 guard.", {
+			"expectedSha256": expected_sha,
+			"actualSha256": disk_sha,
+		})
+	if disk_sha != _loaded_project_file_sha256:
+		return _failure("EDITOR_PROJECT_SETTINGS_STALE", "The managed editor ProjectSettings cache is stale relative to project.godot.", {
+			"loadedProjectFileSha256": _loaded_project_file_sha256,
+			"actualSha256": disk_sha,
+		})
+	return {"beforeSha256": disk_sha}
+
+
+func _save_project_setting(operation_id: String, before_sha: String, rollback_key: String, rollback_value: Variant) -> Dictionary:
+	var delay_ms := int(OS.get_environment("GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_DELAY_MS"))
+	if delay_ms > 0 and delay_ms <= 30000:
+		await get_tree().create_timer(float(delay_ms) / 1000.0).timeout
+	var save_error := ProjectSettings.save()
+	if save_error != OK:
+		ProjectSettings.set_setting(rollback_key, rollback_value)
+		return _failure("EDITOR_PROJECT_SETTING_SAVE_FAILED", "Godot could not save project.godot.", {
+			"operationId": operation_id,
+			"error": save_error,
+		})
+	var after_sha := FileAccess.get_sha256("res://project.godot")
+	if after_sha.is_empty():
+		return _failure("EDITOR_PROJECT_SETTING_SAVE_FAILED", "Godot saved project.godot but its resulting SHA-256 could not be read.", {"operationId": operation_id})
+	_loaded_project_file_sha256 = after_sha
+	return {"beforeSha256": before_sha, "afterSha256": after_sha}
+
+
+func _project_setting_set(params: Dictionary) -> Dictionary:
+	var operation := _begin_project_setting_operation(params)
+	if operation.has("_error"):
+		return operation
+	if bool(operation.get("replayed", false)):
+		if operation.has("failure"):
+			return {"_error": operation.failure}
+		return operation.result
+	var operation_id := str(operation.operationId)
+	var key := str(params.get("key", ""))
+	var allowed := _validate_project_setting_key(key)
+	if allowed.has("_error"):
+		return _finish_project_setting_operation(operation_id, allowed)
+	var guard := _project_file_write_guard(params)
+	if guard.has("_error"):
+		return _finish_project_setting_operation(operation_id, guard)
+	var previous = ProjectSettings.get_setting(key)
+	var coerced := _coerce_project_setting_value(key, params.get("value"), previous)
+	if coerced.has("_error"):
+		return _finish_project_setting_operation(operation_id, coerced)
+	if key == "application/run/main_scene":
+		var checked_scene := _validated_res_path(str(coerced.value), ["tscn"])
+		if checked_scene.has("_error"):
+			return _finish_project_setting_operation(operation_id, checked_scene)
+		if not FileAccess.file_exists(str(checked_scene.path)):
+			return _finish_project_setting_operation(operation_id, _failure("EDITOR_PROJECT_MAIN_SCENE_NOT_FOUND", "The configured main scene does not exist.", {"path": checked_scene.path}))
+	var changed: bool = previous != coerced.value
+	if not changed:
+		return _finish_project_setting_operation(operation_id, {
+			"operationId": operation_id,
+			"key": key,
+			"changed": false,
+			"previousValue": _encode_project_setting_value(previous),
+			"value": _encode_project_setting_value(coerced.value),
+			"beforeSha256": guard.beforeSha256,
+			"afterSha256": guard.beforeSha256,
+			"undoable": false,
+		})
+	ProjectSettings.set_setting(key, coerced.value)
+	var saved := await _save_project_setting(operation_id, str(guard.beforeSha256), key, previous)
+	if saved.has("_error"):
+		return _finish_project_setting_operation(operation_id, saved)
+	return _finish_project_setting_operation(operation_id, {
+		"operationId": operation_id,
+		"key": key,
+		"changed": true,
+		"previousValue": _encode_project_setting_value(previous),
+		"value": _encode_project_setting_value(coerced.value),
+		"beforeSha256": saved.beforeSha256,
+		"afterSha256": saved.afterSha256,
+		"undoable": false,
+	})
+
+
+func _input_binding_keys_valid(binding: Dictionary, allowed: Array[String]) -> bool:
+	for key in binding.keys():
+		if str(key) not in allowed:
+			return false
+	return true
+
+
+func _decode_input_binding(raw: Variant) -> Dictionary:
+	if typeof(raw) != TYPE_DICTIONARY:
+		return _failure("EDITOR_INPUT_EVENT_INVALID", "Each InputMap event must be an object.")
+	var binding: Dictionary = raw
+	var kind := str(binding.get("type", ""))
+	match kind:
+		"key":
+			if not _input_binding_keys_valid(binding, ["type", "keycode", "physicalKeycode", "shift", "alt", "ctrl", "meta"]):
+				return _failure("EDITOR_INPUT_EVENT_INVALID", "Key event contains an unknown field.")
+			var has_keycode := binding.has("keycode")
+			var has_physical := binding.has("physicalKeycode")
+			if has_keycode == has_physical:
+				return _failure("EDITOR_INPUT_EVENT_INVALID", "Key event requires exactly one keycode field.")
+			var code := int(binding.get("keycode", binding.get("physicalKeycode", 0)))
+			if code <= 0:
+				return _failure("EDITOR_INPUT_EVENT_INVALID", "Key code must be positive.")
+			var event := InputEventKey.new()
+			if has_keycode:
+				event.keycode = code
+			else:
+				event.physical_keycode = code
+			event.shift_pressed = bool(binding.get("shift", false))
+			event.alt_pressed = bool(binding.get("alt", false))
+			event.ctrl_pressed = bool(binding.get("ctrl", false))
+			event.meta_pressed = bool(binding.get("meta", false))
+			return {"event": event}
+		"mouse_button":
+			if not _input_binding_keys_valid(binding, ["type", "buttonIndex"]):
+				return _failure("EDITOR_INPUT_EVENT_INVALID", "Mouse button event contains an unknown field.")
+			var button := int(binding.get("buttonIndex", 0))
+			if button < 1 or button > 9:
+				return _failure("EDITOR_INPUT_EVENT_INVALID", "Mouse button index is outside Godot's bounded range.")
+			var event := InputEventMouseButton.new()
+			event.button_index = button
+			return {"event": event}
+		"joypad_button":
+			if not _input_binding_keys_valid(binding, ["type", "buttonIndex", "device"]):
+				return _failure("EDITOR_INPUT_EVENT_INVALID", "Joypad button event contains an unknown field.")
+			var button := int(binding.get("buttonIndex", -1))
+			var device := int(binding.get("device", -1))
+			if button < 0 or button > 127 or device < -1 or device > 15:
+				return _failure("EDITOR_INPUT_EVENT_INVALID", "Joypad binding is outside Godot's bounded range.")
+			var event := InputEventJoypadButton.new()
+			event.button_index = button
+			event.device = device
+			return {"event": event}
+	return _failure("EDITOR_INPUT_EVENT_INVALID", "InputMap event type is not supported.", {"type": kind})
+
+
+func _encode_input_binding(event: InputEvent) -> Dictionary:
+	if event is InputEventKey:
+		var key_event := event as InputEventKey
+		var result := {
+			"type": "key",
+			"shift": key_event.shift_pressed,
+			"alt": key_event.alt_pressed,
+			"ctrl": key_event.ctrl_pressed,
+			"meta": key_event.meta_pressed,
+		}
+		if key_event.keycode > 0:
+			result.keycode = key_event.keycode
+		else:
+			result.physicalKeycode = key_event.physical_keycode
+		return result
+	if event is InputEventMouseButton:
+		return {"type": "mouse_button", "buttonIndex": (event as InputEventMouseButton).button_index}
+	if event is InputEventJoypadButton:
+		var joypad_event := event as InputEventJoypadButton
+		return {"type": "joypad_button", "buttonIndex": joypad_event.button_index, "device": joypad_event.device}
+	return {}
+
+
+func _input_action_upsert(params: Dictionary) -> Dictionary:
+	var operation := _begin_project_setting_operation(params)
+	if operation.has("_error"):
+		return operation
+	if bool(operation.get("replayed", false)):
+		if operation.has("failure"):
+			return {"_error": operation.failure}
+		return operation.result
+	var operation_id := str(operation.operationId)
+	var name := str(params.get("name", ""))
+	var pattern := RegEx.create_from_string("^[A-Za-z0-9_.-]{1,64}$")
+	if pattern.search(name) == null:
+		return _finish_project_setting_operation(operation_id, _failure("EDITOR_INPUT_ACTION_NAME_INVALID", "Input action name is invalid.", {"name": name}))
+	var deadzone := float(params.get("deadzone", -1.0))
+	if deadzone < 0.0 or deadzone > 1.0:
+		return _finish_project_setting_operation(operation_id, _failure("EDITOR_INPUT_ACTION_DEADZONE_INVALID", "Input action deadzone must be between 0 and 1."))
+	var raw_events = params.get("events", null)
+	if typeof(raw_events) != TYPE_ARRAY or raw_events.size() < 1 or raw_events.size() > 32:
+		return _finish_project_setting_operation(operation_id, _failure("EDITOR_INPUT_EVENTS_INVALID", "Input action requires between 1 and 32 events."))
+	var events: Array = []
+	for raw_event in raw_events:
+		var decoded := _decode_input_binding(raw_event)
+		if decoded.has("_error"):
+			return _finish_project_setting_operation(operation_id, decoded)
+		events.append(decoded.event)
+	var guard := _project_file_write_guard(params)
+	if guard.has("_error"):
+		return _finish_project_setting_operation(operation_id, guard)
+	var setting_key := "input/%s" % name
+	var had_previous := ProjectSettings.has_setting(setting_key)
+	var previous = ProjectSettings.get_setting(setting_key, null)
+	if not bool(params.get("replaceEvents", true)) and had_previous and typeof(previous) == TYPE_DICTIONARY:
+		var previous_events = previous.get("events", [])
+		if typeof(previous_events) == TYPE_ARRAY:
+			for previous_event in previous_events:
+				if not previous_event is InputEvent or _encode_input_binding(previous_event).is_empty():
+					return _finish_project_setting_operation(operation_id, _failure("EDITOR_INPUT_EVENT_UNSUPPORTED", "Existing InputMap action contains an event outside the typed union; replace its events explicitly."))
+			events = Array(previous_events) + events
+			if events.size() > 32:
+				return _finish_project_setting_operation(operation_id, _failure("EDITOR_INPUT_EVENTS_INVALID", "Merged InputMap events exceed the maximum of 32."))
+	var encoded_events: Array[Dictionary] = []
+	for event in events:
+		var encoded := _encode_input_binding(event)
+		if not encoded.is_empty():
+			encoded_events.append(encoded)
+	var unchanged: bool = had_previous and typeof(previous) == TYPE_DICTIONARY and previous.get("deadzone", -1.0) == deadzone
+	if unchanged:
+		var stored_events = previous.get("events", null)
+		unchanged = typeof(stored_events) == TYPE_ARRAY and stored_events.size() == encoded_events.size()
+		if unchanged:
+			for index in range(stored_events.size()):
+				var stored_event = stored_events[index]
+				if not stored_event is InputEvent or _encode_input_binding(stored_event) != encoded_events[index]:
+					unchanged = false
+					break
+	if unchanged:
+		return _finish_project_setting_operation(operation_id, {
+			"operationId": operation_id,
+			"name": name,
+			"deadzone": deadzone,
+			"replaceEvents": bool(params.get("replaceEvents", true)),
+			"events": encoded_events,
+			"changed": false,
+			"beforeSha256": guard.beforeSha256,
+			"afterSha256": guard.beforeSha256,
+			"undoable": false,
+		})
+	ProjectSettings.set_setting(setting_key, {"deadzone": deadzone, "events": events})
+	var saved := await _save_project_setting(operation_id, str(guard.beforeSha256), setting_key, previous)
+	if saved.has("_error"):
+		if not had_previous:
+			ProjectSettings.set_setting(setting_key, null)
+		return _finish_project_setting_operation(operation_id, saved)
+	InputMap.load_from_project_settings()
+	return _finish_project_setting_operation(operation_id, {
+		"operationId": operation_id,
+		"name": name,
+		"deadzone": deadzone,
+		"replaceEvents": bool(params.get("replaceEvents", true)),
+		"events": encoded_events,
+		"changed": true,
+		"beforeSha256": saved.beforeSha256,
+		"afterSha256": saved.afterSha256,
+		"undoable": false,
+	})
+
+
+func _resource_inspect(params: Dictionary) -> Dictionary:
+	var checked := _validated_res_path(str(params.get("path", "")), ["tres", "res"])
+	if checked.has("_error"):
+		return checked
+	var path := str(checked.path)
+	if not FileAccess.file_exists(path):
+		return _failure("EDITOR_RESOURCE_NOT_FOUND", "Resource file was not found.", {"path": path})
+	var loaded = ResourceLoader.load(path)
+	if not loaded is Resource:
+		return _failure("EDITOR_RESOURCE_LOAD_FAILED", "Godot could not load the requested Resource.", {"path": path})
+	var resource := loaded as Resource
+	var editable: Array[String] = []
+	var descriptors := {}
+	for descriptor in resource.get_property_list():
+		var property := str(descriptor.get("name", ""))
+		var usage := int(descriptor.get("usage", 0))
+		if not property.is_empty():
+			descriptors[property] = descriptor
+		if not property.is_empty() and (usage & PROPERTY_USAGE_EDITOR) != 0 and (usage & PROPERTY_USAGE_READ_ONLY) == 0:
+			if editable.size() < 1000:
+				editable.append(property)
+	var values := {}
+	if params.has("properties"):
+		var requested = params.properties
+		if typeof(requested) != TYPE_ARRAY or requested.size() > 100:
+			return _failure("EDITOR_PROPERTIES_INVALID", "properties must contain at most 100 names.")
+		for item in requested:
+			var property := str(item)
+			if not descriptors.has(property):
+				return _failure("EDITOR_PROPERTY_NOT_FOUND", "Resource property does not exist.", {"path": path, "property": property})
+			values[property] = _encode_value(resource.get(property))
+	return {
+		"resource": {
+			"path": path,
+			"class": resource.get_class(),
+			"editableProperties": editable,
+			"properties": values,
+		},
+	}
 
 
 func _history_version(root: Node) -> Variant:
