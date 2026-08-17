@@ -40,6 +40,7 @@ import {
   launchProject,
   moveEditorNode,
   readProjectFile,
+  replaceProjectText,
   redoEditorAction,
   runDoctor,
   runProject,
@@ -97,6 +98,9 @@ import {
   RuntimeWaitResultSchema,
   SafeFileReadResultSchema,
   SafeFileWriteResultSchema,
+  SafeTextReplaceResultSchema,
+  FileMutationGuardSchema,
+  Sha256Schema,
 } from "@godot-agent-runtime/protocol";
 
 const ConfigInputSchema = z.object({
@@ -422,13 +426,29 @@ const FileReadInputSchema = z.object({
   projectPath: z.string().min(1),
   path: z.string().min(1),
   maxBytes: z.number().int().min(1).max(1_048_576).optional(),
-});
+}).strict();
+
+const BoundedUtf8TextSchema = z.string().refine(
+  (value) => Buffer.byteLength(value, "utf8") <= 1_048_576,
+  { message: "UTF-8 text must not exceed 1048576 bytes." },
+);
 
 const FileWriteInputSchema = FileReadInputSchema.extend({
-  content: z.string(),
-  expectedSha256: z.string().regex(/^[0-9a-f]{64}$/).nullable().optional(),
+  content: BoundedUtf8TextSchema,
+  guard: FileMutationGuardSchema.optional(),
+  expectedSha256: Sha256Schema.nullable().optional(),
+  expectedProjectFingerprint: Sha256Schema.optional(),
   createDirectories: z.boolean().default(false),
-});
+}).strict();
+
+const FileReplaceInputSchema = FileReadInputSchema.extend({
+  expectedProjectFingerprint: Sha256Schema,
+  oldText: BoundedUtf8TextSchema.refine((value) => value.length > 0, {
+    message: "oldText must not be empty.",
+  }),
+  newText: BoundedUtf8TextSchema,
+  replaceAll: z.boolean().default(false),
+}).strict();
 
 function success(structuredContent: Record<string, unknown>): CallToolResult {
   return {
@@ -566,7 +586,7 @@ export function createMcpServer(): McpServer {
     {
       title: "Safely write a Godot project text file",
       description:
-        "Atomically creates or updates an allowlisted UTF-8 project file. Pass expectedSha256 from godot_file_read (or null to require creation) to prevent lost updates.",
+        "Creates or updates an allowlisted UTF-8 project file under an explicit create or SHA-256 match guard. The lease coordinates participating MCP/CLI processes; external editors do not honor it, so the SHA-256 is rechecked immediately before publish and this is not a general cross-process filesystem transaction.",
       inputSchema: FileWriteInputSchema,
       outputSchema: SafeFileWriteResultSchema,
       annotations: {
@@ -580,7 +600,9 @@ export function createMcpServer(): McpServer {
       projectPath,
       path,
       content,
+      guard,
       expectedSha256,
+      expectedProjectFingerprint,
       createDirectories,
       maxBytes,
     }) =>
@@ -590,7 +612,48 @@ export function createMcpServer(): McpServer {
           path,
           content,
           createDirectories,
+          ...(guard === undefined ? {} : { guard }),
           ...(expectedSha256 === undefined ? {} : { expectedSha256 }),
+          ...(expectedProjectFingerprint === undefined
+            ? {}
+            : { expectedProjectFingerprint }),
+          ...(maxBytes === undefined ? {} : { maxBytes }),
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "godot_file_replace",
+    {
+      title: "Replace text in a Godot project file",
+      description:
+        "Reads and replaces oldText under the expected project fingerprint and a server-side SHA-256 match guard. By default oldText must occur exactly once; replaceAll opts into replacing every bounded match.",
+      inputSchema: FileReplaceInputSchema,
+      outputSchema: SafeTextReplaceResultSchema,
+      annotations: {
+        readOnlyHint: false,
+        idempotentHint: false,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({
+      projectPath,
+      path,
+      expectedProjectFingerprint,
+      oldText,
+      newText,
+      replaceAll,
+      maxBytes,
+    }) =>
+      await handle(async () =>
+        await replaceProjectText({
+          projectPath,
+          path,
+          expectedProjectFingerprint,
+          oldText,
+          newText,
+          replaceAll,
           ...(maxBytes === undefined ? {} : { maxBytes }),
         }),
       ),

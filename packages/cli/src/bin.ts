@@ -34,7 +34,9 @@ import {
   launchEditor,
   launchProject,
   moveEditorNode,
+  readProjectFile,
   redoEditorAction,
+  replaceProjectText,
   runDoctor,
   runProject,
   stopManagedRun,
@@ -48,6 +50,7 @@ import {
   updateEditorNode,
   updateEditorResource,
   waitForRuntime,
+  writeProjectFile,
   type RuntimeInputStep,
 } from "@godot-agent-runtime/core";
 import { parseFiniteNumber, parseFiniteVector3, parseInteger } from "./numeric.js";
@@ -61,12 +64,20 @@ function positional(args: string[]): string[] {
   const values: string[] = [];
   for (let index = 0; index < args.length; index += 1) {
     if (args[index]?.startsWith("--")) {
-      index += 1;
+      if (args[index] !== "--create-only") index += 1;
       continue;
     }
     values.push(args[index] ?? "");
   }
   return values;
+}
+
+function sha256Option(args: string[], name: string): string | undefined {
+  const value = option(args, name);
+  if (value !== undefined && !/^[0-9a-f]{64}$/.test(value)) {
+    throw new Error(`${name} must be a lowercase SHA-256 hash.`);
+  }
+  return value;
 }
 
 function print(value: unknown): void {
@@ -111,6 +122,9 @@ function printHelp(): void {
   process.stdout.write(`  find [SEARCH_ROOT] [--max-depth N] [--limit N]\n`);
   process.stdout.write(`  inspect PROJECT_PATH\n`);
   process.stdout.write(`  check PROJECT_PATH [--config PATH] [--timeout MS]\n`);
+  process.stdout.write(`  file-read PROJECT_PATH RES_PATH\n`);
+  process.stdout.write(`  file-write PROJECT_PATH RES_PATH --content TEXT (--create-only | --expected-sha256 HASH) [--expected-project-fingerprint HASH]\n`);
+  process.stdout.write(`  file-replace PROJECT_PATH RES_PATH --project-fingerprint HASH --old TEXT --new TEXT [--replace-all true|false]\n`);
   process.stdout.write(`  run PROJECT_PATH [--scene RES_PATH] [--config PATH] [--timeout MS]  # headless\n`);
   process.stdout.write(`  launch PROJECT_PATH [--scene RES_PATH] [--config PATH] [--timeout MS]\n`);
   process.stdout.write(`  status PROJECT_PATH RUN_ID [--max-output BYTES]\n`);
@@ -187,6 +201,47 @@ async function main(): Promise<void> {
       if (!values[0]) throw new Error("inspect requires PROJECT_PATH.");
       print(await inspectProject(values[0]));
       return;
+    case "file-read":
+      if (!values[0] || !values[1]) throw new Error("file-read requires PROJECT_PATH and RES_PATH.");
+      print(await readProjectFile({ projectPath: values[0], path: values[1] }));
+      return;
+    case "file-write": {
+      if (!values[0] || !values[1]) throw new Error("file-write requires PROJECT_PATH and RES_PATH.");
+      const content = option(args, "--content");
+      if (content === undefined) throw new Error("file-write requires --content TEXT.");
+      const createOnly = args.includes("--create-only");
+      const expectedSha256 = sha256Option(args, "--expected-sha256");
+      const expectedProjectFingerprint = sha256Option(args, "--expected-project-fingerprint");
+      print(await writeProjectFile({
+        projectPath: values[0],
+        path: values[1],
+        content,
+        ...(createOnly ? { guard: { mode: "create" as const } } : {}),
+        ...(expectedSha256 === undefined ? {} : { expectedSha256 }),
+        ...(expectedProjectFingerprint === undefined ? {} : { expectedProjectFingerprint }),
+      }));
+      return;
+    }
+    case "file-replace": {
+      if (!values[0] || !values[1]) throw new Error("file-replace requires PROJECT_PATH and RES_PATH.");
+      const expectedProjectFingerprint = sha256Option(args, "--project-fingerprint");
+      const oldText = option(args, "--old");
+      const newText = option(args, "--new");
+      if (expectedProjectFingerprint === undefined || oldText === undefined || newText === undefined) {
+        throw new Error("file-replace requires --project-fingerprint HASH, --old TEXT, and --new TEXT.");
+      }
+      if (oldText.length === 0) throw new Error("file-replace --old must not be empty.");
+      const replaceAll = parseBoolean(option(args, "--replace-all"), "--replace-all");
+      print(await replaceProjectText({
+        projectPath: values[0],
+        path: values[1],
+        expectedProjectFingerprint,
+        oldText,
+        newText,
+        ...(replaceAll === undefined ? {} : { replaceAll }),
+      }));
+      return;
+    }
     case "check":
       if (!values[0]) throw new Error("check requires PROJECT_PATH.");
       print(

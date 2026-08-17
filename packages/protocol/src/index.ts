@@ -172,9 +172,16 @@ export const SafeFileReadResultSchema = z.object({
   bytes: z.number().int().nonnegative(),
   sha256: z.string().regex(/^[0-9a-f]{64}$/),
   content: z.string(),
-});
+}).strict();
 
 export type SafeFileReadResult = z.infer<typeof SafeFileReadResultSchema>;
+
+export const FileMutationGuardSchema = z.discriminatedUnion("mode", [
+  z.object({ mode: z.literal("create") }).strict(),
+  z.object({ mode: z.literal("match"), sha256: Sha256Schema }).strict(),
+]);
+
+export type FileMutationGuard = z.infer<typeof FileMutationGuardSchema>;
 
 export const SafeFileWriteResultSchema = z.object({
   ok: z.literal(true),
@@ -184,9 +191,15 @@ export const SafeFileWriteResultSchema = z.object({
   bytes: z.number().int().nonnegative(),
   sha256: z.string().regex(/^[0-9a-f]{64}$/),
   previousSha256: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
-});
+}).strict();
 
 export type SafeFileWriteResult = z.infer<typeof SafeFileWriteResultSchema>;
+
+export const SafeTextReplaceResultSchema = SafeFileWriteResultSchema.extend({
+  replacements: z.number().int().positive(),
+}).strict();
+
+export type SafeTextReplaceResult = z.infer<typeof SafeTextReplaceResultSchema>;
 
 export const RuntimeBridgeInfoSchema = z.object({
   ok: z.literal(true),

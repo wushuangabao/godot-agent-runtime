@@ -82,8 +82,22 @@ export {
 } from "./project.js";
 export { runProcess } from "./process.js";
 export type { ProcessResult, RunProcessOptions } from "./process.js";
-export { readProjectFile, writeProjectFile } from "./safe-file.js";
-export type { SafeFileOptions, SafeFileWriteOptions } from "./safe-file.js";
+export {
+  readProjectFile,
+  replaceProjectText,
+  withProjectMutationLock,
+  writeProjectFile,
+} from "./safe-file.js";
+export type {
+  FileMutationGuard,
+  ProjectMutationLease,
+  ProjectMutationLockOptions,
+  SafeFileOptions,
+  SafeFileWriteOptions,
+  SafeTextReplaceOptions,
+} from "./safe-file.js";
+export { ensureSafeProjectDirectory, resolveSafeTarget } from "./safe-path.js";
+export type { SafeProjectTarget } from "./safe-path.js";
 export {
   assertRuntime,
   captureRuntimeScreenshot,
