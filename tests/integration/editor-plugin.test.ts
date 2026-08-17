@@ -99,6 +99,15 @@ async function blockSceneSave(path: string): Promise<() => Promise<void>> {
   };
 }
 
+async function waitForPath(path: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return;
+    await new Promise((complete) => setTimeout(complete, 10));
+  }
+  throw new Error(`Timed out waiting for ${path}.`);
+}
+
 describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
   it(
     "holds the shared project.godot lease while reconciling a timed-out Bridge response",
@@ -108,9 +117,13 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         recursive: true,
         filter: (source) => !source.includes(`${resolve("examples", "control-ui", ".godot")}`),
       });
-      const previousDelay = process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_DELAY_MS;
-      process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_DELAY_MS = "700";
+      const barrierPath = resolve(projectPath, ".project-setting-test-barrier");
+      const enteredPath = `${barrierPath}.entered`;
+      const previousBarrier = process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_BARRIER_PATH;
+      process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_BARRIER_PATH = barrierPath;
+      await writeFile(barrierPath, "hold", "utf8");
       let runId: string | null = null;
+      const pending: Promise<unknown>[] = [];
       try {
         await installGodotAddon(projectPath);
         const launch = await launchEditor({ projectPath, configPath, timeoutMs: 30_000 });
@@ -127,7 +140,12 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           key: "display/window/size/viewport_width",
           value: 800,
         });
-        await new Promise((complete) => setTimeout(complete, 150));
+        pending.push(setting);
+        await waitForPath(enteredPath);
+        let editorInfoSettled = false;
+        const queuedEditorInfo = getEditorInfo({ projectPath, runId })
+          .finally(() => { editorInfoSettled = true; });
+        pending.push(queuedEditorInfo);
         let writerSettled = false;
         const writer = writeProjectFile({
           projectPath,
@@ -136,8 +154,11 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           expectedSha256: identity.projectFileSha256,
           expectedProjectFingerprint: identity.projectFingerprint,
         }).finally(() => { writerSettled = true; });
+        pending.push(writer);
         await new Promise((complete) => setTimeout(complete, 200));
+        expect(editorInfoSettled).toBe(false);
         expect(writerSettled).toBe(false);
+        await rm(barrierPath, { force: true });
 
         const changed = await setting;
         expect(changed).toMatchObject({
@@ -145,13 +166,17 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           beforeSha256: identity.projectFileSha256,
           afterSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
         });
+        await expect(queuedEditorInfo).resolves.toMatchObject({ protocolVersion: "0.7.0" });
         await expect(writer).rejects.toMatchObject({ payload: { code: "FILE_WRITE_CONFLICT" } });
       } finally {
-        if (previousDelay === undefined) {
-          delete process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_DELAY_MS;
+        await rm(barrierPath, { force: true });
+        await rm(enteredPath, { force: true });
+        if (previousBarrier === undefined) {
+          delete process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_BARRIER_PATH;
         } else {
-          process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_DELAY_MS = previousDelay;
+          process.env.GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_BARRIER_PATH = previousBarrier;
         }
+        await Promise.allSettled(pending);
         if (runId !== null) await stopManagedRun({ projectPath, runId, timeoutMs: 15_000 });
         await rm(projectPath, { recursive: true, force: true });
       }

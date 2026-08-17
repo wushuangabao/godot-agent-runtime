@@ -354,7 +354,7 @@ export async function getDiagnosticsSummary(
       required: true,
     });
   }
-  if (status.state === "running" && errors === 0) {
+  if (status.state === "running" && errors === 0 && !logs.truncated) {
     nextActions.push({
       tool: "godot_runtime_assert",
       reason: "Clean diagnostics do not prove interaction; optionally assert the intended runtime state.",

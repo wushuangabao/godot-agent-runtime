@@ -491,6 +491,7 @@ describe("safe project files", () => {
     await ensureCompiledCore();
     const projectPath = await projectFixture();
     const ready = resolve(projectPath, "publishing.ready");
+    const release = resolve(projectPath, "publishing.release");
     const coreUrl = pathToFileURL(resolve(process.cwd(), "packages/core/dist/safe-file.js")).href;
     const timing = {
       heartbeatMs: 20,
@@ -500,7 +501,7 @@ describe("safe project files", () => {
       pollMs: 5,
     };
     const run = startNodeScript(`
-      import { writeFile } from "node:fs/promises";
+      import { access, writeFile } from "node:fs/promises";
       import { __setSafeFileTestHooks, withProjectMutationLock } from ${JSON.stringify(coreUrl)};
       __setSafeFileTestHooks({ timing: ${JSON.stringify(timing)} });
       await withProjectMutationLock({
@@ -508,31 +509,44 @@ describe("safe project files", () => {
       }, async (lease) => {
         await lease.prepareResultUnknown();
         await writeFile(${JSON.stringify(ready)}, "ready", "utf8");
-        await new Promise((complete) => setTimeout(complete, 250));
+        const deadline = Date.now() + 10000;
+        while (true) {
+          try {
+            await access(${JSON.stringify(release)});
+            break;
+          } catch {
+            if (Date.now() >= deadline) throw new Error("Timed out waiting for publishing lease release.");
+            await new Promise((complete) => setTimeout(complete, 10));
+          }
+        }
       });
     `);
     await waitForPath(ready);
     expect(await onlyLease(projectPath)).toMatchObject({ state: "publishing" });
     await new Promise((complete) => setTimeout(complete, 70));
 
-    await withSafeFileTestHooks({ timing }, async () => {
-      await expect(withProjectMutationLock({
-        projectPath,
-        path: "main.gd",
-      }, async () => "second-owner")).rejects.toMatchObject({
-        payload: { code: "FILE_MUTATION_BUSY" },
+    try {
+      await withSafeFileTestHooks({ timing }, async () => {
+        await expect(withProjectMutationLock({
+          projectPath,
+          path: "main.gd",
+        }, async () => "second-owner")).rejects.toMatchObject({
+          payload: { code: "FILE_MUTATION_BUSY" },
+        });
+        await expect(withProjectMutationLock({
+          projectPath,
+          path: "main.gd",
+          indeterminateErrorCode: "PROJECT_MUTATION_INDETERMINATE",
+        }, async () => "second-owner")).rejects.toMatchObject({
+          payload: {
+            code: "PROJECT_MUTATION_INDETERMINATE",
+            details: { leaseState: "publishing", quarantineUntil: expect.any(String) },
+          },
+        });
       });
-      await expect(withProjectMutationLock({
-        projectPath,
-        path: "main.gd",
-        indeterminateErrorCode: "PROJECT_MUTATION_INDETERMINATE",
-      }, async () => "second-owner")).rejects.toMatchObject({
-        payload: {
-          code: "PROJECT_MUTATION_INDETERMINATE",
-          details: { leaseState: "publishing", quarantineUntil: expect.any(String) },
-        },
-      });
-    });
+    } finally {
+      await writeFile(release, "release", "utf8");
+    }
     expect(await run.result).toMatchObject({ code: 0, stderr: "" });
   });
 
@@ -543,7 +557,7 @@ describe("safe project files", () => {
     const coreUrl = pathToFileURL(resolve(process.cwd(), "packages/core/dist/safe-file.js")).href;
     const timing = {
       heartbeatMs: 20,
-      staleTtlMs: 100,
+      staleTtlMs: 1_000,
       quarantineMs: 100,
       acquireTimeoutMs: 30,
       pollMs: 5,
@@ -567,7 +581,7 @@ describe("safe project files", () => {
       projectPath,
       path: "main.gd",
     }, async () => undefined)).rejects.toMatchObject({ payload: { code: "FILE_MUTATION_BUSY" } }));
-    await new Promise((complete) => setTimeout(complete, 110));
+    await new Promise((complete) => setTimeout(complete, 1_010));
     await withSafeFileTestHooks(
       { timing: { ...timing, acquireTimeoutMs: 80 } },
       async () => await expect(withProjectMutationLock({

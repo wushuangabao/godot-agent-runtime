@@ -87,6 +87,7 @@ const EDITOR_CAPABILITIES = [
 ] as const;
 
 const PROJECT_SETTINGS_DEADLINE_MS = 30_000;
+const PROJECT_SETTINGS_RECONCILE_GRACE_MS = 5_000;
 
 export async function getEditorInfo(options: RuntimeLookupOptions): Promise<EditorBridgeInfo> {
   const result = await sendBridgeCommand(options, "hello");
@@ -434,10 +435,10 @@ function runtimeFailureFromReceipt(value: unknown): RuntimeFailure {
 }
 
 function uncertainBridgeFailure(error: unknown): boolean {
-  return error instanceof RuntimeFailure && [
-    "RUNTIME_BRIDGE_TIMEOUT",
-    "RUNTIME_BRIDGE_CONNECTION_FAILED",
-  ].includes(error.payload.code);
+  if (!(error instanceof RuntimeFailure)) return false;
+  if (error.payload.code === "RUNTIME_BRIDGE_TIMEOUT") return true;
+  if (error.payload.code !== "RUNTIME_BRIDGE_CONNECTION_FAILED") return false;
+  return error.payload.details?.requestSent !== false;
 }
 
 async function projectFileSha256(projectPath: string): Promise<string> {
@@ -489,7 +490,7 @@ async function runProjectSettingsMutation(
     expectedProjectFingerprint: options.expectedProjectFingerprint,
     indeterminateErrorCode: "PROJECT_MUTATION_INDETERMINATE",
   }, async (lease: ProjectMutationLease) => {
-    const deadline = Date.now() + PROJECT_SETTINGS_DEADLINE_MS;
+    const operationDeadline = Date.now() + PROJECT_SETTINGS_DEADLINE_MS;
     await lease.prepareResultUnknown();
     try {
       return await sendBridgeCommand(
@@ -507,7 +508,11 @@ async function runProjectSettingsMutation(
       );
     } catch (error) {
       if (!uncertainBridgeFailure(error)) throw error;
-      const reconciled = await reconcileProjectSettingOperation(options, operationId, deadline);
+      const reconcileDeadline = Math.max(
+        operationDeadline,
+        Date.now() + PROJECT_SETTINGS_RECONCILE_GRACE_MS,
+      );
+      const reconciled = await reconcileProjectSettingOperation(options, operationId, reconcileDeadline);
       if (reconciled !== null) return reconciled;
 
       try {

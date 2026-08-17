@@ -16,6 +16,7 @@ var _batch_dirty_versions := {}
 var _loaded_project_file_sha256 := ""
 var _project_setting_operations := {}
 var _project_setting_operation_order: Array[String] = []
+var _exclusive_operation_active := false
 
 
 func configure(editor: EditorInterface, undo_redo: EditorUndoRedoManager) -> void:
@@ -86,6 +87,11 @@ func _handle(peer: Dictionary, line: String) -> void:
 	var params = request.get("params", {})
 	if typeof(params) != TYPE_DICTIONARY:
 		_send(peer, {"id": request_id, "ok": false, "error": {"code": "EDITOR_REQUEST_INVALID", "message": "params must be an object."}})
+		return
+	var request_timeout_ms := clampi(int(request.get("timeoutMs", 5000)), 100, 32000)
+	var deadline_ms := Time.get_ticks_msec() + request_timeout_ms
+	if not await _acquire_exclusive_operation(peer, deadline_ms):
+		_send(peer, {"id": request_id, "ok": false, "error": {"code": "EDITOR_REQUEST_CANCELLED", "message": "The editor request expired or its client disconnected before execution."}})
 		return
 	match command:
 		"hello":
@@ -162,6 +168,30 @@ func _handle(peer: Dictionary, line: String) -> void:
 			_send_ok(peer, request_id, _history_step("redo", params))
 		_:
 			_send(peer, {"id": request_id, "ok": false, "error": {"code": "EDITOR_COMMAND_UNKNOWN", "message": "Unknown editor command."}})
+	_release_exclusive_operation()
+
+
+func _acquire_exclusive_operation(peer: Dictionary, deadline_ms: int) -> bool:
+	while _exclusive_operation_active:
+		if not _request_is_active(peer, deadline_ms):
+			return false
+		await get_tree().process_frame
+	if not _request_is_active(peer, deadline_ms):
+		return false
+	_exclusive_operation_active = true
+	return true
+
+
+func _release_exclusive_operation() -> void:
+	_exclusive_operation_active = false
+
+
+func _request_is_active(peer: Dictionary, deadline_ms: int) -> bool:
+	if Time.get_ticks_msec() >= deadline_ms or not peer.has("stream") or peer.stream == null:
+		return false
+	var stream: StreamPeerTCP = peer.stream
+	stream.poll()
+	return stream.get_status() == StreamPeerTCP.STATUS_CONNECTED
 
 
 func _history_for_root(root: Node) -> UndoRedo:
@@ -323,6 +353,7 @@ func _project_file_write_guard(params: Dictionary) -> Dictionary:
 
 
 func _save_project_setting(operation_id: String, before_sha: String, rollback_key: String, rollback_value: Variant) -> Dictionary:
+	await _wait_for_project_setting_test_barrier()
 	var delay_ms := int(OS.get_environment("GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_DELAY_MS"))
 	if delay_ms > 0 and delay_ms <= 30000:
 		await get_tree().create_timer(float(delay_ms) / 1000.0).timeout
@@ -338,6 +369,21 @@ func _save_project_setting(operation_id: String, before_sha: String, rollback_ke
 		return _failure("EDITOR_PROJECT_SETTING_SAVE_FAILED", "Godot saved project.godot but its resulting SHA-256 could not be read.", {"operationId": operation_id})
 	_loaded_project_file_sha256 = after_sha
 	return {"beforeSha256": before_sha, "afterSha256": after_sha}
+
+
+func _wait_for_project_setting_test_barrier() -> void:
+	var barrier_path := OS.get_environment("GODOT_AGENT_RUNTIME_TEST_PROJECT_SETTING_BARRIER_PATH")
+	if barrier_path.is_empty() or not FileAccess.file_exists(barrier_path):
+		return
+	var entered_path := barrier_path + ".entered"
+	var marker := FileAccess.open(entered_path, FileAccess.WRITE)
+	if marker != null:
+		marker.store_string("entered")
+		marker.close()
+	var deadline_ms := Time.get_ticks_msec() + 30000
+	while FileAccess.file_exists(barrier_path) and Time.get_ticks_msec() < deadline_ms:
+		await get_tree().process_frame
+	DirAccess.remove_absolute(entered_path)
 
 
 func _project_setting_set(params: Dictionary) -> Dictionary:
@@ -2299,7 +2345,12 @@ func _screenshot(params: Dictionary) -> Dictionary:
 	if viewport_kind == "3d":
 		var camera := viewport.get_camera_3d()
 		if camera == null:
-			return _failure("EDITOR_SCREENSHOT_CAMERA_UNAVAILABLE", "The requested 3D editor viewport has no active camera.", {"viewportIndex": viewport_index})
+			var cleanup_error := DirAccess.remove_absolute(path)
+			return _failure("EDITOR_SCREENSHOT_CAMERA_UNAVAILABLE", "The requested 3D editor viewport has no active camera.", {
+				"viewportIndex": viewport_index,
+				"path": path.replace("\\", "/"),
+				"cleanupError": cleanup_error,
+			})
 		var projection_name := "perspective"
 		match camera.projection:
 			Camera3D.PROJECTION_ORTHOGONAL:

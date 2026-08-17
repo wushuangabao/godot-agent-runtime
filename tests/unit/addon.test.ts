@@ -59,6 +59,12 @@ describe("Godot addon installer", () => {
     expect(editorBridge).toContain('"input_map"');
     expect(editorBridge).toContain('"resource_inspect"');
     expect(editorBridge).toContain('"project_setting_operation_status"');
+    const cameraUnavailableStart = editorBridge.indexOf("if camera == null:");
+    const cameraUnavailableEnd = editorBridge.indexOf("var projection_name :=", cameraUnavailableStart);
+    expect(cameraUnavailableStart).toBeGreaterThan(-1);
+    expect(cameraUnavailableEnd).toBeGreaterThan(cameraUnavailableStart);
+    expect(editorBridge.slice(cameraUnavailableStart, cameraUnavailableEnd))
+      .toContain("DirAccess.remove_absolute(path)");
     expect(runtimeBridge).toContain('const PROTOCOL_VERSION := "0.4.0"');
     expect(runtimeBridge).toContain('"screenshot_receipt"');
   });

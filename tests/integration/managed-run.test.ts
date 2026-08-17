@@ -16,6 +16,7 @@ import {
 import { RuntimeFailure } from "../../packages/core/src/errors.js";
 import {
   findLoopbackPort,
+  sendBridgeCommand,
   waitForRuntimeBridge,
 } from "../../packages/core/src/runtime.js";
 
@@ -250,5 +251,32 @@ describe("managed run lifecycle", () => {
     })).rejects.toMatchObject({ payload: { code: "RUNTIME_BRIDGE_FAILED" } });
     expect(Date.now() - startedAt).toBeLessThan(4_000);
     await stopManagedRun({ projectPath, runId: launch.runId });
+  });
+
+  it("reports whether a bridge connection failed before the request was sent", async () => {
+    const projectPath = resolve("tests", "fixtures", "managed-process");
+    const launch = await launchManagedProcess({
+      projectPath,
+      executable: process.execPath,
+      args: [resolve(projectPath, "child.mjs")],
+      env: { ...process.env },
+      scene: null,
+      runtimeBridgePort: await findLoopbackPort(),
+    });
+    try {
+      await expect(sendBridgeCommand({
+        projectPath,
+        runId: launch.runId,
+        timeoutMs: 1_000,
+      }, "hello")).rejects.toMatchObject({
+        payload: {
+          code: "RUNTIME_BRIDGE_CONNECTION_FAILED",
+          details: { requestSent: false },
+        },
+      });
+      expect((await getManagedRunStatus({ projectPath, runId: launch.runId })).state).toBe("running");
+    } finally {
+      await stopManagedRun({ projectPath, runId: launch.runId });
+    }
   });
 });

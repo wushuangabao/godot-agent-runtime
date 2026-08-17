@@ -18,7 +18,11 @@ afterEach(async () => {
   }));
 });
 
-async function createRun(stdout: Buffer | string, stderr: Buffer | string = "") {
+async function createRun(
+  stdout: Buffer | string,
+  stderr: Buffer | string = "",
+  state: "running" | "exited" = "exited",
+) {
   const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-diagnostics-"));
   sandboxes.push(projectPath);
   await writeFile(resolve(projectPath, "project.godot"), "[application]\nconfig/name=\"Diagnostics\"\n", "utf8");
@@ -33,7 +37,7 @@ async function createRun(stdout: Buffer | string, stderr: Buffer | string = "") 
     schemaVersion: 1,
     runId,
     token: "not-a-report-field",
-    state: "exited",
+    state,
     projectPath,
     scene: "res://main.tscn",
     processId: null,
@@ -142,6 +146,25 @@ describe("structured diagnostics", () => {
       reason: expect.any(String),
       required: true,
     });
+  });
+
+  it("does not call truncated diagnostics clean when unseen stderr may contain errors", async () => {
+    const run = await createRun("ordinary stdout\n", "ERROR: unseen stderr failure\n", "running");
+    const summary = await getDiagnosticsSummary({
+      projectPath: run.projectPath,
+      runId: run.runId,
+      maxIssues: 1,
+    });
+
+    expect(summary.truncated).toBe(true);
+    expect(summary.nextActions).toContainEqual({
+      tool: "godot_log_read",
+      reason: expect.any(String),
+      required: true,
+    });
+    expect(summary.nextActions).not.toContainEqual(expect.objectContaining({
+      tool: "godot_runtime_assert",
+    }));
   });
 
   it("rejects invalid UTF-8 instead of treating it as a trailing partial code point", async () => {

@@ -266,6 +266,7 @@ export async function sendBridgeCommand(
     const socket = createConnection({ host: "127.0.0.1", port: connection.runtimeBridgePort });
     let buffer = Buffer.alloc(0);
     let settled = false;
+    let requestSent = false;
     const fail = (error: unknown) => {
       if (settled) return;
       settled = true;
@@ -278,7 +279,7 @@ export async function sendBridgeCommand(
           code: "RUNTIME_BRIDGE_TIMEOUT",
           stage: "run",
           message: `Runtime bridge command ${command} timed out after ${timeoutMs} ms.`,
-          details: { runId: options.runId, command },
+          details: { runId: options.runId, command, requestSent },
           recovery: ["Query godot_run_status for runtime errors, then retry with a larger timeout."],
         }),
       ),
@@ -289,12 +290,15 @@ export async function sendBridgeCommand(
           code: "RUNTIME_BRIDGE_CONNECTION_FAILED",
           stage: "run",
           message: `Could not connect to the runtime bridge for run ${options.runId}.`,
-          details: { command, cause: error.message },
+          details: { command, cause: error.message, requestSent },
           recovery: ["Confirm the run is still active and inspect its stderr with godot_run_status."],
         }),
       ),
     );
-    socket.once("connect", () => socket.write(request, "utf8"));
+    socket.once("connect", () => {
+      requestSent = true;
+      socket.write(request, "utf8");
+    });
     socket.on("data", (chunk: Buffer) => {
       buffer = Buffer.concat([buffer, chunk]);
       if (buffer.length > MAX_RESPONSE_BYTES) {
