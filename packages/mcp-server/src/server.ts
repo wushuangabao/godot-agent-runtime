@@ -9,6 +9,7 @@ import {
   checkProject,
   checkScript,
   assertRuntime,
+  batchEditorScene,
   captureEditorScreenshot,
   captureRuntimeScreenshot,
   controlRuntime,
@@ -65,6 +66,8 @@ import {
 import {
   DoctorResultSchema,
   AddonInstallResultSchema,
+  EditorBatchRequestSchema,
+  EditorBatchResultSchema,
   EditorBridgeInfoSchema,
   EditorHistoryResultSchema,
   EditorInheritedSceneResultSchema,
@@ -457,6 +460,12 @@ const EditorSignalConnectInputSchema = EditorMutationLookupInputSchema.extend({
   targetPath: z.string().min(1),
   method: z.string().min(1),
   flags: z.number().int().min(0).max(15).optional(),
+});
+
+const EditorBatchInputSchema = EditorBatchRequestSchema.safeExtend({
+  projectPath: z.string().min(1),
+  runId: z.uuid(),
+  timeoutMs: z.number().int().min(100).max(30_000).optional(),
 });
 
 function acceptMissingRequiredGuards<Schema extends StandardSchemaWithJSON>(
@@ -1432,6 +1441,30 @@ export function createMcpServer(): McpServer {
           runId,
           paths,
           focus,
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "godot_editor_batch",
+    {
+      title: "Apply an atomic editor scene batch",
+      description: "Validates 1-32 typed scene operations, then applies them as one native Undo/Redo action without saving. Creation-only batches do not delete content; this tool is statically marked destructive because node_delete is supported.",
+      inputSchema: EditorBatchInputSchema,
+      outputSchema: EditorBatchResultSchema,
+      annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true, openWorldHint: false },
+    },
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, actionName, operations, confirmDestructive }) =>
+      await handle(async () =>
+        await batchEditorScene({
+          projectPath,
+          runId,
+          expectedProjectFingerprint,
+          expectedScenePath,
+          operations,
+          confirmDestructive,
+          ...(actionName === undefined ? {} : { actionName }),
           ...(timeoutMs === undefined ? {} : { timeoutMs }),
         }),
       ),

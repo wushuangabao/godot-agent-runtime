@@ -1,7 +1,7 @@
 @tool
 extends Node
 
-const PROTOCOL_VERSION := "0.4.0"
+const PROTOCOL_VERSION := "0.5.0"
 const MAX_MESSAGE_BYTES := 1024 * 1024
 
 var _editor: EditorInterface
@@ -11,6 +11,7 @@ var _port := 0
 var _token := ""
 var _run_id := ""
 var _peers: Array[Dictionary] = []
+var _batch_dirty_versions := {}
 
 
 func configure(editor: EditorInterface, undo_redo: EditorUndoRedoManager) -> void:
@@ -89,7 +90,7 @@ func _handle(peer: Dictionary, line: String) -> void:
 				"engineVersion": Engine.get_version_info().get("string", "unknown"),
 				"scene": root.scene_file_path if root != null else null,
 				"historyVersion": _history_version(root) if root != null else null,
-				"capabilities": ["scene_tree", "selection", "screenshot", "viewport_3d", "node_edit", "scene_instantiate", "scene_inheritance", "instance_editable", "resource_edit", "resource_save", "resource_focus", "signal_connect", "scene_save", "scene_open", "undo_redo"],
+				"capabilities": ["scene_tree", "selection", "screenshot", "viewport_3d", "node_edit", "scene_instantiate", "scene_inheritance", "instance_editable", "resource_edit", "resource_save", "resource_focus", "signal_connect", "scene_save", "scene_open", "scene_batch", "undo_redo"],
 			})
 		"scene_open":
 			_send_ok(peer, request_id, await _scene_open(params))
@@ -108,6 +109,8 @@ func _handle(peer: Dictionary, line: String) -> void:
 			_send_ok(peer, request_id, await _screenshot(params))
 		"node_get":
 			_send_ok(peer, request_id, _node_get(params))
+		"scene_batch":
+			_send_ok(peer, request_id, _scene_batch(params))
 		"node_create":
 			_send_ok(peer, request_id, _node_create(params))
 		"scene_instantiate":
@@ -254,6 +257,528 @@ func _node_get(params: Dictionary) -> Dictionary:
 			return _failure("EDITOR_PROPERTY_NOT_FOUND", "Node property does not exist.", {"nodePath": path, "property": property})
 		values[property] = _encode_value(node.get(property))
 	return {"node": _describe_node(node, values)}
+
+
+func _scene_batch(params: Dictionary) -> Dictionary:
+	var validated := _validate_batch(params)
+	if validated.has("_error"):
+		return validated
+	var root: Node = validated.root
+	var context := _create_batch_context(root)
+	var plans: Array[Dictionary] = []
+	var receipts: Array[Dictionary] = []
+	var operations: Array = validated.operations
+	for index in range(operations.size()):
+		var operation: Dictionary = operations[index]
+		var planned := _plan_batch_operation(context, operation, index)
+		if planned.has("_error"):
+			_cleanup_batch_context(context)
+			return _batch_validation_failure(index, str(operation.get("op", "")), _batch_operation_hint_path(operation), planned)
+		plans.append(planned)
+		receipts.append({
+			"index": index,
+			"op": str(operation.op),
+			"path": str(planned.path),
+			"action": str(planned.action),
+		})
+
+	var full_action_name := "Agent batch: %s" % validated.actionName
+	_undo_redo.create_action(full_action_name, UndoRedo.MERGE_DISABLE, root)
+	for plan in plans:
+		_register_batch_do_operation(root, plan)
+	for plan_index in range(plans.size() - 1, -1, -1):
+		_register_batch_undo_operation(root, plans[plan_index])
+	_undo_redo.commit_action()
+	var history_version = _history_version(root)
+	_batch_dirty_versions[root.scene_file_path] = history_version
+	return {
+		"scenePath": root.scene_file_path,
+		"actionName": full_action_name,
+		"operationCount": plans.size(),
+		"results": receipts,
+		"undoable": true,
+		"dirty": true,
+		"historyVersion": history_version,
+	}
+
+
+func _validate_batch(params: Dictionary) -> Dictionary:
+	var required := _require_edited_scene(params)
+	if required.has("_error"):
+		return required
+	if str(params.get("expectedProjectFingerprint", "")).is_empty():
+		return _failure("PROJECT_FINGERPRINT_REQUIRED", "expectedProjectFingerprint is required for editor batches.")
+	var operations = params.get("operations", null)
+	if typeof(operations) != TYPE_ARRAY or operations.size() < 1 or operations.size() > 32:
+		return _failure("EDITOR_BATCH_VALIDATION_FAILED", "operations must contain between 1 and 32 entries.", {"operationCount": operations.size() if typeof(operations) == TYPE_ARRAY else null})
+	var confirm_destructive := bool(params.get("confirmDestructive", false))
+	var supported := ["node_create", "node_update", "node_move", "node_delete", "scene_instantiate", "resource_create", "resource_update", "instance_set_editable", "signal_connect"]
+	for index in range(operations.size()):
+		if typeof(operations[index]) != TYPE_DICTIONARY:
+			return _failure("EDITOR_BATCH_VALIDATION_FAILED", "Every operation must be an object.", {"index": index})
+		var operation: Dictionary = operations[index]
+		var op := str(operation.get("op", ""))
+		if op not in supported:
+			return _failure("EDITOR_BATCH_VALIDATION_FAILED", "Batch operation is not supported.", {"index": index, "op": op})
+		if op == "node_delete" and not confirm_destructive:
+			return _failure("EDITOR_BATCH_VALIDATION_FAILED", "node_delete requires confirmDestructive=true.", {"index": index, "op": op})
+	var action_name := str(params.get("actionName", "Scene batch"))
+	if action_name.is_empty() or action_name.length() > 120:
+		return _failure("EDITOR_BATCH_VALIDATION_FAILED", "actionName must contain between 1 and 120 characters.")
+	return {"root": required.root, "operations": operations, "actionName": action_name}
+
+
+func _create_batch_context(root: Node) -> Dictionary:
+	var context := {
+		"root": root,
+		"rootPath": "/root/%s" % root.name,
+		"index": {},
+		"children": {},
+		"createdRoots": [],
+		"propertyValues": {},
+		"editableValues": {},
+		"connections": {},
+	}
+	_index_batch_subtree(context, root, str(context.rootPath), "")
+	return context
+
+
+func _index_batch_subtree(context: Dictionary, node: Node, path: String, parent_path: String) -> void:
+	context.index[path] = {
+		"node": node,
+		"path": path,
+		"parentPath": parent_path,
+		"name": path.get_file(),
+	}
+	if not context.children.has(parent_path):
+		context.children[parent_path] = []
+	var siblings: Array = context.children[parent_path]
+	if path not in siblings:
+		siblings.append(path)
+	context.children[parent_path] = siblings
+	if not context.children.has(path):
+		context.children[path] = []
+	for child in node.get_children():
+		_index_batch_subtree(context, child, path.path_join(str(child.name)), path)
+
+
+func _batch_operation_hint_path(operation: Dictionary) -> String:
+	match str(operation.get("op", "")):
+		"node_create":
+			return str(operation.get("parentPath", "")).path_join(str(operation.get("name", "")))
+		"scene_instantiate":
+			return str(operation.get("parentPath", "")).path_join(str(operation.get("name", operation.get("scenePath", ""))))
+		"node_update", "node_move", "node_delete", "resource_create", "resource_update", "instance_set_editable":
+			return str(operation.get("nodePath", ""))
+		"signal_connect":
+			return str(operation.get("sourcePath", ""))
+	return ""
+
+
+func _batch_validation_failure(index: int, op: String, path: String, cause: Dictionary) -> Dictionary:
+	var error: Dictionary = cause.get("_error", {})
+	return _failure("EDITOR_BATCH_VALIDATION_FAILED", "Batch operation failed validation before any editor mutation was registered.", {
+		"index": index,
+		"op": op,
+		"path": path,
+		"causeCode": str(error.get("code", "EDITOR_BATCH_VALIDATION_FAILED")),
+		"causeDetails": error.get("details", {}),
+	})
+
+
+func _cleanup_batch_context(context: Dictionary) -> void:
+	for value in context.createdRoots:
+		if value is Node and is_instance_valid(value) and not (value as Node).is_inside_tree():
+			(value as Node).free()
+
+
+func _batch_entry(context: Dictionary, path: String, code: String = "EDITOR_NODE_NOT_FOUND") -> Dictionary:
+	if not context.index.has(path):
+		return _failure(code, "Node was not found in the logical batch scene.", {"nodePath": path})
+	return context.index[path]
+
+
+func _batch_property_key(object: Object, property: String) -> String:
+	return "%d:%s" % [object.get_instance_id(), property]
+
+
+func _batch_current_property(context: Dictionary, object: Object, property: String) -> Variant:
+	var key := _batch_property_key(object, property)
+	return context.propertyValues[key] if context.propertyValues.has(key) else object.get(property)
+
+
+func _batch_set_property(context: Dictionary, object: Object, property: String, value: Variant) -> void:
+	context.propertyValues[_batch_property_key(object, property)] = value
+
+
+func _prepare_batch_properties(context: Dictionary, object: Object, raw: Variant) -> Dictionary:
+	var prepared := _prepare_properties(object, raw)
+	if prepared.has("_error"):
+		return prepared
+	for change in prepared.changes:
+		var property := str(change.property)
+		change.previous = _batch_current_property(context, object, property)
+		_batch_set_property(context, object, property, change.value)
+	return prepared
+
+
+func _rewrite_batch_path(path: String, old_path: String, new_path: String) -> String:
+	if path == old_path:
+		return new_path
+	if path.begins_with(old_path + "/"):
+		return new_path + path.trim_prefix(old_path)
+	return path
+
+
+func _rewrite_batch_paths(context: Dictionary, old_path: String, new_path: String) -> void:
+	var rewritten_index := {}
+	for key_value in context.index.keys():
+		var key := str(key_value)
+		var rewritten := _rewrite_batch_path(key, old_path, new_path)
+		var entry: Dictionary = context.index[key]
+		entry.path = rewritten
+		entry.parentPath = _rewrite_batch_path(str(entry.parentPath), old_path, new_path)
+		rewritten_index[rewritten] = entry
+	context.index = rewritten_index
+
+	var rewritten_children := {}
+	for parent_value in context.children.keys():
+		var parent_path := _rewrite_batch_path(str(parent_value), old_path, new_path)
+		var paths: Array = []
+		for child_value in context.children[parent_value]:
+			paths.append(_rewrite_batch_path(str(child_value), old_path, new_path))
+		rewritten_children[parent_path] = paths
+	context.children = rewritten_children
+	context.rootPath = _rewrite_batch_path(str(context.rootPath), old_path, new_path)
+
+
+func _remove_batch_subtree(context: Dictionary, path: String) -> void:
+	var entry: Dictionary = context.index[path]
+	var parent_path := str(entry.parentPath)
+	if context.children.has(parent_path):
+		var siblings: Array = context.children[parent_path]
+		siblings.erase(path)
+		context.children[parent_path] = siblings
+	var removed: Array[String] = []
+	for key_value in context.index.keys():
+		var key := str(key_value)
+		if key == path or key.begins_with(path + "/"):
+			removed.append(key)
+	for key in removed:
+		context.index.erase(key)
+		context.children.erase(key)
+
+
+func _plan_batch_operation(context: Dictionary, operation: Dictionary, _index: int) -> Dictionary:
+	var op := str(operation.get("op", ""))
+	var root: Node = context.root
+	match op:
+		"node_create":
+			var parent_path := str(operation.get("parentPath", ""))
+			var parent_entry := _batch_entry(context, parent_path, "EDITOR_PARENT_NOT_FOUND")
+			if parent_entry.has("_error"):
+				return parent_entry
+			var type_name := str(operation.get("type", ""))
+			if type_name.is_empty() or not ClassDB.class_exists(type_name) or not ClassDB.can_instantiate(type_name) or not ClassDB.is_parent_class(type_name, "Node"):
+				return _failure("EDITOR_NODE_TYPE_INVALID", "type must name an instantiable Node class.", {"type": type_name})
+			var node_name := str(operation.get("name", ""))
+			var name_error := _validate_node_name(node_name)
+			if not name_error.is_empty():
+				return _failure("EDITOR_NODE_NAME_INVALID", name_error, {"name": node_name})
+			var path := parent_path.path_join(node_name)
+			if context.index.has(path):
+				return _failure("EDITOR_NODE_NAME_CONFLICT", "Parent already has a logical child with this name.", {"parentPath": parent_path, "name": node_name})
+			var instance = ClassDB.instantiate(type_name)
+			if not instance is Node:
+				if instance != null:
+					instance.free()
+				return _failure("EDITOR_NODE_CREATE_FAILED", "Godot could not instantiate the requested Node type.", {"type": type_name})
+			var node := instance as Node
+			node.name = node_name
+			var prepared := _prepare_batch_properties(context, node, operation.get("properties", {}))
+			if prepared.has("_error"):
+				node.free()
+				return prepared
+			context.createdRoots.append(node)
+			_index_batch_subtree(context, node, path, parent_path)
+			return {"kind": op, "action": "create", "path": path, "node": node, "parent": parent_entry.node, "prepared": prepared}
+
+		"scene_instantiate":
+			var parent_path := str(operation.get("parentPath", ""))
+			var parent_entry := _batch_entry(context, parent_path, "EDITOR_PARENT_NOT_FOUND")
+			if parent_entry.has("_error"):
+				return parent_entry
+			var checked_path := _validated_res_path(str(operation.get("scenePath", "")), ["tscn"])
+			if checked_path.has("_error"):
+				return checked_path
+			var scene_path: String = checked_path.path
+			if not FileAccess.file_exists(scene_path):
+				return _failure("EDITOR_SCENE_RESOURCE_NOT_FOUND", "PackedScene file was not found.", {"scenePath": scene_path})
+			var packed = load(scene_path)
+			if not packed is PackedScene or not (packed as PackedScene).can_instantiate():
+				return _failure("EDITOR_PACKED_SCENE_INVALID", "The resource is not an instantiable PackedScene.", {"scenePath": scene_path})
+			var instance := (packed as PackedScene).instantiate(PackedScene.GEN_EDIT_STATE_INSTANCE)
+			if instance == null:
+				return _failure("EDITOR_SCENE_INSTANTIATE_FAILED", "Godot could not instantiate the PackedScene.", {"scenePath": scene_path})
+			if operation.has("name"):
+				var name_error := _validate_node_name(str(operation.name))
+				if not name_error.is_empty():
+					instance.free()
+					return _failure("EDITOR_NODE_NAME_INVALID", name_error, {"name": str(operation.name)})
+				instance.name = str(operation.name)
+			var path := parent_path.path_join(str(instance.name))
+			if context.index.has(path):
+				instance.free()
+				return _failure("EDITOR_NODE_NAME_CONFLICT", "Parent already has a logical child with this name.", {"parentPath": parent_path, "name": str(instance.name)})
+			var prepared := _prepare_batch_properties(context, instance, operation.get("properties", {}))
+			if prepared.has("_error"):
+				instance.free()
+				return prepared
+			context.createdRoots.append(instance)
+			_index_batch_subtree(context, instance, path, parent_path)
+			return {"kind": op, "action": "instantiate", "path": path, "node": instance, "parent": parent_entry.node, "prepared": prepared}
+
+		"node_update":
+			var path := str(operation.get("nodePath", ""))
+			var entry := _batch_entry(context, path)
+			if entry.has("_error"):
+				return entry
+			var node: Node = entry.node
+			var prepared := _prepare_batch_properties(context, node, operation.get("properties", {}))
+			if prepared.has("_error"):
+				return prepared
+			var name_changed := false
+			var old_name := str(entry.name)
+			var new_name := old_name
+			if operation.has("name"):
+				new_name = str(operation.name)
+				var name_error := _validate_node_name(new_name)
+				if not name_error.is_empty():
+					return _failure("EDITOR_NODE_NAME_INVALID", name_error, {"name": new_name})
+				name_changed = new_name != old_name
+				var new_path := str(entry.parentPath).path_join(new_name) if not str(entry.parentPath).is_empty() else "/root/%s" % new_name
+				if name_changed and context.index.has(new_path):
+					return _failure("EDITOR_NODE_NAME_CONFLICT", "Parent already has a logical child with this name.", {"name": new_name})
+				if name_changed:
+					entry.name = new_name
+					context.index[path] = entry
+					_rewrite_batch_paths(context, path, new_path)
+					path = new_path
+			if not name_changed and prepared.names.is_empty():
+				return _failure("EDITOR_UPDATE_EMPTY", "Update requires name or at least one property.")
+			return {"kind": op, "action": "update", "path": path, "node": node, "prepared": prepared, "nameChanged": name_changed, "oldName": old_name, "newName": new_name}
+
+		"node_move":
+			var path := str(operation.get("nodePath", ""))
+			var parent_path := str(operation.get("newParentPath", ""))
+			var entry := _batch_entry(context, path)
+			if entry.has("_error"):
+				return entry
+			var parent_entry := _batch_entry(context, parent_path, "EDITOR_PARENT_NOT_FOUND")
+			if parent_entry.has("_error"):
+				return parent_entry
+			if path == str(context.rootPath):
+				return _failure("EDITOR_ROOT_MOVE_REJECTED", "The edited scene root cannot be moved.")
+			if parent_path == path or parent_path.begins_with(path + "/"):
+				return _failure("EDITOR_MOVE_CYCLE", "A node cannot be moved below itself or one of its descendants.")
+			var old_parent_path := str(entry.parentPath)
+			var new_path := parent_path.path_join(str(entry.name))
+			if new_path != path and context.index.has(new_path):
+				return _failure("EDITOR_NODE_NAME_CONFLICT", "New parent already has a logical child with this name.", {"name": str(entry.name)})
+			var old_siblings: Array = context.children.get(old_parent_path, [])
+			var old_index := old_siblings.find(path)
+			var new_siblings: Array = context.children.get(parent_path, [])
+			var maximum := new_siblings.size() if old_parent_path != parent_path else maxi(new_siblings.size() - 1, 0)
+			var requested_index := int(operation.get("index", -1))
+			if requested_index < -1 or requested_index > maximum:
+				return _failure("EDITOR_CHILD_INDEX_INVALID", "index is outside the new parent's logical child range.", {"index": requested_index, "maximum": maximum})
+			var same_parent_no_op := old_parent_path == parent_path and requested_index < 0
+			if not same_parent_no_op:
+				old_siblings.erase(path)
+				context.children[old_parent_path] = old_siblings
+				new_siblings = context.children.get(parent_path, [])
+				var final_index := new_siblings.size() if requested_index < 0 else requested_index
+				new_siblings.insert(final_index, path)
+				context.children[parent_path] = new_siblings
+				entry.parentPath = parent_path
+				context.index[path] = entry
+				_rewrite_batch_paths(context, path, new_path)
+			return {"kind": op, "action": "move", "path": new_path, "node": entry.node, "oldParent": context.index[old_parent_path].node, "newParent": parent_entry.node, "oldIndex": old_index, "index": requested_index, "keepGlobalTransform": bool(operation.get("keepGlobalTransform", true)), "sameParentNoOp": same_parent_no_op}
+
+		"node_delete":
+			var path := str(operation.get("nodePath", ""))
+			var entry := _batch_entry(context, path)
+			if entry.has("_error"):
+				return entry
+			if path == str(context.rootPath):
+				return _failure("EDITOR_ROOT_DELETE_REJECTED", "The edited scene root cannot be deleted.")
+			var parent_path := str(entry.parentPath)
+			var parent_entry := _batch_entry(context, parent_path, "EDITOR_PARENT_NOT_FOUND")
+			if parent_entry.has("_error"):
+				return parent_entry
+			var siblings: Array = context.children.get(parent_path, [])
+			var child_index := siblings.find(path)
+			var node: Node = entry.node
+			var owner = node.owner if node.is_inside_tree() else root
+			_remove_batch_subtree(context, path)
+			return {"kind": op, "action": "delete", "path": path, "node": node, "parent": parent_entry.node, "index": child_index, "owner": owner}
+
+		"resource_create":
+			var node_path := str(operation.get("nodePath", ""))
+			var entry := _batch_entry(context, node_path)
+			if entry.has("_error"):
+				return entry
+			var node: Node = entry.node
+			var property := str(operation.get("property", ""))
+			var descriptor := _property_descriptor(node, property)
+			if descriptor.is_empty():
+				return _failure("EDITOR_PROPERTY_NOT_FOUND", "Target resource property does not exist.", {"nodePath": node_path, "property": property})
+			if int(descriptor.usage) & PROPERTY_USAGE_READ_ONLY or int(descriptor.type) != TYPE_OBJECT:
+				return _failure("EDITOR_RESOURCE_PROPERTY_INVALID", "Target property must be a writable Object/Resource property.", {"property": property})
+			var type_name := str(operation.get("type", ""))
+			if type_name.is_empty() or not ClassDB.class_exists(type_name) or not ClassDB.can_instantiate(type_name) or not ClassDB.is_parent_class(type_name, "Resource"):
+				return _failure("EDITOR_RESOURCE_TYPE_INVALID", "type must name an instantiable Resource class.", {"type": type_name})
+			var instance = ClassDB.instantiate(type_name)
+			if not instance is Resource:
+				return _failure("EDITOR_RESOURCE_CREATE_FAILED", "Godot could not instantiate the requested Resource type.", {"type": type_name})
+			var resource := instance as Resource
+			var required_class := _resource_class_from_descriptor(descriptor)
+			if not required_class.is_empty() and not resource.is_class(required_class):
+				return _failure("EDITOR_RESOURCE_CLASS_MISMATCH", "Resource type is incompatible with the target property.", {"type": type_name, "requiredClass": required_class, "property": property})
+			var prepared := _prepare_batch_properties(context, resource, operation.get("properties", {}))
+			if prepared.has("_error"):
+				return prepared
+			var previous = _batch_current_property(context, node, property)
+			_batch_set_property(context, node, property, resource)
+			return {"kind": op, "action": op, "path": node_path, "node": node, "property": property, "resource": resource, "previous": previous, "prepared": prepared}
+
+		"resource_update":
+			var node_path := str(operation.get("nodePath", ""))
+			var entry := _batch_entry(context, node_path)
+			if entry.has("_error"):
+				return entry
+			var node: Node = entry.node
+			var property := str(operation.get("property", ""))
+			if _property_descriptor(node, property).is_empty():
+				return _failure("EDITOR_PROPERTY_NOT_FOUND", "Resource property does not exist.", {"nodePath": node_path, "property": property})
+			var value = _batch_current_property(context, node, property)
+			if not value is Resource:
+				return _failure("EDITOR_RESOURCE_VALUE_REQUIRED", "The selected node property does not contain a Resource.", {"nodePath": node_path, "property": property})
+			var resource := value as Resource
+			var prepared := _prepare_batch_properties(context, resource, operation.get("properties", {}))
+			if prepared.has("_error"):
+				return prepared
+			if prepared.names.is_empty():
+				return _failure("EDITOR_UPDATE_EMPTY", "Resource update requires at least one property.")
+			return {"kind": op, "action": op, "path": node_path, "resource": resource, "prepared": prepared}
+
+		"instance_set_editable":
+			var node_path := str(operation.get("nodePath", ""))
+			var entry := _batch_entry(context, node_path)
+			if entry.has("_error"):
+				return entry
+			var node: Node = entry.node
+			if node == root or node.scene_file_path.is_empty():
+				return _failure("EDITOR_PACKED_SCENE_INSTANCE_REQUIRED", "Node must be the root of an instantiated PackedScene.", {"nodePath": node_path})
+			var key := str(node.get_instance_id())
+			var previous: bool = bool(context.editableValues.get(key, root.is_editable_instance(node) if node.is_inside_tree() else false))
+			var editable := bool(operation.get("editable", true))
+			if previous == editable:
+				return _failure("EDITOR_INSTANCE_EDITABLE_UNCHANGED", "PackedScene editable state already has the requested value.", {"nodePath": node_path, "editable": editable})
+			context.editableValues[key] = editable
+			return {"kind": op, "action": op, "path": node_path, "node": node, "previous": previous, "editable": editable}
+
+		"signal_connect":
+			var source_path := str(operation.get("sourcePath", ""))
+			var target_path := str(operation.get("targetPath", ""))
+			var source_entry := _batch_entry(context, source_path, "EDITOR_SIGNAL_NODE_NOT_FOUND")
+			var target_entry := _batch_entry(context, target_path, "EDITOR_SIGNAL_NODE_NOT_FOUND")
+			if source_entry.has("_error") or target_entry.has("_error"):
+				return _failure("EDITOR_SIGNAL_NODE_NOT_FOUND", "Signal source or target node was not found in the logical batch scene.", {"sourcePath": source_path, "targetPath": target_path})
+			var source: Node = source_entry.node
+			var target: Node = target_entry.node
+			var signal_name := str(operation.get("signal", ""))
+			var method := str(operation.get("method", ""))
+			if signal_name.is_empty() or not source.has_signal(signal_name):
+				return _failure("EDITOR_SIGNAL_NOT_FOUND", "Source does not declare the requested signal.", {"signal": signal_name})
+			if method.is_empty() or not target.has_method(method):
+				return _failure("EDITOR_SIGNAL_METHOD_NOT_FOUND", "Target method was not found.", {"method": method})
+			var callable := Callable(target, method)
+			var connection_key := "%d:%s:%d:%s" % [source.get_instance_id(), signal_name, target.get_instance_id(), method]
+			if source.is_connected(signal_name, callable) or context.connections.has(connection_key):
+				return _failure("EDITOR_SIGNAL_ALREADY_CONNECTED", "This signal connection already exists.", {"signal": signal_name})
+			context.connections[connection_key] = true
+			var allowed_flags := CONNECT_DEFERRED | CONNECT_PERSIST | CONNECT_ONE_SHOT | CONNECT_REFERENCE_COUNTED
+			var flags := int(operation.get("flags", CONNECT_PERSIST)) & allowed_flags
+			flags |= CONNECT_PERSIST
+			return {"kind": op, "action": op, "path": source_path, "source": source, "target": target, "signal": signal_name, "method": method, "callable": callable, "flags": flags}
+
+	return _failure("EDITOR_BATCH_OPERATION_UNKNOWN", "Batch operation is not supported.", {"op": op})
+
+
+func _register_batch_do_operation(root: Node, plan: Dictionary) -> void:
+	match str(plan.kind):
+		"node_create", "scene_instantiate":
+			_undo_redo.add_do_method(plan.parent, "add_child", plan.node, true)
+			_undo_redo.add_do_method(plan.node, "set_owner", root)
+			for change in plan.prepared.changes:
+				_undo_redo.add_do_property(plan.node, change.property, change.value)
+			_undo_redo.add_do_reference(plan.node)
+		"node_update":
+			if bool(plan.nameChanged):
+				_undo_redo.add_do_property(plan.node, "name", plan.newName)
+			for change in plan.prepared.changes:
+				_undo_redo.add_do_property(plan.node, change.property, change.value)
+		"node_move":
+			if not bool(plan.sameParentNoOp):
+				if plan.oldParent != plan.newParent:
+					_undo_redo.add_do_method(plan.node, "reparent", plan.newParent, plan.keepGlobalTransform)
+				if int(plan.index) >= 0:
+					_undo_redo.add_do_method(plan.newParent, "move_child", plan.node, plan.index)
+		"node_delete":
+			_undo_redo.add_do_method(plan.parent, "remove_child", plan.node)
+		"resource_create":
+			for change in plan.prepared.changes:
+				_undo_redo.add_do_property(plan.resource, change.property, change.value)
+			_undo_redo.add_do_property(plan.node, plan.property, plan.resource)
+			_undo_redo.add_do_reference(plan.resource)
+		"resource_update":
+			for change in plan.prepared.changes:
+				_undo_redo.add_do_property(plan.resource, change.property, change.value)
+		"instance_set_editable":
+			_undo_redo.add_do_method(root, "set_editable_instance", plan.node, plan.editable)
+		"signal_connect":
+			_undo_redo.add_do_method(plan.source, "connect", StringName(plan.signal), plan.callable, plan.flags)
+
+
+func _register_batch_undo_operation(root: Node, plan: Dictionary) -> void:
+	match str(plan.kind):
+		"node_create", "scene_instantiate":
+			_undo_redo.add_undo_method(plan.parent, "remove_child", plan.node)
+		"node_update":
+			if bool(plan.nameChanged):
+				_undo_redo.add_undo_property(plan.node, "name", plan.oldName)
+			for change in plan.prepared.changes:
+				_undo_redo.add_undo_property(plan.node, change.property, change.previous)
+		"node_move":
+			if not bool(plan.sameParentNoOp):
+				if plan.oldParent != plan.newParent:
+					_undo_redo.add_undo_method(plan.node, "reparent", plan.oldParent, plan.keepGlobalTransform)
+				_undo_redo.add_undo_method(plan.oldParent, "move_child", plan.node, plan.oldIndex)
+		"node_delete":
+			_undo_redo.add_undo_method(plan.parent, "add_child", plan.node, true)
+			_undo_redo.add_undo_method(plan.parent, "move_child", plan.node, plan.index)
+			_undo_redo.add_undo_method(plan.node, "set_owner", plan.owner)
+			_undo_redo.add_undo_reference(plan.node)
+		"resource_create":
+			_undo_redo.add_undo_property(plan.node, plan.property, plan.previous)
+		"resource_update":
+			for change in plan.prepared.changes:
+				_undo_redo.add_undo_property(plan.resource, change.property, change.previous)
+		"instance_set_editable":
+			_undo_redo.add_undo_method(root, "set_editable_instance", plan.node, plan.previous)
+		"signal_connect":
+			_undo_redo.add_undo_method(plan.source, "disconnect", StringName(plan.signal), plan.callable)
 
 
 func _node_create(params: Dictionary) -> Dictionary:
@@ -888,10 +1413,20 @@ func _scene_save(params: Dictionary) -> Dictionary:
 	var guarded_history := _require_history_version(params, root)
 	if guarded_history.has("_error"):
 		return guarded_history
+	var scene_path := root.scene_file_path
+	var before_sha256 := FileAccess.get_sha256(scene_path) if FileAccess.file_exists(scene_path) else ""
+	var batch_dirty: bool = _batch_dirty_versions.get(scene_path, null) == guarded_history.history.get_version()
 	var error := _editor.save_scene()
-	if error != OK:
-		return _failure("EDITOR_SCENE_SAVE_FAILED", "Godot could not save the edited scene.", {"error": error, "scene": root.scene_file_path})
-	return {"saved": true, "scene": root.scene_file_path, "error": error, "historyVersion": _history_version(root)}
+	var after_sha256 := FileAccess.get_sha256(scene_path) if FileAccess.file_exists(scene_path) else ""
+	if error != OK or not FileAccess.file_exists(scene_path) or (batch_dirty and before_sha256 == after_sha256):
+		return _failure("EDITOR_SCENE_SAVE_FAILED", "Godot could not persist the edited scene.", {
+			"error": error if error != OK else ERR_CANT_CREATE,
+			"scene": scene_path,
+			"beforeSha256": before_sha256,
+			"afterSha256": after_sha256,
+		})
+	_batch_dirty_versions.erase(scene_path)
+	return {"saved": true, "scene": scene_path, "error": error, "historyVersion": _history_version(root)}
 
 
 func _selection_get() -> Dictionary:

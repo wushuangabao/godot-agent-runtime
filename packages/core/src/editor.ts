@@ -4,6 +4,10 @@ import { relative, resolve, sep } from "node:path";
 
 import {
   EDITOR_PROTOCOL_VERSION,
+  EditorBatchRequestSchema,
+  EditorBatchResultSchema,
+  type EditorBatchOperation,
+  type EditorBatchResult,
   type EditorSceneOpenResult,
   type EditorBridgeInfo,
   type EditorHistoryResult,
@@ -58,6 +62,7 @@ const EDITOR_CAPABILITIES = [
   "signal_connect",
   "scene_save",
   "scene_open",
+  "scene_batch",
   "undo_redo",
 ] as const;
 
@@ -242,6 +247,14 @@ export interface EditorHistoryMutationOptions extends EditorMutationLookupOption
   readonly expectedActionName?: string;
 }
 
+export interface EditorBatchOptions extends RuntimeLookupOptions {
+  readonly expectedProjectFingerprint: string;
+  readonly expectedScenePath: string;
+  readonly actionName?: string;
+  readonly operations: readonly EditorBatchOperation[];
+  readonly confirmDestructive: boolean;
+}
+
 export interface EditorSceneOpenOptions extends RuntimeLookupOptions {
   readonly expectedProjectFingerprint: string;
   readonly scenePath: string;
@@ -385,6 +398,64 @@ async function prepareEditorHistoryMutation(options: EditorHistoryMutationOption
       recovery: ["Read godot_editor_status and pass its current historyVersion without modification."],
     });
   }
+}
+
+export async function batchEditorScene(
+  options: EditorBatchOptions,
+): Promise<EditorBatchResult> {
+  const parsed = EditorBatchRequestSchema.safeParse({
+    expectedScenePath: options.expectedScenePath,
+    expectedProjectFingerprint: options.expectedProjectFingerprint,
+    ...(options.actionName === undefined ? {} : { actionName: options.actionName }),
+    operations: options.operations,
+    confirmDestructive: options.confirmDestructive,
+  });
+  if (!parsed.success) {
+    throw new RuntimeFailure({
+      code: "EDITOR_BATCH_INPUT_INVALID",
+      stage: "validation",
+      message: "Editor batch input does not match the strict operation schema.",
+      details: { issues: parsed.error.issues },
+      recovery: ["Use one of the documented editor batch operations with only its declared fields."],
+    });
+  }
+  await prepareEditorMutation({
+    ...options,
+    expectedProjectFingerprint: parsed.data.expectedProjectFingerprint,
+    expectedScenePath: parsed.data.expectedScenePath,
+  });
+  const info = await getEditorInfo(options);
+  assertEditorCapability(info.capabilities, "scene_batch");
+  const result = await sendBridgeCommand(options, "scene_batch", parsed.data);
+  const validated = EditorBatchResultSchema.safeParse({
+    ok: true,
+    runId: options.runId,
+    ...result,
+  });
+  if (!validated.success) {
+    throw new RuntimeFailure({
+      code: "EDITOR_BATCH_RESULT_INVALID",
+      stage: "protocol",
+      message: "Editor bridge returned an invalid or unbounded batch result.",
+      details: { issues: validated.error.issues },
+      recovery: ["Install the matching Godot Agent Runtime addon and launch a fresh managed editor."],
+    });
+  }
+  return validated.data;
+}
+
+export function assertEditorCapability(
+  capabilities: readonly string[],
+  capability: string,
+): void {
+  if (capabilities.includes(capability)) return;
+  throw new RuntimeFailure({
+    code: "EDITOR_CAPABILITY_UNAVAILABLE",
+    stage: "protocol",
+    message: `The managed editor does not advertise the required ${capability} capability.`,
+    details: { capability, capabilities: [...capabilities] },
+    recovery: ["Install the matching Godot Agent Runtime addon and launch a fresh managed editor."],
+  });
 }
 
 export async function openEditorScene(

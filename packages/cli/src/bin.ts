@@ -3,6 +3,7 @@
 import {
   checkProject,
   checkScript,
+  batchEditorScene,
   configureClient,
   assertRuntime,
   captureEditorScreenshot,
@@ -56,6 +57,7 @@ import {
   waitForRuntime,
   writeProjectFile,
   type RuntimeInputStep,
+  type EditorBatchOptions,
   RuntimeFailure,
 } from "@godot-agent-runtime/core";
 import { parseFiniteNumber, parseFiniteVector3, parseInteger } from "./numeric.js";
@@ -202,6 +204,7 @@ function printHelp(): void {
   process.stdout.write(`  editor-resource-focus PROJECT_PATH RUN_ID --path RES_PATH\n`);
   process.stdout.write(`  editor-selection-get PROJECT_PATH RUN_ID\n`);
   process.stdout.write(`  editor-selection-set PROJECT_PATH RUN_ID --paths JSON_ARRAY [--focus true|false]\n`);
+  process.stdout.write(`  editor-batch PROJECT_PATH RUN_ID --project-fingerprint HASH --scene RES_PATH --operations JSON_ARRAY [--action-name TEXT] --confirm-destructive true|false\n`);
   process.stdout.write(`  editor-signal-connect PROJECT_PATH RUN_ID --source NODE_PATH --signal NAME --target NODE_PATH --method NAME [--flags N]\n`);
   process.stdout.write(`  persistent editor mutations also require --expected-scene RES_PATH [--expected-project-fingerprint HASH]\n`);
   process.stdout.write(`  editor-save PROJECT_PATH RUN_ID --expected-scene RES_PATH --expected-history-version N\n`);
@@ -690,6 +693,32 @@ async function main(): Promise<void> {
         runId: values[1],
         paths,
         ...(focus === undefined ? {} : { focus }),
+      }));
+      return;
+    }
+    case "editor-batch": {
+      if (!values[0] || !values[1]) throw new Error("editor-batch requires PROJECT_PATH and RUN_ID.");
+      const expectedProjectFingerprint = sha256Option(args, "--project-fingerprint");
+      const expectedScenePath = option(args, "--scene");
+      const operations = parseJsonArray(option(args, "--operations"), "--operations");
+      const confirmDestructive = parseBoolean(option(args, "--confirm-destructive"), "--confirm-destructive");
+      if (expectedProjectFingerprint === undefined || expectedScenePath === undefined || operations === undefined || confirmDestructive === undefined) {
+        throw new RuntimeFailure({
+          code: "EDITOR_BATCH_INPUT_INVALID",
+          stage: "validation",
+          message: "editor-batch requires --project-fingerprint, --scene, --operations, and --confirm-destructive.",
+          recovery: ["Pass the current project identity, active .tscn path, a typed operation array, and an explicit destructive confirmation."],
+        });
+      }
+      const actionName = option(args, "--action-name");
+      print(await batchEditorScene({
+        projectPath: values[0],
+        runId: values[1],
+        expectedProjectFingerprint,
+        expectedScenePath,
+        operations: operations as EditorBatchOptions["operations"],
+        confirmDestructive,
+        ...(actionName === undefined ? {} : { actionName }),
       }));
       return;
     }

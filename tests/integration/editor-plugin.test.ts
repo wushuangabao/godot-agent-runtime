@@ -1,11 +1,13 @@
 import { existsSync } from "node:fs";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { chmod, cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
 import {
+  batchEditorScene,
   captureEditorScreenshot,
   connectEditorSignal,
   createInheritedEditorScene,
@@ -43,7 +45,414 @@ import {
 const configPath = resolve("config", "development.local.json");
 const hasLocalConfig = existsSync(configPath);
 
+async function blockSceneSave(path: string): Promise<() => Promise<void>> {
+  if (process.platform !== "win32") {
+    await chmod(path, 0o444);
+    return async () => await chmod(path, 0o666);
+  }
+  const script = [
+    "$stream = [System.IO.File]::Open($args[0], [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)",
+    "[Console]::Out.WriteLine('READY')",
+    "[Console]::Out.Flush()",
+    "[Console]::In.ReadLine() | Out-Null",
+    "$stream.Dispose()",
+  ].join("; ");
+  const helperDirectory = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-scene-lock-"));
+  const helperPath = resolve(helperDirectory, "lock.ps1");
+  await writeFile(helperPath, script, "utf8");
+  const child = spawn("powershell.exe", ["-NoProfile", "-File", helperPath, path], {
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  let stderr = "";
+  child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+  await new Promise<void>((complete, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out acquiring an exclusive scene lock.")), 5_000);
+    child.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.once("close", (code) => {
+      clearTimeout(timeout);
+      reject(new Error(`Scene lock helper exited before READY with code ${code}: ${stderr}`));
+    });
+    child.stdout.on("data", (chunk: string) => {
+      if (!chunk.includes("READY")) return;
+      clearTimeout(timeout);
+      complete();
+    });
+  });
+  return async () => {
+    child.stdin.end("\n");
+    await new Promise<void>((complete, reject) => {
+      child.once("error", reject);
+      child.once("close", () => complete());
+    });
+    await rm(helperDirectory, { recursive: true, force: true });
+  };
+}
+
 describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
+  it(
+    "applies typed batches as one action with logical-path validation and honest persistence state",
+    async () => {
+      const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-editor-batch-"));
+      await cp(resolve("examples", "control-ui"), projectPath, {
+        recursive: true,
+        filter: (source) => !source.includes(`${resolve("examples", "control-ui", ".godot")}`),
+      });
+      const mainPath = resolve(projectPath, "main.tscn");
+      const diskBefore = await readFile(mainPath, "utf8");
+      let editorRunId: string | null = null;
+      let releaseSaveBlock: (() => Promise<void>) | null = null;
+      try {
+        await installGodotAddon(projectPath);
+        const identity = await getProjectIdentity(projectPath);
+        const launch = await launchEditor({ projectPath, configPath, timeoutMs: 30_000 });
+        editorRunId = launch.runId;
+        const guard = {
+          projectPath,
+          runId: editorRunId,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedScenePath: "res://main.tscn",
+        } as const;
+
+        expect(await getEditorInfo({ projectPath, runId: editorRunId })).toMatchObject({
+          protocolVersion: "0.5.0",
+          capabilities: expect.arrayContaining(["scene_batch"]),
+        });
+
+        const built = await batchEditorScene({
+          ...guard,
+          actionName: "Build agent panel",
+          operations: [
+            { op: "node_create", parentPath: "/root/Main", type: "Panel", name: "BatchPanel", properties: {} },
+            { op: "node_create", parentPath: "/root/Main/BatchPanel", type: "Button", name: "BatchButton", properties: { text: "Batch" } },
+            { op: "signal_connect", sourcePath: "/root/Main/BatchPanel/BatchButton", signal: "pressed", targetPath: "/root/Main", method: "_on_start_pressed" },
+          ],
+          confirmDestructive: false,
+        });
+        expect(built).toMatchObject({
+          scenePath: "res://main.tscn",
+          actionName: "Agent batch: Build agent panel",
+          operationCount: 3,
+          undoable: true,
+          dirty: true,
+          historyVersion: expect.any(Number),
+        });
+        expect(built.results).toHaveLength(3);
+        expect(built).not.toHaveProperty("saved");
+        expect((await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/BatchPanel/BatchButton",
+          properties: ["text"],
+        })).node.properties.text).toBe("Batch");
+
+        const undone = await undoEditorAction({
+          ...guard,
+          expectedHistoryVersion: built.historyVersion,
+          expectedActionName: built.actionName,
+        });
+        expect(undone.actionName).toBe("Agent batch: Build agent panel");
+        await expect(getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/BatchPanel",
+        })).rejects.toMatchObject({ payload: { code: "EDITOR_NODE_NOT_FOUND" } });
+        const redone = await redoEditorAction({
+          ...guard,
+          expectedHistoryVersion: undone.afterVersion,
+          expectedActionName: built.actionName,
+        });
+        expect((await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/BatchPanel/BatchButton",
+        })).node.name).toBe("BatchButton");
+
+        const initialButton = await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/StartButton",
+          properties: ["text"],
+        });
+        const sequentialUpdates = await batchEditorScene({
+          ...guard,
+          actionName: "Sequential updates",
+          operations: [
+            { op: "node_update", nodePath: "/root/Main/StartButton", properties: { text: "Review A" } },
+            { op: "node_update", nodePath: "/root/Main/StartButton", properties: { text: "Review B" } },
+          ],
+          confirmDestructive: false,
+        });
+        expect((await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/StartButton",
+          properties: ["text"],
+        })).node.properties.text).toBe("Review B");
+        const sequentialUndone = await undoEditorAction({
+          ...guard,
+          expectedHistoryVersion: sequentialUpdates.historyVersion,
+          expectedActionName: sequentialUpdates.actionName,
+        });
+        expect((await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/StartButton",
+          properties: ["text"],
+        })).node.properties.text).toBe(initialButton.node.properties.text);
+        await redoEditorAction({
+          ...guard,
+          expectedHistoryVersion: sequentialUndone.afterVersion,
+          expectedActionName: sequentialUpdates.actionName,
+        });
+        expect((await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/StartButton",
+          properties: ["text"],
+        })).node.properties.text).toBe("Review B");
+
+        await createEditorNode({
+          ...guard,
+          parentPath: "/root/Main",
+          type: "Node2D",
+          name: "TransformSource",
+          properties: { position: { $type: "Vector2", x: 100, y: 50 } },
+        });
+        await createEditorNode({
+          ...guard,
+          parentPath: "/root/Main",
+          type: "Node2D",
+          name: "TransformTarget",
+          properties: { position: { $type: "Vector2", x: -20, y: 40 } },
+        });
+        await createEditorNode({
+          ...guard,
+          parentPath: "/root/Main/TransformSource",
+          type: "Node2D",
+          name: "TransformChild",
+          properties: { position: { $type: "Vector2", x: 10, y: 5 } },
+        });
+        const transformProperties = ["position", "global_position", "transform", "global_transform"] as const;
+        const initialTransform = await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/TransformSource/TransformChild",
+          properties: transformProperties,
+        });
+        const transformMove = await batchEditorScene({
+          ...guard,
+          actionName: "Transform then move",
+          operations: [
+            {
+              op: "node_update",
+              nodePath: "/root/Main/TransformSource/TransformChild",
+              properties: { position: { $type: "Vector2", x: 30, y: 15 } },
+            },
+            {
+              op: "node_move",
+              nodePath: "/root/Main/TransformSource/TransformChild",
+              newParentPath: "/root/Main/TransformTarget",
+              keepGlobalTransform: true,
+            },
+          ],
+          confirmDestructive: false,
+        });
+        const movedTransform = await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/TransformTarget/TransformChild",
+          properties: transformProperties,
+        });
+        const transformUndone = await undoEditorAction({
+          ...guard,
+          expectedHistoryVersion: transformMove.historyVersion,
+          expectedActionName: transformMove.actionName,
+        });
+        expect((await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/TransformSource/TransformChild",
+          properties: transformProperties,
+        })).node.properties).toEqual(initialTransform.node.properties);
+        await redoEditorAction({
+          ...guard,
+          expectedHistoryVersion: transformUndone.afterVersion,
+          expectedActionName: transformMove.actionName,
+        });
+        expect((await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/TransformTarget/TransformChild",
+          properties: transformProperties,
+        })).node.properties).toEqual(movedTransform.node.properties);
+
+        await batchEditorScene({
+          ...guard,
+          actionName: "Create ordered siblings",
+          operations: [
+            { op: "node_create", parentPath: "/root/Main", type: "Node", name: "OrderParent", properties: {} },
+            { op: "node_create", parentPath: "/root/Main/OrderParent", type: "Node", name: "OrderA", properties: {} },
+            { op: "node_create", parentPath: "/root/Main/OrderParent", type: "Node", name: "OrderB", properties: {} },
+            { op: "node_create", parentPath: "/root/Main/OrderParent", type: "Node", name: "OrderC", properties: {} },
+            { op: "node_create", parentPath: "/root/Main/OrderParent", type: "Node", name: "OrderD", properties: {} },
+          ],
+          confirmDestructive: false,
+        });
+        const orderedChildren = async (): Promise<string[]> => {
+          const tree = await getEditorSceneTree({ projectPath, runId: editorRunId! });
+          const parent = tree.root?.children.find((child) => child.name === "OrderParent");
+          if (parent === undefined) throw new Error("OrderParent was not found in the editor scene tree.");
+          return parent.children.map((child) => child.name);
+        };
+        expect(await orderedChildren()).toEqual(["OrderA", "OrderB", "OrderC", "OrderD"]);
+        const reordered = await batchEditorScene({
+          ...guard,
+          actionName: "Omitted same-parent index",
+          operations: [
+            { op: "node_move", nodePath: "/root/Main/OrderParent/OrderA", newParentPath: "/root/Main/OrderParent" },
+            { op: "node_move", nodePath: "/root/Main/OrderParent/OrderB", newParentPath: "/root/Main/OrderParent", index: 0 },
+            { op: "node_delete", nodePath: "/root/Main/OrderParent/OrderB" },
+          ],
+          confirmDestructive: true,
+        });
+        expect(await orderedChildren()).toEqual(["OrderA", "OrderC", "OrderD"]);
+        const reorderedUndone = await undoEditorAction({
+          ...guard,
+          expectedHistoryVersion: reordered.historyVersion,
+          expectedActionName: reordered.actionName,
+        });
+        expect(await orderedChildren()).toEqual(["OrderA", "OrderB", "OrderC", "OrderD"]);
+        await redoEditorAction({
+          ...guard,
+          expectedHistoryVersion: reorderedUndone.afterVersion,
+          expectedActionName: reordered.actionName,
+        });
+        expect(await orderedChildren()).toEqual(["OrderA", "OrderC", "OrderD"]);
+
+        const beforeInvalid = (await getEditorInfo({ projectPath, runId: editorRunId })).historyVersion!;
+        await expect(batchEditorScene({
+          ...guard,
+          actionName: "Must stay atomic",
+          operations: [
+            { op: "node_create", parentPath: "/root/Main", type: "Node", name: "InvalidParent", properties: {} },
+            { op: "node_create", parentPath: "/root/Main/InvalidParent", type: "Label", name: "InvalidChild", properties: {} },
+            { op: "node_update", nodePath: "/root/Main/DoesNotExist", properties: { name: "never" } },
+          ],
+          confirmDestructive: false,
+        })).rejects.toMatchObject({
+          payload: {
+            code: "EDITOR_BATCH_VALIDATION_FAILED",
+            details: { index: 2, op: "node_update", path: "/root/Main/DoesNotExist" },
+          },
+        });
+        await expect(getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/InvalidParent",
+        })).rejects.toMatchObject({ payload: { code: "EDITOR_NODE_NOT_FOUND" } });
+        expect((await getEditorInfo({ projectPath, runId: editorRunId })).historyVersion)
+          .toBe(beforeInvalid);
+
+        const logical = await batchEditorScene({
+          ...guard,
+          actionName: "Logical paths",
+          operations: [
+            { op: "node_create", parentPath: "/root/Main", type: "Node", name: "Flow", properties: {} },
+            { op: "node_create", parentPath: "/root/Main/Flow", type: "Label", name: "Child", properties: { text: "Before" } },
+            { op: "node_update", nodePath: "/root/Main/Flow", name: "Renamed", properties: {} },
+            { op: "node_update", nodePath: "/root/Main/Renamed/Child", properties: { text: "After" } },
+            { op: "node_create", parentPath: "/root/Main", type: "Node", name: "Destination", properties: {} },
+            { op: "node_move", nodePath: "/root/Main/Renamed/Child", newParentPath: "/root/Main/Destination" },
+            { op: "node_update", nodePath: "/root/Main/Destination/Child", name: "MovedChild", properties: {} },
+            { op: "scene_instantiate", parentPath: "/root/Main", scenePath: "res://badge.tscn", name: "BatchBadge", properties: {} },
+            { op: "node_update", nodePath: "/root/Main/BatchBadge", properties: { text: "Batch badge" } },
+            { op: "node_create", parentPath: "/root/Main", type: "Node", name: "Disposable", properties: {} },
+            { op: "node_delete", nodePath: "/root/Main/Disposable" },
+          ],
+          confirmDestructive: true,
+        });
+        expect(logical.operationCount).toBe(11);
+        expect((await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/Destination/MovedChild",
+          properties: ["text"],
+        })).node.properties.text).toBe("After");
+        expect((await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/BatchBadge",
+          properties: ["text"],
+        })).node.properties.text).toBe("Batch badge");
+        await expect(getEditorNode({ projectPath, runId: editorRunId, nodePath: "/root/Main/Flow" }))
+          .rejects.toMatchObject({ payload: { code: "EDITOR_NODE_NOT_FOUND" } });
+        await expect(getEditorNode({ projectPath, runId: editorRunId, nodePath: "/root/Main/Disposable" }))
+          .rejects.toMatchObject({ payload: { code: "EDITOR_NODE_NOT_FOUND" } });
+
+        await expect(batchEditorScene({
+          ...guard,
+          actionName: "Deleted path is invalid",
+          operations: [
+            { op: "node_create", parentPath: "/root/Main", type: "Node", name: "Ghost", properties: {} },
+            { op: "node_create", parentPath: "/root/Main/Ghost", type: "Label", name: "Child", properties: {} },
+            { op: "node_delete", nodePath: "/root/Main/Ghost" },
+            { op: "node_update", nodePath: "/root/Main/Ghost/Child", properties: { text: "never" } },
+          ],
+          confirmDestructive: true,
+        })).rejects.toMatchObject({
+          payload: { code: "EDITOR_BATCH_VALIDATION_FAILED", details: { index: 3 } },
+        });
+        expect((await getEditorInfo({ projectPath, runId: editorRunId })).historyVersion)
+          .toBe(logical.historyVersion);
+
+        releaseSaveBlock = await blockSceneSave(mainPath);
+        await expect(saveEditorScene({
+          ...guard,
+          expectedHistoryVersion: logical.historyVersion,
+        })).rejects.toMatchObject({ payload: { code: "EDITOR_SCENE_SAVE_FAILED" } });
+        expect((await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/Destination/MovedChild",
+        })).node.name).toBe("MovedChild");
+        expect((await getEditorInfo({ projectPath, runId: editorRunId })).historyVersion)
+          .toBe(logical.historyVersion);
+        await releaseSaveBlock();
+        releaseSaveBlock = null;
+        expect(await readFile(mainPath, "utf8")).toBe(diskBefore);
+
+        await undoEditorAction({
+          ...guard,
+          expectedHistoryVersion: logical.historyVersion,
+          expectedActionName: logical.actionName,
+        });
+        await expect(getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/Destination",
+        })).rejects.toMatchObject({ payload: { code: "EDITOR_NODE_NOT_FOUND" } });
+        await expect(getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/BatchBadge",
+        })).rejects.toMatchObject({ payload: { code: "EDITOR_NODE_NOT_FOUND" } });
+      } finally {
+        if (releaseSaveBlock !== null) await releaseSaveBlock();
+        if (editorRunId !== null) {
+          await stopManagedRun({ projectPath, runId: editorRunId, timeoutMs: 15_000 });
+        }
+        await rm(projectPath, { recursive: true, force: true });
+      }
+    },
+    90_000,
+  );
+
   it(
     "guards the active scene and native history while explicitly opening scenes",
     async () => {
@@ -61,7 +470,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
 
         const initial = await getEditorInfo({ projectPath, runId: editorRunId });
         expect(initial).toMatchObject({
-          protocolVersion: "0.4.0",
+          protocolVersion: "0.5.0",
           scene: "res://main.tscn",
           historyVersion: expect.any(Number),
         });
@@ -297,7 +706,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         };
 
         const info = await getEditorInfo({ projectPath, runId: editorRunId });
-        expect(info.protocolVersion).toBe("0.4.0");
+        expect(info.protocolVersion).toBe("0.5.0");
         expect(info.historyVersion).toEqual(expect.any(Number));
         expect(info.capabilities).toEqual([
           "scene_tree",
@@ -314,6 +723,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           "signal_connect",
           "scene_save",
           "scene_open",
+          "scene_batch",
           "undo_redo",
         ]);
 

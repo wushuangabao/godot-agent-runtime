@@ -12,6 +12,7 @@ export type { FindProjectsOptions } from "./discovery.js";
 export { runDoctor } from "./doctor.js";
 export { RuntimeFailure, toRuntimeError } from "./errors.js";
 export {
+  batchEditorScene,
   captureEditorScreenshot,
   connectEditorSignal,
   createInheritedEditorScene,
@@ -39,6 +40,7 @@ export {
   updateEditorResource,
 } from "./editor.js";
 export type {
+  EditorBatchOptions,
   EditorScreenshotOptions,
   EditorNodeCreateOptions,
   EditorNodeDeleteOptions,

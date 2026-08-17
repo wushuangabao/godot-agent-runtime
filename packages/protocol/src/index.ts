@@ -1,6 +1,6 @@
 import * as z from "zod/v4";
 
-export const EDITOR_PROTOCOL_VERSION = "0.4.0";
+export const EDITOR_PROTOCOL_VERSION = "0.5.0";
 export const RUNTIME_PROTOCOL_VERSION = "0.3.0";
 /** @deprecated Use EDITOR_PROTOCOL_VERSION or RUNTIME_PROTOCOL_VERSION explicitly. */
 export const PROTOCOL_VERSION = RUNTIME_PROTOCOL_VERSION;
@@ -476,6 +476,123 @@ export const AddonInstallResultSchema = z.object({
   projectConfigurationChanged: z.boolean(),
 });
 
+const BoundedEditorPropertiesSchema = z.record(z.string().min(1), z.unknown())
+  .refine(
+    (value) => Object.keys(value).length <= 100,
+    "At most 100 properties are allowed.",
+  );
+
+export const EditorBatchOperationSchema = z.discriminatedUnion("op", [
+  z.object({
+    op: z.literal("node_create"),
+    parentPath: z.string().min(1),
+    type: z.string().min(1),
+    name: z.string().min(1),
+    properties: BoundedEditorPropertiesSchema.default({}),
+  }).strict(),
+  z.object({
+    op: z.literal("node_update"),
+    nodePath: z.string().min(1),
+    name: z.string().min(1).optional(),
+    properties: BoundedEditorPropertiesSchema.default({}),
+  }).strict(),
+  z.object({
+    op: z.literal("node_move"),
+    nodePath: z.string().min(1),
+    newParentPath: z.string().min(1),
+    index: z.number().int().min(-1).optional(),
+    keepGlobalTransform: z.boolean().default(true),
+  }).strict(),
+  z.object({
+    op: z.literal("node_delete"),
+    nodePath: z.string().min(1),
+  }).strict(),
+  z.object({
+    op: z.literal("scene_instantiate"),
+    parentPath: z.string().min(1),
+    scenePath: z.string().startsWith("res://").endsWith(".tscn"),
+    name: z.string().min(1).optional(),
+    properties: BoundedEditorPropertiesSchema.default({}),
+  }).strict(),
+  z.object({
+    op: z.literal("resource_create"),
+    nodePath: z.string().min(1),
+    property: z.string().min(1),
+    type: z.string().min(1),
+    properties: BoundedEditorPropertiesSchema.default({}),
+  }).strict(),
+  z.object({
+    op: z.literal("resource_update"),
+    nodePath: z.string().min(1),
+    property: z.string().min(1),
+    properties: BoundedEditorPropertiesSchema,
+  }).strict(),
+  z.object({
+    op: z.literal("instance_set_editable"),
+    nodePath: z.string().min(1),
+    editable: z.boolean(),
+  }).strict(),
+  z.object({
+    op: z.literal("signal_connect"),
+    sourcePath: z.string().min(1),
+    signal: z.string().min(1),
+    targetPath: z.string().min(1),
+    method: z.string().min(1),
+    flags: z.number().int().min(0).max(15).optional(),
+  }).strict(),
+]);
+
+export type EditorBatchOperation = z.infer<typeof EditorBatchOperationSchema>;
+
+export const EditorBatchRequestSchema = z.object({
+  expectedScenePath: z.string().startsWith("res://").endsWith(".tscn"),
+  expectedProjectFingerprint: Sha256Schema,
+  actionName: z.string().min(1).max(120).optional(),
+  operations: z.array(EditorBatchOperationSchema).min(1).max(32),
+  confirmDestructive: z.boolean(),
+}).strict().superRefine((value, context) => {
+  if (!value.confirmDestructive && value.operations.some(({ op }) => op === "node_delete")) {
+    context.addIssue({
+      code: "custom",
+      path: ["confirmDestructive"],
+      message: "confirmDestructive must be true when operations contain node_delete.",
+    });
+  }
+});
+
+export type EditorBatchRequest = z.infer<typeof EditorBatchRequestSchema>;
+
+export const EditorBatchReceiptSchema = z.object({
+  index: z.number().int().min(0).max(31),
+  op: z.enum([
+    "node_create",
+    "node_update",
+    "node_move",
+    "node_delete",
+    "scene_instantiate",
+    "resource_create",
+    "resource_update",
+    "instance_set_editable",
+    "signal_connect",
+  ]),
+  path: z.string().min(1),
+  action: z.string().min(1),
+}).strict();
+
+export const EditorBatchResultSchema = z.object({
+  ok: z.literal(true),
+  runId: z.uuid(),
+  scenePath: z.string().startsWith("res://").endsWith(".tscn"),
+  actionName: z.string().min(1).max(133),
+  operationCount: z.number().int().min(1).max(32),
+  results: z.array(EditorBatchReceiptSchema).max(32),
+  undoable: z.literal(true),
+  dirty: z.literal(true),
+  historyVersion: z.number().int().nonnegative(),
+}).strict();
+
+export type EditorBatchResult = z.infer<typeof EditorBatchResultSchema>;
+
 export const EditorBridgeInfoSchema = z.object({
   ok: z.literal(true),
   runId: z.uuid(),
@@ -499,6 +616,7 @@ export const EditorBridgeInfoSchema = z.object({
       "signal_connect",
       "scene_save",
       "scene_open",
+      "scene_batch",
       "undo_redo",
     ]),
   ),

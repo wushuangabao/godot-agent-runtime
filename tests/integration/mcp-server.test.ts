@@ -114,6 +114,7 @@ describe("MCP server", () => {
       "godot_editor_node_get",
       "godot_editor_selection_get",
       "godot_editor_selection_set",
+      "godot_editor_batch",
       "godot_editor_node_create",
       "godot_editor_scene_instantiate",
       "godot_editor_scene_create_inherited",
@@ -144,6 +145,7 @@ describe("MCP server", () => {
     const editorStatus = tools.find(({ name }) => name === "godot_editor_status");
     const editorSceneOpen = tools.find(({ name }) => name === "godot_editor_scene_open");
     const editorNodeCreate = tools.find(({ name }) => name === "godot_editor_node_create");
+    const editorBatch = tools.find(({ name }) => name === "godot_editor_batch");
     const editorSceneSave = tools.find(({ name }) => name === "godot_editor_scene_save");
     expect(projectContext?.inputSchema.additionalProperties).toBe(false);
     expect(projectContext?.outputSchema?.additionalProperties).toBe(false);
@@ -165,6 +167,21 @@ describe("MCP server", () => {
     expect(editorSceneOpen?.outputSchema?.properties).toHaveProperty("historyVersion");
     expect(editorNodeCreate?.inputSchema.required).toContain("expectedScenePath");
     expect(editorNodeCreate?.inputSchema.properties).toHaveProperty("expectedProjectFingerprint");
+    expect(editorBatch?.inputSchema.required).toEqual(expect.arrayContaining([
+      "expectedScenePath",
+      "expectedProjectFingerprint",
+      "operations",
+      "confirmDestructive",
+    ]));
+    expect(editorBatch?.inputSchema.additionalProperties).toBe(false);
+    expect(editorBatch?.outputSchema?.additionalProperties).toBe(false);
+    expect(editorBatch?.outputSchema?.properties).not.toHaveProperty("saved");
+    expect(editorBatch?.annotations).toMatchObject({
+      readOnlyHint: false,
+      idempotentHint: false,
+      destructiveHint: true,
+      openWorldHint: false,
+    });
     expect(editorSceneSave?.inputSchema.required).toEqual(expect.arrayContaining([
       "expectedScenePath",
       "expectedHistoryVersion",
@@ -227,6 +244,42 @@ describe("MCP server", () => {
         code: "EDITOR_HISTORY_VERSION_REQUIRED",
         recovery: expect.arrayContaining([expect.any(String)]),
       },
+    });
+  });
+
+  it("rejects unknown raw batch operations through MCP and CLI before bridge access", async () => {
+    const projectPath = resolveProject("examples/minimal-2d");
+    const runId = "00000000-0000-4000-8000-000000000000";
+    const operations = [{ op: "run_script", source: "print('unsafe')" }];
+    const result = await client.callTool({
+      name: "godot_editor_batch",
+      arguments: {
+        projectPath,
+        runId,
+        expectedProjectFingerprint: "0".repeat(64),
+        expectedScenePath: "res://main.tscn",
+        operations,
+        confirmDestructive: false,
+      },
+    });
+    const cli = await runCli([
+      "editor-batch",
+      projectPath,
+      runId,
+      "--project-fingerprint",
+      "0".repeat(64),
+      "--scene",
+      "res://main.tscn",
+      "--operations",
+      JSON.stringify(operations),
+      "--confirm-destructive",
+      "false",
+    ]);
+
+    expect(result.isError).toBe(true);
+    expect(cli).toMatchObject({
+      code: 1,
+      payload: { ok: false, error: { code: "EDITOR_BATCH_INPUT_INVALID", stage: "validation" } },
     });
   });
 

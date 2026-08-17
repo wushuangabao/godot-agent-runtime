@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { RuntimeFailure } from "../../packages/core/src/errors.js";
+import * as Editor from "../../packages/core/src/editor.js";
 import { validateBridgeHandshake } from "../../packages/core/src/runtime.js";
 import {
   EDITOR_PROTOCOL_VERSION,
@@ -21,7 +22,7 @@ describe("bridge handshake negotiation", () => {
 
   it("rejects an incompatible protocol version with a stable error", () => {
     expect(() => validateBridgeHandshake(
-      { protocolVersion: "0.0.9", capabilities: [] },
+      { protocolVersion: "0.4.0", capabilities: [] },
       "editor",
       EDITOR_PROTOCOL_VERSION,
       [],
@@ -29,7 +30,7 @@ describe("bridge handshake negotiation", () => {
 
     try {
       validateBridgeHandshake(
-        { protocolVersion: "0.0.9", capabilities: [] },
+        { protocolVersion: "0.4.0", capabilities: [] },
         "editor",
         EDITOR_PROTOCOL_VERSION,
         [],
@@ -39,7 +40,7 @@ describe("bridge handshake negotiation", () => {
         payload: {
           code: "EDITOR_PROTOCOL_VERSION_MISMATCH",
           stage: "protocol",
-          details: { expected: "0.4.0", actual: "0.0.9" },
+          details: { expected: "0.5.0", actual: "0.4.0" },
         },
       });
     }
@@ -54,5 +55,25 @@ describe("bridge handshake negotiation", () => {
     )).toThrowError(expect.objectContaining({
       payload: expect.objectContaining({ code: "RUNTIME_PROTOCOL_CAPABILITIES_INVALID" }),
     }));
+  });
+
+  it("returns a stable error when a matching editor omits scene_batch", () => {
+    const assertEditorCapability = (Editor as unknown as {
+      assertEditorCapability?: (capabilities: readonly string[], capability: string) => void;
+    }).assertEditorCapability;
+    expect(assertEditorCapability).toBeDefined();
+    if (assertEditorCapability === undefined) return;
+
+    expect(() => assertEditorCapability(["scene_open"], "scene_batch")).toThrowError(
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          code: "EDITOR_CAPABILITY_UNAVAILABLE",
+          stage: "protocol",
+          details: { capability: "scene_batch", capabilities: ["scene_open"] },
+        }),
+      }),
+    );
+    expect(() => assertEditorCapability(["scene_open", "scene_batch"], "scene_batch"))
+      .not.toThrow();
   });
 });
