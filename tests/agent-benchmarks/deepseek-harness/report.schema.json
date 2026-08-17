@@ -2,11 +2,21 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Godot Agent Runtime cross-agent benchmark report",
   "type": "object",
-  "required": ["client", "ok", "toolCalls", "durationMs", "assertion", "screenshots", "cleanup"],
+  "required": [
+    "client",
+    "ok",
+    "toolCount",
+    "toolSchemaBytes",
+    "instructionsBytes",
+    "hostExecutionVerified"
+  ],
   "properties": {
     "client": { "enum": ["codex", "deepseek-harness"] },
     "ok": { "type": "boolean" },
-    "toolCalls": { "type": "integer", "minimum": 1 },
+    "toolCalls": { "type": "integer", "minimum": 0 },
+    "contextCalls": { "type": "integer", "minimum": 0 },
+    "batchCalls": { "type": "integer", "minimum": 0 },
+    "diagnosticCalls": { "type": "integer", "minimum": 0 },
     "durationMs": { "type": "integer", "minimum": 0 },
     "assertion": {
       "type": "object",
@@ -25,16 +35,83 @@
       "minItems": 2,
       "items": {
         "type": "object",
-        "required": ["path", "sha256"],
+        "required": ["path", "sha256", "evidenceClass"],
         "properties": {
           "path": { "type": "string" },
-          "sha256": { "type": "string", "minLength": 64, "maxLength": 64 }
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "evidenceClass": { "enum": ["editor_viewport", "runtime_frame"] }
         },
         "additionalProperties": true
       }
     },
-    "cleanup": { "type": "boolean" },
+    "evidenceClasses": {
+      "type": "array",
+      "minItems": 2,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "editor_viewport",
+          "runtime_frame",
+          "structured_wait",
+          "structured_assertion",
+          "diagnostics",
+          "incremental_logs",
+          "debug_report",
+          "file_receipt",
+          "scene_receipt",
+          "project_setting_receipt"
+        ]
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "required": ["attempted", "allStopped", "finalStates"],
+      "properties": {
+        "attempted": { "const": true },
+        "allStopped": { "type": "boolean" },
+        "finalStates": { "type": "object", "additionalProperties": { "type": "string" } }
+      },
+      "additionalProperties": true
+    },
+    "toolCount": { "type": "integer", "const": 62 },
+    "toolSchemaBytes": { "type": "integer", "minimum": 1, "maximum": 144606 },
+    "instructionsBytes": { "type": "integer", "minimum": 1, "maximum": 4096 },
+    "hostExecutionVerified": { "type": "boolean" },
     "error": { "type": ["object", "null"] }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "hostExecutionVerified": { "const": true } },
+        "required": ["hostExecutionVerified"]
+      },
+      "then": {
+        "required": [
+          "toolCalls",
+          "contextCalls",
+          "batchCalls",
+          "diagnosticCalls",
+          "durationMs",
+          "assertion",
+          "screenshots",
+          "evidenceClasses",
+          "cleanup"
+        ],
+        "properties": {
+          "toolCalls": { "minimum": 1 },
+          "contextCalls": { "minimum": 1 },
+          "diagnosticCalls": { "minimum": 1 }
+        }
+      },
+      "else": {
+        "not": {
+          "anyOf": [
+            { "required": ["selectionRate"] },
+            { "required": ["toolSelectionRate"] }
+          ]
+        }
+      }
+    }
+  ],
   "additionalProperties": true
 }

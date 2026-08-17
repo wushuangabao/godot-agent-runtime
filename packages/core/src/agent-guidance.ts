@@ -91,7 +91,7 @@ const RECIPES = deepFreeze<readonly AgentRecipe[]>([
       "godot_project_context", "godot_editor_launch", "godot_editor_status", "godot_editor_batch",
       "godot_editor_scene_save", "godot_script_check", "godot_project_check", "godot_run_stop",
       "godot_scene_launch", "godot_runtime_ui_find", "godot_runtime_screenshot", "godot_runtime_input",
-      "godot_runtime_wait", "godot_runtime_assert",
+      "godot_runtime_wait", "godot_runtime_assert", "godot_run_stop",
     ],
     successCriteria: [
       "The guarded editor action is explicitly saved and the project checks pass.",
@@ -114,6 +114,7 @@ const RECIPES = deepFreeze<readonly AgentRecipe[]>([
       "godot_editor_scene_save", "godot_editor_screenshot", "godot_project_check", "godot_run_stop",
       "godot_scene_launch", "godot_runtime_observe", "godot_runtime_3d_project", "godot_runtime_3d_raycast",
       "godot_runtime_input", "godot_runtime_wait", "godot_runtime_assert", "godot_runtime_screenshot",
+      "godot_run_stop",
     ],
     successCriteria: [
       "The saved scene passes project validation.",
@@ -147,7 +148,7 @@ const RECIPES = deepFreeze<readonly AgentRecipe[]>([
     prerequisites: ["Project fingerprint, active scene path, and current native history version are known."],
     tools: [
       "godot_project_context", "godot_editor_launch", "godot_editor_status", "godot_editor_batch",
-      "godot_editor_undo", "godot_editor_redo", "godot_editor_scene_save",
+      "godot_editor_undo", "godot_editor_redo", "godot_editor_scene_save", "godot_run_stop",
     ],
     successCriteria: [
       "The batch reports one action, dirty=true, saved=false, and a new history version.",

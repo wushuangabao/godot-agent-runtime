@@ -14,6 +14,7 @@
     "benchmark:milestone-2": "pnpm run build && node tests/agent-benchmarks/milestone-2/run.mjs",
     "benchmark:milestone-3": "pnpm run build && node tests/agent-benchmarks/milestone-3/run.mjs",
     "benchmark:milestone-4": "pnpm run build && node tests/agent-benchmarks/milestone-4/run.mjs",
+    "benchmark:milestone-5": "pnpm run build && node tests/agent-benchmarks/milestone-5/run.mjs",
     "benchmark:runtime": "node tests/agent-benchmarks/runtime-loop/run.mjs",
     "clean": "tsc -b --clean",
     "doctor": "node packages/cli/dist/bin.js doctor",

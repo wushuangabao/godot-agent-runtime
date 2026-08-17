@@ -57,6 +57,23 @@ describe("shared agent guidance", () => {
     }
   });
 
+  it("stops every recipe after its final managed launch", () => {
+    const guide = getAgentGuide();
+
+    for (const summary of guide.recipes) {
+      const { recipe } = getAgentGuide(summary.id);
+      const launchIndexes = recipe.tools.flatMap((tool, index) =>
+        tool === "godot_editor_launch" || tool === "godot_scene_launch" ? [index] : [],
+      );
+      if (launchIndexes.length === 0) continue;
+
+      const finalLaunchIndex = Math.max(...launchIndexes);
+      expect(recipe.tools.lastIndexOf("godot_run_stop"), recipe.id).toBeGreaterThan(finalLaunchIndex);
+    }
+
+    expect(getAgentGuide("safe-scene-batch").recipe.tools.at(-1)).toBe("godot_run_stop");
+  });
+
   it("is deterministic, read-only, and does not retain caller mutations", () => {
     const first = getAgentGuide();
     const snapshot = JSON.stringify(first);
