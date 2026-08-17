@@ -37,11 +37,22 @@ describe("Godot addon installer", () => {
     const second = await installGodotAddon(projectPath);
     const project = await inspectProject(projectPath);
     const configuration = await readFile(resolve(projectPath, "project.godot"), "utf8");
+    const editorBridge = await readFile(
+      resolve(projectPath, "addons", "godot_agent_runtime", "editor_bridge.gd"),
+      "utf8",
+    );
+    const runtimeBridge = await readFile(
+      resolve(projectPath, "addons", "godot_agent_runtime", "runtime_entry.gd"),
+      "utf8",
+    );
 
     expect(first.files).toHaveLength(4);
     expect(first.projectConfigurationChanged).toBe(true);
     expect(second.projectConfigurationChanged).toBe(false);
     expect(project.enabledPlugins).toEqual(["existing_plugin", "godot_agent_runtime"]);
     expect(configuration.match(/godot_agent_runtime/g)).toHaveLength(1);
+    expect(editorBridge).toContain('const PROTOCOL_VERSION := "0.4.0"');
+    expect(editorBridge).toContain('"scene_open"');
+    expect(runtimeBridge).toContain('const PROTOCOL_VERSION := "0.3.0"');
   });
 });

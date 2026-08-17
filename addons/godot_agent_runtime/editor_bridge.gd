@@ -1,7 +1,7 @@
 @tool
 extends Node
 
-const PROTOCOL_VERSION := "0.3.0"
+const PROTOCOL_VERSION := "0.4.0"
 const MAX_MESSAGE_BYTES := 1024 * 1024
 
 var _editor: EditorInterface
@@ -88,8 +88,11 @@ func _handle(peer: Dictionary, line: String) -> void:
 				"protocolVersion": PROTOCOL_VERSION,
 				"engineVersion": Engine.get_version_info().get("string", "unknown"),
 				"scene": root.scene_file_path if root != null else null,
-				"capabilities": ["scene_tree", "selection", "screenshot", "viewport_3d", "node_edit", "scene_instantiate", "scene_inheritance", "instance_editable", "resource_edit", "resource_save", "resource_focus", "signal_connect", "scene_save", "undo_redo"],
+				"historyVersion": _history_version(root) if root != null else null,
+				"capabilities": ["scene_tree", "selection", "screenshot", "viewport_3d", "node_edit", "scene_instantiate", "scene_inheritance", "instance_editable", "resource_edit", "resource_save", "resource_focus", "signal_connect", "scene_save", "scene_open", "undo_redo"],
 			})
+		"scene_open":
+			_send_ok(peer, request_id, await _scene_open(params))
 		"scene_tree":
 			var root := _editor.get_edited_scene_root()
 			var budget: Array[int] = [2000]
@@ -134,13 +137,89 @@ func _handle(peer: Dictionary, line: String) -> void:
 		"signal_connect":
 			_send_ok(peer, request_id, _signal_connect(params))
 		"scene_save":
-			_send_ok(peer, request_id, _scene_save())
+			_send_ok(peer, request_id, _scene_save(params))
 		"history_undo":
-			_send_ok(peer, request_id, _history_step("undo"))
+			_send_ok(peer, request_id, _history_step("undo", params))
 		"history_redo":
-			_send_ok(peer, request_id, _history_step("redo"))
+			_send_ok(peer, request_id, _history_step("redo", params))
 		_:
 			_send(peer, {"id": request_id, "ok": false, "error": {"code": "EDITOR_COMMAND_UNKNOWN", "message": "Unknown editor command."}})
+
+
+func _history_for_root(root: Node) -> UndoRedo:
+	var history_id := _undo_redo.get_object_history_id(root)
+	return _undo_redo.get_history_undo_redo(history_id)
+
+
+func _history_version(root: Node) -> Variant:
+	var history := _history_for_root(root)
+	return history.get_version() if history != null else null
+
+
+func _require_edited_scene(params: Dictionary) -> Dictionary:
+	var root := _editor.get_edited_scene_root()
+	if root == null:
+		return _failure("EDITOR_SCENE_NOT_OPEN", "No edited scene is open.")
+	var expected := str(params.get("expectedScenePath", ""))
+	if expected.is_empty():
+		return _failure("EDITOR_SCENE_PATH_REQUIRED", "expectedScenePath is required for scene mutations.")
+	if root.scene_file_path != expected:
+		return _failure("EDITOR_SCENE_MISMATCH", "The active scene does not match expectedScenePath.", {
+			"expectedScenePath": expected,
+			"actualScenePath": root.scene_file_path,
+		})
+	return {"ok": true, "root": root}
+
+
+func _require_history_version(params: Dictionary, root: Node) -> Dictionary:
+	if not params.has("expectedHistoryVersion"):
+		return _failure("EDITOR_HISTORY_VERSION_REQUIRED", "expectedHistoryVersion is required for scene save, undo, and redo.")
+	var raw_expected = params.expectedHistoryVersion
+	if typeof(raw_expected) not in [TYPE_INT, TYPE_FLOAT] or float(raw_expected) < 0.0 or float(raw_expected) != floor(float(raw_expected)):
+		return _failure("EDITOR_HISTORY_VERSION_INVALID", "expectedHistoryVersion must be a non-negative integer.", {"expectedHistoryVersion": raw_expected})
+	var history := _history_for_root(root)
+	if history == null:
+		return _failure("EDITOR_HISTORY_NOT_FOUND", "Godot did not expose an Undo/Redo history for the edited scene.")
+	var expected := int(raw_expected)
+	var actual := history.get_version()
+	if expected != actual:
+		return _failure("EDITOR_HISTORY_CONFLICT", "The edited scene history changed after the caller obtained its guard.", {
+			"expectedHistoryVersion": expected,
+			"actualHistoryVersion": actual,
+		})
+	return {"ok": true, "history": history}
+
+
+func _scene_open(params: Dictionary) -> Dictionary:
+	if str(params.get("expectedProjectFingerprint", "")).is_empty():
+		return _failure("PROJECT_FINGERPRINT_REQUIRED", "expectedProjectFingerprint is required before opening an editor scene.")
+	var checked_path := _validated_res_path(str(params.get("scenePath", "")), ["tscn"])
+	if checked_path.has("_error"):
+		return checked_path
+	var scene_path: String = checked_path.path
+	if not FileAccess.file_exists(scene_path):
+		return _failure("EDITOR_SCENE_RESOURCE_NOT_FOUND", "PackedScene file was not found.", {"scenePath": scene_path})
+	var previous_root := _editor.get_edited_scene_root()
+	var previous_scene = previous_root.scene_file_path if previous_root != null and not previous_root.scene_file_path.is_empty() else null
+	_editor.open_scene_from_path(scene_path)
+	for _frame in range(120):
+		await get_tree().process_frame
+		var opened_root := _editor.get_edited_scene_root()
+		if opened_root != null and opened_root.scene_file_path == scene_path:
+			var history_version = _history_version(opened_root)
+			if history_version == null:
+				return _failure("EDITOR_HISTORY_NOT_FOUND", "Godot did not expose an Undo/Redo history for the opened scene.")
+			return {
+				"opened": true,
+				"previousScene": previous_scene,
+				"scene": scene_path,
+				"historyVersion": history_version,
+			}
+	var actual_root := _editor.get_edited_scene_root()
+	return _failure("EDITOR_SCENE_OPEN_TIMEOUT", "The requested scene did not become the active edited scene before the deadline.", {
+		"scenePath": scene_path,
+		"actualScenePath": actual_root.scene_file_path if actual_root != null else null,
+	})
 
 
 func _describe_tree(node: Node, depth: int, budget: Array[int]) -> Dictionary:
@@ -178,9 +257,10 @@ func _node_get(params: Dictionary) -> Dictionary:
 
 
 func _node_create(params: Dictionary) -> Dictionary:
-	var root := _editor.get_edited_scene_root()
-	if root == null:
-		return _failure("EDITOR_SCENE_NOT_OPEN", "No edited scene is open.")
+	var required := _require_edited_scene(params)
+	if required.has("_error"):
+		return required
+	var root: Node = required.root
 	var parent_path := str(params.get("parentPath", ""))
 	var parent := _node_at_path(parent_path)
 	if parent == null:
@@ -220,13 +300,15 @@ func _node_create(params: Dictionary) -> Dictionary:
 		"previousPath": null,
 		"changedProperties": prepared.names,
 		"undoable": true,
+		"historyVersion": _history_version(root),
 	}
 
 
 func _scene_instantiate(params: Dictionary) -> Dictionary:
-	var root := _editor.get_edited_scene_root()
-	if root == null:
-		return _failure("EDITOR_SCENE_NOT_OPEN", "No edited scene is open.")
+	var required := _require_edited_scene(params)
+	if required.has("_error"):
+		return required
+	var root: Node = required.root
 	var parent_path := str(params.get("parentPath", ""))
 	var parent := _node_at_path(parent_path)
 	if parent == null:
@@ -274,6 +356,7 @@ func _scene_instantiate(params: Dictionary) -> Dictionary:
 		"scenePath": scene_path,
 		"changedProperties": prepared.names,
 		"undoable": true,
+		"historyVersion": _history_version(root),
 	}
 
 
@@ -369,9 +452,10 @@ func _restore_edited_scene(scene_path: String) -> bool:
 
 
 func _node_update(params: Dictionary) -> Dictionary:
-	var root := _editor.get_edited_scene_root()
-	if root == null:
-		return _failure("EDITOR_SCENE_NOT_OPEN", "No edited scene is open.")
+	var required := _require_edited_scene(params)
+	if required.has("_error"):
+		return required
+	var root: Node = required.root
 	var path := str(params.get("nodePath", ""))
 	var node := _node_at_path(path)
 	if node == null:
@@ -409,13 +493,15 @@ func _node_update(params: Dictionary) -> Dictionary:
 		"previousPath": path,
 		"changedProperties": changed_names,
 		"undoable": true,
+		"historyVersion": _history_version(root),
 	}
 
 
 func _node_delete(params: Dictionary) -> Dictionary:
-	var root := _editor.get_edited_scene_root()
-	if root == null:
-		return _failure("EDITOR_SCENE_NOT_OPEN", "No edited scene is open.")
+	var required := _require_edited_scene(params)
+	if required.has("_error"):
+		return required
+	var root: Node = required.root
 	var path := str(params.get("nodePath", ""))
 	var node := _node_at_path(path)
 	if node == null:
@@ -443,13 +529,15 @@ func _node_delete(params: Dictionary) -> Dictionary:
 		"previousPath": path,
 		"changedProperties": [],
 		"undoable": true,
+		"historyVersion": _history_version(root),
 	}
 
 
 func _node_move(params: Dictionary) -> Dictionary:
-	var root := _editor.get_edited_scene_root()
-	if root == null:
-		return _failure("EDITOR_SCENE_NOT_OPEN", "No edited scene is open.")
+	var required := _require_edited_scene(params)
+	if required.has("_error"):
+		return required
+	var root: Node = required.root
 	var path := str(params.get("nodePath", ""))
 	var parent_path := str(params.get("newParentPath", ""))
 	var node := _node_at_path(path)
@@ -492,13 +580,15 @@ func _node_move(params: Dictionary) -> Dictionary:
 		"index": node.get_index(),
 		"changedProperties": [],
 		"undoable": true,
+		"historyVersion": _history_version(root),
 	}
 
 
 func _resource_create(params: Dictionary) -> Dictionary:
-	var root := _editor.get_edited_scene_root()
-	if root == null:
-		return _failure("EDITOR_SCENE_NOT_OPEN", "No edited scene is open.")
+	var required := _require_edited_scene(params)
+	if required.has("_error"):
+		return required
+	var root: Node = required.root
 	var node_path := str(params.get("nodePath", ""))
 	var property := str(params.get("property", ""))
 	var type_name := str(params.get("type", ""))
@@ -543,6 +633,7 @@ func _resource_create(params: Dictionary) -> Dictionary:
 		},
 		"changedProperties": prepared.names,
 		"undoable": true,
+		"historyVersion": _history_version(root),
 	}
 
 
@@ -568,9 +659,10 @@ func _resource_get(params: Dictionary) -> Dictionary:
 
 
 func _resource_update(params: Dictionary) -> Dictionary:
-	var root := _editor.get_edited_scene_root()
-	if root == null:
-		return _failure("EDITOR_SCENE_NOT_OPEN", "No edited scene is open.")
+	var required := _require_edited_scene(params)
+	if required.has("_error"):
+		return required
+	var root: Node = required.root
 	var target := _resource_target(params)
 	if target.has("_error"):
 		return target
@@ -593,6 +685,7 @@ func _resource_update(params: Dictionary) -> Dictionary:
 		"resource": _describe_resource(resource, _encoded_properties(resource, prepared.names)),
 		"changedProperties": prepared.names,
 		"undoable": true,
+		"historyVersion": _history_version(root),
 	}
 
 
@@ -620,9 +713,10 @@ func _describe_resource(resource: Resource, properties: Dictionary) -> Dictionar
 
 
 func _resource_save(params: Dictionary) -> Dictionary:
-	var root := _editor.get_edited_scene_root()
-	if root == null:
-		return _failure("EDITOR_SCENE_NOT_OPEN", "No edited scene is open.")
+	var required := _require_edited_scene(params)
+	if required.has("_error"):
+		return required
+	var root: Node = required.root
 	var node_path := str(params.get("nodePath", ""))
 	var property := str(params.get("property", ""))
 	var node := _node_at_path(node_path)
@@ -674,6 +768,7 @@ func _resource_save(params: Dictionary) -> Dictionary:
 		"undoable": false,
 		"referenceUndoable": true,
 		"fileUndoable": false,
+		"historyVersion": _history_version(root),
 	}
 
 
@@ -706,6 +801,9 @@ func _instance_get(params: Dictionary) -> Dictionary:
 
 
 func _instance_set_editable(params: Dictionary) -> Dictionary:
+	var required := _require_edited_scene(params)
+	if required.has("_error"):
+		return required
 	var target := _instance_target(params)
 	if target.has("_error"):
 		return target
@@ -726,6 +824,7 @@ func _instance_set_editable(params: Dictionary) -> Dictionary:
 		"editable": root.is_editable_instance(node),
 		"previousEditable": previous,
 		"undoable": true,
+		"historyVersion": _history_version(root),
 	}
 
 
@@ -743,9 +842,10 @@ func _instance_target(params: Dictionary) -> Dictionary:
 
 
 func _signal_connect(params: Dictionary) -> Dictionary:
-	var root := _editor.get_edited_scene_root()
-	if root == null:
-		return _failure("EDITOR_SCENE_NOT_OPEN", "No edited scene is open.")
+	var required := _require_edited_scene(params)
+	if required.has("_error"):
+		return required
+	var root: Node = required.root
 	var source_path := str(params.get("sourcePath", ""))
 	var target_path := str(params.get("targetPath", ""))
 	var signal_name := str(params.get("signal", ""))
@@ -776,17 +876,22 @@ func _signal_connect(params: Dictionary) -> Dictionary:
 		"method": method,
 		"flags": flags,
 		"undoable": true,
+		"historyVersion": _history_version(root),
 	}
 
 
-func _scene_save() -> Dictionary:
-	var root := _editor.get_edited_scene_root()
-	if root == null:
-		return _failure("EDITOR_SCENE_NOT_OPEN", "No edited scene is open.")
+func _scene_save(params: Dictionary) -> Dictionary:
+	var required := _require_edited_scene(params)
+	if required.has("_error"):
+		return required
+	var root: Node = required.root
+	var guarded_history := _require_history_version(params, root)
+	if guarded_history.has("_error"):
+		return guarded_history
 	var error := _editor.save_scene()
 	if error != OK:
 		return _failure("EDITOR_SCENE_SAVE_FAILED", "Godot could not save the edited scene.", {"error": error, "scene": root.scene_file_path})
-	return {"saved": true, "scene": root.scene_file_path, "error": error}
+	return {"saved": true, "scene": root.scene_file_path, "error": error, "historyVersion": _history_version(root)}
 
 
 func _selection_get() -> Dictionary:
@@ -820,25 +925,31 @@ func _selection_set(params: Dictionary) -> Dictionary:
 	return _selection_get()
 
 
-func _history_step(action: String) -> Dictionary:
-	var root := _editor.get_edited_scene_root()
-	if root == null:
-		return _failure("EDITOR_SCENE_NOT_OPEN", "No edited scene is open.")
-	var history_id := _undo_redo.get_object_history_id(root)
-	var history: UndoRedo = _undo_redo.get_history_undo_redo(history_id)
-	if history == null:
-		return _failure("EDITOR_HISTORY_NOT_FOUND", "Godot did not expose an Undo/Redo history for the edited scene.")
+func _history_step(action: String, params: Dictionary) -> Dictionary:
+	var required := _require_edited_scene(params)
+	if required.has("_error"):
+		return required
+	var root: Node = required.root
+	var guarded_history := _require_history_version(params, root)
+	if guarded_history.has("_error"):
+		return guarded_history
+	var history: UndoRedo = guarded_history.history
 	var available := history.has_undo() if action == "undo" else history.has_redo()
 	if not available:
 		return _failure("EDITOR_HISTORY_EMPTY", "The edited scene has no action available to %s." % action, {"action": action})
 	var before_version := history.get_version()
-	var action_name := history.get_current_action_name() if action == "undo" else ""
+	var action_name := history.get_current_action_name() if action == "undo" else history.get_action_name(history.get_current_action() + 1)
+	var expected_action_name := str(params.get("expectedActionName", ""))
+	if not expected_action_name.is_empty() and expected_action_name != action_name:
+		return _failure("EDITOR_HISTORY_ACTION_MISMATCH", "The next history action does not match expectedActionName.", {
+			"expectedActionName": expected_action_name,
+			"actualActionName": action_name,
+		})
 	var performed: bool
 	if action == "undo":
 		performed = history.undo()
 	else:
 		performed = history.redo()
-		action_name = history.get_current_action_name()
 	if not performed:
 		return _failure("EDITOR_HISTORY_STEP_FAILED", "Godot could not %s the current scene action." % action, {"action": action})
 	return {
@@ -847,6 +958,7 @@ func _history_step(action: String) -> Dictionary:
 		"actionName": action_name,
 		"beforeVersion": before_version,
 		"afterVersion": history.get_version(),
+		"historyVersion": history.get_version(),
 	}
 
 

@@ -109,6 +109,7 @@ describe("MCP server", () => {
       "godot_runtime_control",
       "godot_editor_launch",
       "godot_editor_status",
+      "godot_editor_scene_open",
       "godot_editor_scene_tree",
       "godot_editor_node_get",
       "godot_editor_selection_get",
@@ -140,6 +141,10 @@ describe("MCP server", () => {
     const fileReplace = tools.find(({ name }) => name === "godot_file_replace");
     const projectContext = tools.find(({ name }) => name === "godot_project_context");
     const scriptCheck = tools.find(({ name }) => name === "godot_script_check");
+    const editorStatus = tools.find(({ name }) => name === "godot_editor_status");
+    const editorSceneOpen = tools.find(({ name }) => name === "godot_editor_scene_open");
+    const editorNodeCreate = tools.find(({ name }) => name === "godot_editor_node_create");
+    const editorSceneSave = tools.find(({ name }) => name === "godot_editor_scene_save");
     expect(projectContext?.inputSchema.additionalProperties).toBe(false);
     expect(projectContext?.outputSchema?.additionalProperties).toBe(false);
     expect(projectContext?.annotations).toEqual({
@@ -152,6 +157,18 @@ describe("MCP server", () => {
       readOnlyHint: false,
       idempotentHint: true,
     });
+    expect(editorStatus?.outputSchema?.properties).toHaveProperty("historyVersion");
+    expect(editorSceneOpen?.inputSchema.required).toEqual(expect.arrayContaining([
+      "expectedProjectFingerprint",
+      "scenePath",
+    ]));
+    expect(editorSceneOpen?.outputSchema?.properties).toHaveProperty("historyVersion");
+    expect(editorNodeCreate?.inputSchema.required).toContain("expectedScenePath");
+    expect(editorNodeCreate?.inputSchema.properties).toHaveProperty("expectedProjectFingerprint");
+    expect(editorSceneSave?.inputSchema.required).toEqual(expect.arrayContaining([
+      "expectedScenePath",
+      "expectedHistoryVersion",
+    ]));
     expect(fileWrite?.inputSchema.additionalProperties).toBe(false);
     expect(fileWrite?.annotations).toMatchObject({
       readOnlyHint: false,
@@ -165,6 +182,51 @@ describe("MCP server", () => {
       idempotentHint: false,
       destructiveHint: false,
       openWorldHint: false,
+    });
+  });
+
+  it("returns the stable scene guard error when expectedScenePath is omitted", async () => {
+    const projectPath = resolveProject("examples/minimal-2d");
+    const runId = "00000000-0000-4000-8000-000000000000";
+
+    const missingSceneGuard = await client.callTool({
+      name: "godot_editor_node_create",
+      arguments: {
+        projectPath,
+        runId,
+        parentPath: ".",
+        type: "Node2D",
+        name: "MissingSceneGuard",
+      },
+    });
+    expect(missingSceneGuard.isError).toBe(true);
+    expect(missingSceneGuard.structuredContent).toMatchObject({
+      ok: false,
+      error: {
+        code: "EDITOR_SCENE_PATH_REQUIRED",
+        recovery: expect.arrayContaining([expect.any(String)]),
+      },
+    });
+  });
+
+  it("returns the stable history guard error when expectedHistoryVersion is omitted", async () => {
+    const projectPath = resolveProject("examples/minimal-2d");
+    const runId = "00000000-0000-4000-8000-000000000000";
+    const missingHistoryGuard = await client.callTool({
+      name: "godot_editor_scene_save",
+      arguments: {
+        projectPath,
+        runId,
+        expectedScenePath: "res://main.tscn",
+      },
+    });
+    expect(missingHistoryGuard.isError).toBe(true);
+    expect(missingHistoryGuard.structuredContent).toMatchObject({
+      ok: false,
+      error: {
+        code: "EDITOR_HISTORY_VERSION_REQUIRED",
+        recovery: expect.arrayContaining([expect.any(String)]),
+      },
     });
   });
 

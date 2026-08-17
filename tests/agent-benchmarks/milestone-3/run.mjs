@@ -9,7 +9,9 @@ import {
   captureEditorScreenshot,
   captureRuntimeScreenshot,
   checkProject,
+  getEditorInfo,
   getEditorNode,
+  getProjectIdentity,
   getRuntimeSceneTree,
   injectRuntimeInputSequence,
   installGodotAddon,
@@ -92,9 +94,16 @@ try {
   });
 
   await step("install-editor-plugin", async () => await installGodotAddon(projectPath));
+  const identity = await step("identify-project", async () => await getProjectIdentity(projectPath));
   editorRun = await step("launch-editor", async () =>
     await launchEditor({ projectPath, configPath, timeoutMs: 30_000 }),
   );
+  const editorStatus = await step("read-editor-status", async () =>
+    await getEditorInfo({ projectPath, runId: editorRun.runId }),
+  );
+  if (editorStatus.scene === null || editorStatus.historyVersion === null) {
+    throw new Error("Managed editor did not expose an active scene history.");
+  }
   const editorBefore = await step("read-editor-player-transform", async () =>
     await getEditorNode({
       projectPath,
@@ -107,6 +116,8 @@ try {
     await updateEditorNode({
       projectPath,
       runId: editorRun.runId,
+      expectedProjectFingerprint: identity.projectFingerprint,
+      expectedScenePath: editorStatus.scene,
       nodePath: playerPath,
       properties: { position: { $type: "Vector3", x: -2.5, y: 0.5, z: 0 } },
     }),
@@ -123,7 +134,13 @@ try {
     }),
   );
   await step("save-3d-scene", async () =>
-    await saveEditorScene({ projectPath, runId: editorRun.runId }),
+    await saveEditorScene({
+      projectPath,
+      runId: editorRun.runId,
+      expectedProjectFingerprint: identity.projectFingerprint,
+      expectedScenePath: editorStatus.scene,
+      expectedHistoryVersion: editorMutation.historyVersion,
+    }),
   );
   const editorScreenshot = await step("capture-editor-3d-viewport", async () =>
     await captureEditorScreenshot({

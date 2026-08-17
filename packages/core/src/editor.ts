@@ -2,24 +2,26 @@ import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
 
-import type {
-  EditorBridgeInfo,
-  EditorHistoryResult,
-  EditorInheritedSceneResult,
-  EditorInstanceMutationResult,
-  EditorInstanceResult,
-  EditorMutationResult,
-  EditorNodeResult,
-  EditorResourceResult,
-  EditorResourceReadResult,
-  EditorResourceFocusResult,
-  EditorResourceSaveResult,
-  EditorSceneSaveResult,
-  EditorSceneTreeResult,
-  EditorScreenshotResult,
-  EditorSelectionResult,
-  EditorSignalConnectionResult,
-  GodotLaunchResult,
+import {
+  EDITOR_PROTOCOL_VERSION,
+  type EditorSceneOpenResult,
+  type EditorBridgeInfo,
+  type EditorHistoryResult,
+  type EditorInheritedSceneResult,
+  type EditorInstanceMutationResult,
+  type EditorInstanceResult,
+  type EditorMutationResult,
+  type EditorNodeResult,
+  type EditorResourceResult,
+  type EditorResourceReadResult,
+  type EditorResourceFocusResult,
+  type EditorResourceSaveResult,
+  type EditorSceneSaveResult,
+  type EditorSceneTreeResult,
+  type EditorScreenshotResult,
+  type EditorSelectionResult,
+  type EditorSignalConnectionResult,
+  type GodotLaunchResult,
 } from "@godot-agent-runtime/protocol";
 
 import { RuntimeFailure } from "./errors.js";
@@ -33,7 +35,7 @@ import {
   launchManagedProcess,
   stopManagedRun,
 } from "./managed-run.js";
-import { inspectProject } from "./project.js";
+import { assertProjectFingerprint, inspectProject } from "./project.js";
 import {
   findLoopbackPort,
   sendBridgeCommand,
@@ -55,18 +57,49 @@ const EDITOR_CAPABILITIES = [
   "resource_focus",
   "signal_connect",
   "scene_save",
+  "scene_open",
   "undo_redo",
 ] as const;
 
 export async function getEditorInfo(options: RuntimeLookupOptions): Promise<EditorBridgeInfo> {
   const result = await sendBridgeCommand(options, "hello");
-  const handshake = validateBridgeHandshake(result, "editor", EDITOR_CAPABILITIES);
+  const handshake = validateBridgeHandshake(
+    result,
+    "editor",
+    EDITOR_PROTOCOL_VERSION,
+    EDITOR_CAPABILITIES,
+  );
+  const rawHistoryVersion = result.historyVersion;
+  const historyVersion = rawHistoryVersion === null
+    ? null
+    : rawHistoryVersion;
+  if (historyVersion !== null &&
+      (typeof historyVersion !== "number" || !Number.isInteger(historyVersion) || historyVersion < 0)) {
+    throw new RuntimeFailure({
+      code: "EDITOR_PROTOCOL_HANDSHAKE_INVALID",
+      stage: "protocol",
+      message: "editor bridge returned an invalid scene history version.",
+      details: { historyVersion: rawHistoryVersion ?? null },
+      recovery: ["Reinstall the Godot Agent Runtime addon and start a fresh managed editor."],
+    });
+  }
+  const scene = typeof result.scene === "string" ? result.scene : null;
+  if ((scene === null) !== (historyVersion === null)) {
+    throw new RuntimeFailure({
+      code: "EDITOR_PROTOCOL_HANDSHAKE_INVALID",
+      stage: "protocol",
+      message: "editor bridge returned inconsistent scene and history status.",
+      details: { scene, historyVersion },
+      recovery: ["Reinstall the Godot Agent Runtime addon and start a fresh managed editor."],
+    });
+  }
   return {
     ok: true,
     runId: options.runId,
     protocolVersion: handshake.protocolVersion,
     engineVersion: String(result.engineVersion ?? "unknown"),
-    scene: typeof result.scene === "string" ? result.scene : null,
+    scene,
+    historyVersion,
     capabilities: handshake.capabilities as EditorBridgeInfo["capabilities"],
   };
 }
@@ -199,14 +232,29 @@ export interface EditorNodeLookupOptions extends RuntimeLookupOptions {
   readonly properties?: readonly string[];
 }
 
-export interface EditorNodeCreateOptions extends RuntimeLookupOptions {
+export interface EditorMutationLookupOptions extends RuntimeLookupOptions {
+  readonly expectedProjectFingerprint?: string | undefined;
+  readonly expectedScenePath: string;
+}
+
+export interface EditorHistoryMutationOptions extends EditorMutationLookupOptions {
+  readonly expectedHistoryVersion: number;
+  readonly expectedActionName?: string;
+}
+
+export interface EditorSceneOpenOptions extends RuntimeLookupOptions {
+  readonly expectedProjectFingerprint: string;
+  readonly scenePath: string;
+}
+
+export interface EditorNodeCreateOptions extends EditorMutationLookupOptions {
   readonly parentPath: string;
   readonly type: string;
   readonly name: string;
   readonly properties?: Readonly<Record<string, unknown>>;
 }
 
-export interface EditorSceneInstantiateOptions extends RuntimeLookupOptions {
+export interface EditorSceneInstantiateOptions extends EditorMutationLookupOptions {
   readonly parentPath: string;
   readonly scenePath: string;
   readonly name?: string;
@@ -222,24 +270,24 @@ export interface EditorSceneInheritanceOptions extends RuntimeLookupOptions {
   readonly overwrite?: boolean;
 }
 
-export interface EditorNodeUpdateOptions extends RuntimeLookupOptions {
+export interface EditorNodeUpdateOptions extends EditorMutationLookupOptions {
   readonly nodePath: string;
   readonly name?: string;
   readonly properties?: Readonly<Record<string, unknown>>;
 }
 
-export interface EditorNodeDeleteOptions extends RuntimeLookupOptions {
+export interface EditorNodeDeleteOptions extends EditorMutationLookupOptions {
   readonly nodePath: string;
 }
 
-export interface EditorNodeMoveOptions extends RuntimeLookupOptions {
+export interface EditorNodeMoveOptions extends EditorMutationLookupOptions {
   readonly nodePath: string;
   readonly newParentPath: string;
   readonly index?: number;
   readonly keepGlobalTransform?: boolean;
 }
 
-export interface EditorResourceCreateOptions extends RuntimeLookupOptions {
+export interface EditorResourceCreateOptions extends EditorMutationLookupOptions {
   readonly nodePath: string;
   readonly property: string;
   readonly type: string;
@@ -252,7 +300,7 @@ export interface EditorResourceLookupOptions extends RuntimeLookupOptions {
   readonly properties?: readonly string[];
 }
 
-export interface EditorResourceUpdateOptions extends RuntimeLookupOptions {
+export interface EditorResourceUpdateOptions extends EditorMutationLookupOptions {
   readonly nodePath: string;
   readonly property: string;
   readonly properties: Readonly<Record<string, unknown>>;
@@ -262,11 +310,11 @@ export interface EditorInstanceLookupOptions extends RuntimeLookupOptions {
   readonly nodePath: string;
 }
 
-export interface EditorInstanceSetEditableOptions extends EditorInstanceLookupOptions {
+export interface EditorInstanceSetEditableOptions extends EditorInstanceLookupOptions, EditorMutationLookupOptions {
   readonly editable: boolean;
 }
 
-export interface EditorResourceSaveOptions extends RuntimeLookupOptions {
+export interface EditorResourceSaveOptions extends EditorMutationLookupOptions {
   readonly nodePath: string;
   readonly property: string;
   readonly path: string;
@@ -282,7 +330,7 @@ export interface EditorSelectionSetOptions extends RuntimeLookupOptions {
   readonly focus?: boolean;
 }
 
-export interface EditorSignalConnectOptions extends RuntimeLookupOptions {
+export interface EditorSignalConnectOptions extends EditorMutationLookupOptions {
   readonly sourcePath: string;
   readonly signal: string;
   readonly targetPath: string;
@@ -293,6 +341,79 @@ export interface EditorSignalConnectOptions extends RuntimeLookupOptions {
 export interface EditorScreenshotOptions extends RuntimeLookupOptions {
   readonly viewport?: "2d" | "3d";
   readonly viewportIndex?: number;
+}
+
+async function prepareEditorMutation(options: EditorMutationLookupOptions): Promise<void> {
+  await assertProjectFingerprint(options.projectPath, options.expectedProjectFingerprint);
+  const expectedScenePath = options.expectedScenePath as unknown;
+  if (typeof expectedScenePath !== "string" || expectedScenePath.length === 0) {
+    throw new RuntimeFailure({
+      code: "EDITOR_SCENE_PATH_REQUIRED",
+      stage: "validation",
+      message: "expectedScenePath is required for persistent editor mutations.",
+      recovery: ["Read godot_editor_status and pass its exact scene path as expectedScenePath."],
+    });
+  }
+  if (!expectedScenePath.startsWith("res://")) {
+    throw new RuntimeFailure({
+      code: "EDITOR_SCENE_PATH_INVALID",
+      stage: "validation",
+      message: "expectedScenePath must be a res:// scene path.",
+      details: { expectedScenePath },
+      recovery: ["Read godot_project_context or godot_editor_status and pass the exact scene path."],
+    });
+  }
+}
+
+async function prepareEditorHistoryMutation(options: EditorHistoryMutationOptions): Promise<void> {
+  await prepareEditorMutation(options);
+  const expectedHistoryVersion = options.expectedHistoryVersion as unknown;
+  if (expectedHistoryVersion === undefined || expectedHistoryVersion === null) {
+    throw new RuntimeFailure({
+      code: "EDITOR_HISTORY_VERSION_REQUIRED",
+      stage: "validation",
+      message: "expectedHistoryVersion is required for scene save, undo, and redo.",
+      recovery: ["Read godot_editor_status or the previous mutation receipt and pass its historyVersion."],
+    });
+  }
+  if (!Number.isInteger(expectedHistoryVersion) || Number(expectedHistoryVersion) < 0) {
+    throw new RuntimeFailure({
+      code: "EDITOR_HISTORY_VERSION_INVALID",
+      stage: "validation",
+      message: "expectedHistoryVersion must be a non-negative integer.",
+      details: { expectedHistoryVersion },
+      recovery: ["Read godot_editor_status and pass its current historyVersion without modification."],
+    });
+  }
+}
+
+export async function openEditorScene(
+  options: EditorSceneOpenOptions,
+): Promise<EditorSceneOpenResult> {
+  const expectedProjectFingerprint = options.expectedProjectFingerprint as unknown;
+  if (typeof expectedProjectFingerprint !== "string" || expectedProjectFingerprint.length === 0) {
+    throw new RuntimeFailure({
+      code: "PROJECT_FINGERPRINT_REQUIRED",
+      stage: "validation",
+      message: "expectedProjectFingerprint is required before opening an editor scene.",
+      recovery: ["Read godot_project_context and pass identity.projectFingerprint."],
+    });
+  }
+  await assertProjectFingerprint(options.projectPath, expectedProjectFingerprint);
+  if (!options.scenePath.startsWith("res://") || !options.scenePath.toLowerCase().endsWith(".tscn")) {
+    throw new RuntimeFailure({
+      code: "EDITOR_SCENE_PATH_INVALID",
+      stage: "validation",
+      message: "scenePath must be a project-local res:// .tscn path.",
+      details: { scenePath: options.scenePath },
+      recovery: ["Choose a .tscn returned by the project files under res://."],
+    });
+  }
+  const result = await sendBridgeCommand(options, "scene_open", {
+    expectedProjectFingerprint,
+    scenePath: options.scenePath,
+  });
+  return { ok: true, runId: options.runId, ...result } as EditorSceneOpenResult;
 }
 
 export async function getEditorNode(
@@ -308,7 +429,9 @@ export async function getEditorNode(
 export async function createEditorNode(
   options: EditorNodeCreateOptions,
 ): Promise<EditorMutationResult> {
+  await prepareEditorMutation(options);
   const result = await sendBridgeCommand(options, "node_create", {
+    expectedScenePath: options.expectedScenePath,
     parentPath: options.parentPath,
     type: options.type,
     name: options.name,
@@ -320,7 +443,9 @@ export async function createEditorNode(
 export async function instantiateEditorScene(
   options: EditorSceneInstantiateOptions,
 ): Promise<EditorMutationResult> {
+  await prepareEditorMutation(options);
   const result = await sendBridgeCommand(options, "scene_instantiate", {
+    expectedScenePath: options.expectedScenePath,
     parentPath: options.parentPath,
     scenePath: options.scenePath,
     ...(options.name === undefined ? {} : { name: options.name }),
@@ -382,7 +507,9 @@ export async function createInheritedEditorScene(
 export async function updateEditorNode(
   options: EditorNodeUpdateOptions,
 ): Promise<EditorMutationResult> {
+  await prepareEditorMutation(options);
   const result = await sendBridgeCommand(options, "node_update", {
+    expectedScenePath: options.expectedScenePath,
     nodePath: options.nodePath,
     ...(options.name === undefined ? {} : { name: options.name }),
     properties: options.properties ?? {},
@@ -393,7 +520,9 @@ export async function updateEditorNode(
 export async function deleteEditorNode(
   options: EditorNodeDeleteOptions,
 ): Promise<EditorMutationResult> {
+  await prepareEditorMutation(options);
   const result = await sendBridgeCommand(options, "node_delete", {
+    expectedScenePath: options.expectedScenePath,
     nodePath: options.nodePath,
   });
   return { ok: true, runId: options.runId, ...result } as EditorMutationResult;
@@ -402,7 +531,9 @@ export async function deleteEditorNode(
 export async function moveEditorNode(
   options: EditorNodeMoveOptions,
 ): Promise<EditorMutationResult> {
+  await prepareEditorMutation(options);
   const result = await sendBridgeCommand(options, "node_move", {
+    expectedScenePath: options.expectedScenePath,
     nodePath: options.nodePath,
     newParentPath: options.newParentPath,
     ...(options.index === undefined ? {} : { index: options.index }),
@@ -416,7 +547,9 @@ export async function moveEditorNode(
 export async function createEditorResource(
   options: EditorResourceCreateOptions,
 ): Promise<EditorResourceResult> {
+  await prepareEditorMutation(options);
   const result = await sendBridgeCommand(options, "resource_create", {
+    expectedScenePath: options.expectedScenePath,
     nodePath: options.nodePath,
     property: options.property,
     type: options.type,
@@ -439,7 +572,9 @@ export async function getEditorResource(
 export async function updateEditorResource(
   options: EditorResourceUpdateOptions,
 ): Promise<EditorResourceResult> {
+  await prepareEditorMutation(options);
   const result = await sendBridgeCommand(options, "resource_update", {
+    expectedScenePath: options.expectedScenePath,
     nodePath: options.nodePath,
     property: options.property,
     properties: options.properties,
@@ -450,7 +585,9 @@ export async function updateEditorResource(
 export async function saveEditorResource(
   options: EditorResourceSaveOptions,
 ): Promise<EditorResourceSaveResult> {
+  await prepareEditorMutation(options);
   const result = await sendBridgeCommand(options, "resource_save", {
+    expectedScenePath: options.expectedScenePath,
     nodePath: options.nodePath,
     property: options.property,
     path: options.path,
@@ -480,7 +617,9 @@ export async function getEditorInstance(
 export async function setEditorInstanceEditable(
   options: EditorInstanceSetEditableOptions,
 ): Promise<EditorInstanceMutationResult> {
+  await prepareEditorMutation(options);
   const result = await sendBridgeCommand(options, "instance_set_editable", {
+    expectedScenePath: options.expectedScenePath,
     nodePath: options.nodePath,
     editable: options.editable,
   });
@@ -507,7 +646,9 @@ export async function setEditorSelection(
 export async function connectEditorSignal(
   options: EditorSignalConnectOptions,
 ): Promise<EditorSignalConnectionResult> {
+  await prepareEditorMutation(options);
   const result = await sendBridgeCommand(options, "signal_connect", {
+    expectedScenePath: options.expectedScenePath,
     sourcePath: options.sourcePath,
     signal: options.signal,
     targetPath: options.targetPath,
@@ -522,23 +663,41 @@ export async function connectEditorSignal(
 }
 
 export async function saveEditorScene(
-  options: RuntimeLookupOptions,
+  options: EditorHistoryMutationOptions,
 ): Promise<EditorSceneSaveResult> {
-  const result = await sendBridgeCommand(options, "scene_save");
+  await prepareEditorHistoryMutation(options);
+  const result = await sendBridgeCommand(options, "scene_save", {
+    expectedScenePath: options.expectedScenePath,
+    expectedHistoryVersion: options.expectedHistoryVersion,
+  });
   return { ok: true, runId: options.runId, ...result } as EditorSceneSaveResult;
 }
 
 export async function undoEditorAction(
-  options: RuntimeLookupOptions,
+  options: EditorHistoryMutationOptions,
 ): Promise<EditorHistoryResult> {
-  const result = await sendBridgeCommand(options, "history_undo");
+  await prepareEditorHistoryMutation(options);
+  const result = await sendBridgeCommand(options, "history_undo", {
+    expectedScenePath: options.expectedScenePath,
+    expectedHistoryVersion: options.expectedHistoryVersion,
+    ...(options.expectedActionName === undefined
+      ? {}
+      : { expectedActionName: options.expectedActionName }),
+  });
   return { ok: true, runId: options.runId, ...result } as EditorHistoryResult;
 }
 
 export async function redoEditorAction(
-  options: RuntimeLookupOptions,
+  options: EditorHistoryMutationOptions,
 ): Promise<EditorHistoryResult> {
-  const result = await sendBridgeCommand(options, "history_redo");
+  await prepareEditorHistoryMutation(options);
+  const result = await sendBridgeCommand(options, "history_redo", {
+    expectedScenePath: options.expectedScenePath,
+    expectedHistoryVersion: options.expectedHistoryVersion,
+    ...(options.expectedActionName === undefined
+      ? {}
+      : { expectedActionName: options.expectedActionName }),
+  });
   return { ok: true, runId: options.runId, ...result } as EditorHistoryResult;
 }
 

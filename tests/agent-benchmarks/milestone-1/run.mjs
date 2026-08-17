@@ -10,8 +10,10 @@ import {
   captureRuntimeScreenshot,
   checkProject,
   findRuntimeUi,
+  getEditorInfo,
   getEditorNode,
   getEditorSceneTree,
+  getProjectIdentity,
   getRuntimeSceneTree,
   injectRuntimeInputSequence,
   inspectProject,
@@ -84,11 +86,18 @@ try {
   });
 
   const project = await step("inspect-project", async () => await inspectProject(projectPath));
+  const identity = await step("identify-project", async () => await getProjectIdentity(projectPath));
   await step("install-editor-plugin", async () => await installGodotAddon(projectPath));
 
   editorRun = await step("launch-editor", async () =>
     await launchEditor({ projectPath, configPath, timeoutMs: 30_000 }),
   );
+  const editorStatus = await step("read-editor-status", async () =>
+    await getEditorInfo({ projectPath, runId: editorRun.runId }),
+  );
+  if (editorStatus.scene === null || editorStatus.historyVersion === null) {
+    throw new Error("Managed editor did not expose an active scene history.");
+  }
   const editorTree = await step("read-editor-scene-tree", async () =>
     await getEditorSceneTree({ projectPath, runId: editorRun.runId }),
   );
@@ -110,6 +119,8 @@ try {
     await updateEditorNode({
       projectPath,
       runId: editorRun.runId,
+      expectedProjectFingerprint: identity.projectFingerprint,
+      expectedScenePath: editorStatus.scene,
       nodePath: "/root/Main/StartButton",
       properties: { text: "Agent Launch" },
     }),
@@ -119,7 +130,13 @@ try {
   }
 
   await step("save-edited-scene", async () =>
-    await saveEditorScene({ projectPath, runId: editorRun.runId }),
+    await saveEditorScene({
+      projectPath,
+      runId: editorRun.runId,
+      expectedProjectFingerprint: identity.projectFingerprint,
+      expectedScenePath: editorStatus.scene,
+      expectedHistoryVersion: modifiedButton.historyVersion,
+    }),
   );
   const editorStopped = await stopRun("editor", editorRun);
   editorRun = null;

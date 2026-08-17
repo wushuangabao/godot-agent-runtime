@@ -4,7 +4,7 @@ import { createServer, createConnection } from "node:net";
 import { relative, resolve, sep } from "node:path";
 
 import {
-  PROTOCOL_VERSION,
+  RUNTIME_PROTOCOL_VERSION,
   type RuntimeAssertionResult,
   type RuntimeBridgeInfo,
   type RuntimeControlResult,
@@ -42,11 +42,12 @@ const RUNTIME_CAPABILITIES = [
 
 type BridgeKind = "runtime" | "editor";
 
-export function validateBridgeHandshake(
+export function validateBridgeHandshake<const Version extends string>(
   result: Record<string, unknown>,
   kind: BridgeKind,
+  expectedProtocolVersion: Version,
   allowedCapabilities: readonly string[],
-): { protocolVersion: typeof PROTOCOL_VERSION; capabilities: string[] } {
+): { protocolVersion: Version; capabilities: string[] } {
   const prefix = kind.toUpperCase();
   if (typeof result.protocolVersion !== "string") {
     throw new RuntimeFailure({
@@ -57,12 +58,12 @@ export function validateBridgeHandshake(
       recovery: ["Install a bridge version compatible with this MCP server and start a fresh managed run."],
     });
   }
-  if (result.protocolVersion !== PROTOCOL_VERSION) {
+  if (result.protocolVersion !== expectedProtocolVersion) {
     throw new RuntimeFailure({
       code: `${prefix}_PROTOCOL_VERSION_MISMATCH`,
       stage: "protocol",
       message: `${kind} bridge protocol version is incompatible with this MCP server.`,
-      details: { expected: PROTOCOL_VERSION, actual: result.protocolVersion },
+      details: { expected: expectedProtocolVersion, actual: result.protocolVersion },
       recovery: ["Reinstall the Godot Agent Runtime addon so the server and bridge versions match."],
     });
   }
@@ -86,7 +87,7 @@ export function validateBridgeHandshake(
       recovery: ["Use matching server and bridge versions, then start a fresh managed run."],
     });
   }
-  return { protocolVersion: PROTOCOL_VERSION, capabilities: [...capabilities] };
+  return { protocolVersion: expectedProtocolVersion, capabilities: [...capabilities] };
 }
 
 export interface RuntimeLookupOptions {
@@ -339,7 +340,12 @@ export async function sendBridgeCommand(
 
 export async function getRuntimeInfo(options: RuntimeLookupOptions): Promise<RuntimeBridgeInfo> {
   const result = await sendBridgeCommand(options, "hello");
-  const handshake = validateBridgeHandshake(result, "runtime", RUNTIME_CAPABILITIES);
+  const handshake = validateBridgeHandshake(
+    result,
+    "runtime",
+    RUNTIME_PROTOCOL_VERSION,
+    RUNTIME_CAPABILITIES,
+  );
   return {
     ok: true,
     runId: options.runId,

@@ -1,6 +1,7 @@
 import {
   McpServer,
   type CallToolResult,
+  type StandardSchemaWithJSON,
 } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 
@@ -41,6 +42,7 @@ import {
   launchEditor,
   launchProject,
   moveEditorNode,
+  openEditorScene,
   readProjectFile,
   replaceProjectText,
   redoEditorAction,
@@ -75,6 +77,7 @@ import {
   EditorResourceFocusResultSchema,
   EditorResourceSaveResultSchema,
   EditorSceneSaveResultSchema,
+  EditorSceneOpenResultSchema,
   EditorSceneTreeResultSchema,
   EditorScreenshotResultSchema,
   EditorSelectionResultSchema,
@@ -332,19 +335,34 @@ const EditorNodeLookupInputSchema = RuntimeLookupInputSchema.extend({
   properties: z.array(z.string().min(1)).max(100).default([]),
 });
 
+const EditorMutationLookupInputSchema = RuntimeLookupInputSchema.extend({
+  expectedProjectFingerprint: Sha256Schema.optional(),
+  expectedScenePath: z.string().startsWith("res://").endsWith(".tscn"),
+});
+
+const EditorHistoryMutationInputSchema = EditorMutationLookupInputSchema.extend({
+  expectedHistoryVersion: z.number().int().nonnegative(),
+  expectedActionName: z.string().min(1).optional(),
+});
+
+const EditorSceneOpenInputSchema = RuntimeLookupInputSchema.extend({
+  expectedProjectFingerprint: Sha256Schema,
+  scenePath: z.string().startsWith("res://").endsWith(".tscn"),
+});
+
 const EditorPropertiesSchema = z.record(z.string().min(1), z.unknown()).refine(
   (value) => Object.keys(value).length <= 100,
   "properties must contain at most 100 entries",
 );
 
-const EditorNodeCreateInputSchema = RuntimeLookupInputSchema.extend({
+const EditorNodeCreateInputSchema = EditorMutationLookupInputSchema.extend({
   parentPath: z.string().min(1),
   type: z.string().min(1),
   name: z.string().min(1),
   properties: EditorPropertiesSchema.default({}),
 });
 
-const EditorSceneInstantiateInputSchema = RuntimeLookupInputSchema.extend({
+const EditorSceneInstantiateInputSchema = EditorMutationLookupInputSchema.extend({
   parentPath: z.string().min(1),
   scenePath: z.string().startsWith("res://").endsWith(".tscn"),
   name: z.string().min(1).optional(),
@@ -360,7 +378,7 @@ const EditorSceneInheritanceInputSchema = RuntimeLookupInputSchema.extend({
   overwrite: z.boolean().default(false),
 });
 
-const EditorNodeUpdateInputSchema = RuntimeLookupInputSchema.extend({
+const EditorNodeUpdateInputSchema = EditorMutationLookupInputSchema.extend({
   nodePath: z.string().min(1),
   name: z.string().min(1).optional(),
   properties: EditorPropertiesSchema.default({}),
@@ -370,18 +388,18 @@ const EditorNodeUpdateInputSchema = RuntimeLookupInputSchema.extend({
   }
 });
 
-const EditorNodeDeleteInputSchema = RuntimeLookupInputSchema.extend({
+const EditorNodeDeleteInputSchema = EditorMutationLookupInputSchema.extend({
   nodePath: z.string().min(1),
 });
 
-const EditorNodeMoveInputSchema = RuntimeLookupInputSchema.extend({
+const EditorNodeMoveInputSchema = EditorMutationLookupInputSchema.extend({
   nodePath: z.string().min(1),
   newParentPath: z.string().min(1),
   index: z.number().int().min(-1).optional(),
   keepGlobalTransform: z.boolean().default(true),
 });
 
-const EditorResourceCreateInputSchema = RuntimeLookupInputSchema.extend({
+const EditorResourceCreateInputSchema = EditorMutationLookupInputSchema.extend({
   nodePath: z.string().min(1),
   property: z.string().min(1),
   type: z.string().min(1),
@@ -394,7 +412,7 @@ const EditorResourceLookupInputSchema = RuntimeLookupInputSchema.extend({
   properties: z.array(z.string().min(1)).max(100).default([]),
 });
 
-const EditorResourceUpdateInputSchema = RuntimeLookupInputSchema.extend({
+const EditorResourceUpdateInputSchema = EditorMutationLookupInputSchema.extend({
   nodePath: z.string().min(1),
   property: z.string().min(1),
   properties: EditorPropertiesSchema.refine(
@@ -407,11 +425,12 @@ const EditorInstanceLookupInputSchema = RuntimeLookupInputSchema.extend({
   nodePath: z.string().min(1),
 });
 
-const EditorInstanceSetEditableInputSchema = EditorInstanceLookupInputSchema.extend({
+const EditorInstanceSetEditableInputSchema = EditorMutationLookupInputSchema.extend({
+  nodePath: z.string().min(1),
   editable: z.boolean(),
 });
 
-const EditorResourceSaveInputSchema = RuntimeLookupInputSchema.extend({
+const EditorResourceSaveInputSchema = EditorMutationLookupInputSchema.extend({
   nodePath: z.string().min(1),
   property: z.string().min(1),
   path: z.string().startsWith("res://").endsWith(".tres"),
@@ -432,13 +451,97 @@ const EditorScreenshotInputSchema = RuntimeLookupInputSchema.extend({
   viewportIndex: z.number().int().min(0).max(3).default(0),
 });
 
-const EditorSignalConnectInputSchema = RuntimeLookupInputSchema.extend({
+const EditorSignalConnectInputSchema = EditorMutationLookupInputSchema.extend({
   sourcePath: z.string().min(1),
   signal: z.string().min(1),
   targetPath: z.string().min(1),
   method: z.string().min(1),
   flags: z.number().int().min(0).max(15).optional(),
 });
+
+function acceptMissingRequiredGuards<Schema extends StandardSchemaWithJSON>(
+  advertisedSchema: Schema,
+  acceptedSchema: StandardSchemaWithJSON,
+): Schema {
+  const advertised = advertisedSchema["~standard"];
+  const accepted = acceptedSchema["~standard"];
+  const schema: StandardSchemaWithJSON = {
+    "~standard": {
+      version: 1,
+      vendor: "godot-agent-runtime",
+      validate: (value, options) => accepted.validate(value, options),
+      jsonSchema: {
+        input: (options) => advertised.jsonSchema.input(options),
+        output: (options) => advertised.jsonSchema.output(options),
+      },
+    },
+  };
+  return schema as Schema;
+}
+
+const EditorNodeCreateHandlerInputSchema = acceptMissingRequiredGuards(
+  EditorNodeCreateInputSchema,
+  EditorNodeCreateInputSchema.partial({ expectedScenePath: true }),
+);
+const EditorSceneInstantiateHandlerInputSchema = acceptMissingRequiredGuards(
+  EditorSceneInstantiateInputSchema,
+  EditorSceneInstantiateInputSchema.partial({ expectedScenePath: true }),
+);
+const EditorInstanceSetEditableHandlerInputSchema = acceptMissingRequiredGuards(
+  EditorInstanceSetEditableInputSchema,
+  EditorInstanceSetEditableInputSchema.partial({ expectedScenePath: true }),
+);
+const EditorNodeUpdateHandlerInputSchema = acceptMissingRequiredGuards(
+  EditorNodeUpdateInputSchema,
+  EditorMutationLookupInputSchema.partial({ expectedScenePath: true }).extend({
+    nodePath: z.string().min(1),
+    name: z.string().min(1).optional(),
+    properties: EditorPropertiesSchema.default({}),
+  }).superRefine((value, context) => {
+    if (value.name === undefined && Object.keys(value.properties).length === 0) {
+      context.addIssue({ code: "custom", message: "update requires name or properties" });
+    }
+  }),
+);
+const EditorNodeDeleteHandlerInputSchema = acceptMissingRequiredGuards(
+  EditorNodeDeleteInputSchema,
+  EditorNodeDeleteInputSchema.partial({ expectedScenePath: true }),
+);
+const EditorNodeMoveHandlerInputSchema = acceptMissingRequiredGuards(
+  EditorNodeMoveInputSchema,
+  EditorNodeMoveInputSchema.partial({ expectedScenePath: true }),
+);
+const EditorResourceCreateHandlerInputSchema = acceptMissingRequiredGuards(
+  EditorResourceCreateInputSchema,
+  EditorResourceCreateInputSchema.partial({ expectedScenePath: true }),
+);
+const EditorResourceUpdateHandlerInputSchema = acceptMissingRequiredGuards(
+  EditorResourceUpdateInputSchema,
+  EditorResourceUpdateInputSchema.partial({ expectedScenePath: true }),
+);
+const EditorResourceSaveHandlerInputSchema = acceptMissingRequiredGuards(
+  EditorResourceSaveInputSchema,
+  EditorResourceSaveInputSchema.partial({ expectedScenePath: true }),
+);
+const EditorSignalConnectHandlerInputSchema = acceptMissingRequiredGuards(
+  EditorSignalConnectInputSchema,
+  EditorSignalConnectInputSchema.partial({ expectedScenePath: true }),
+);
+const EditorHistoryMutationHandlerInputSchema = acceptMissingRequiredGuards(
+  EditorHistoryMutationInputSchema,
+  EditorHistoryMutationInputSchema.partial({
+    expectedScenePath: true,
+    expectedHistoryVersion: true,
+  }),
+);
+const EditorSceneSaveInputSchema = EditorHistoryMutationInputSchema.omit({ expectedActionName: true });
+const EditorSceneSaveHandlerInputSchema = acceptMissingRequiredGuards(
+  EditorSceneSaveInputSchema,
+  EditorSceneSaveInputSchema.partial({
+    expectedScenePath: true,
+    expectedHistoryVersion: true,
+  }),
+);
 
 const FileReadInputSchema = z.object({
   projectPath: z.string().min(1),
@@ -1238,6 +1341,27 @@ export function createMcpServer(): McpServer {
   );
 
   server.registerTool(
+    "godot_editor_scene_open",
+    {
+      title: "Open an editor scene",
+      description: "Explicitly opens one project-local .tscn after validating project identity, then returns the active scene's native history version.",
+      inputSchema: EditorSceneOpenInputSchema,
+      outputSchema: EditorSceneOpenResultSchema,
+      annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, scenePath }) =>
+      await handle(async () =>
+        await openEditorScene({
+          projectPath,
+          runId,
+          expectedProjectFingerprint,
+          scenePath,
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        }),
+      ),
+  );
+
+  server.registerTool(
     "godot_editor_scene_tree",
     {
       title: "Read the edited scene tree",
@@ -1318,15 +1442,17 @@ export function createMcpServer(): McpServer {
     {
       title: "Create an edited scene node",
       description: "Creates an instantiable Godot Node under parentPath, sets owner to the edited root, applies validated properties, and records one native Undo/Redo action.",
-      inputSchema: EditorNodeCreateInputSchema,
+      inputSchema: EditorNodeCreateHandlerInputSchema,
       outputSchema: EditorMutationResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs, parentPath, type, name, properties }) =>
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, parentPath, type, name, properties }) =>
       await handle(async () =>
         await createEditorNode({
           projectPath,
           runId,
+          expectedProjectFingerprint,
+          expectedScenePath,
           parentPath,
           type,
           name,
@@ -1341,15 +1467,17 @@ export function createMcpServer(): McpServer {
     {
       title: "Instantiate a PackedScene",
       description: "Loads a project-local .tscn and adds an editable scene instance below a parent as one native Undo/Redo action.",
-      inputSchema: EditorSceneInstantiateInputSchema,
+      inputSchema: EditorSceneInstantiateHandlerInputSchema,
       outputSchema: EditorMutationResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs, parentPath, scenePath, name, properties }) =>
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, parentPath, scenePath, name, properties }) =>
       await handle(async () =>
         await instantiateEditorScene({
           projectPath,
           runId,
+          expectedProjectFingerprint,
+          expectedScenePath,
           parentPath,
           scenePath,
           properties,
@@ -1409,15 +1537,17 @@ export function createMcpServer(): McpServer {
     {
       title: "Set PackedScene editable children",
       description: "Enables or disables editable children through Node.set_editable_instance as one native Godot Undo/Redo action.",
-      inputSchema: EditorInstanceSetEditableInputSchema,
+      inputSchema: EditorInstanceSetEditableHandlerInputSchema,
       outputSchema: EditorInstanceMutationResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs, nodePath, editable }) =>
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, nodePath, editable }) =>
       await handle(async () =>
         await setEditorInstanceEditable({
           projectPath,
           runId,
+          expectedProjectFingerprint,
+          expectedScenePath,
           nodePath,
           editable,
           ...(timeoutMs === undefined ? {} : { timeoutMs }),
@@ -1430,15 +1560,17 @@ export function createMcpServer(): McpServer {
     {
       title: "Update an edited scene node",
       description: "Renames a node and/or applies validated Godot properties as one native Undo/Redo action. Structural owner and scene path properties are rejected.",
-      inputSchema: EditorNodeUpdateInputSchema,
+      inputSchema: EditorNodeUpdateHandlerInputSchema,
       outputSchema: EditorMutationResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs, nodePath, name, properties }) =>
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, nodePath, name, properties }) =>
       await handle(async () =>
         await updateEditorNode({
           projectPath,
           runId,
+          expectedProjectFingerprint,
+          expectedScenePath,
           nodePath,
           properties,
           ...(name === undefined ? {} : { name }),
@@ -1452,15 +1584,17 @@ export function createMcpServer(): McpServer {
     {
       title: "Delete an edited scene node",
       description: "Removes a non-root node while retaining it for native Undo/Redo restoration.",
-      inputSchema: EditorNodeDeleteInputSchema,
+      inputSchema: EditorNodeDeleteHandlerInputSchema,
       outputSchema: EditorMutationResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs, nodePath }) =>
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, nodePath }) =>
       await handle(async () =>
         await deleteEditorNode({
           projectPath,
           runId,
+          expectedProjectFingerprint,
+          expectedScenePath,
           nodePath,
           ...(timeoutMs === undefined ? {} : { timeoutMs }),
         }),
@@ -1472,15 +1606,17 @@ export function createMcpServer(): McpServer {
     {
       title: "Move an edited scene node",
       description: "Reparents and/or reorders a non-root node as one native Undo/Redo action, rejecting cycles and name conflicts.",
-      inputSchema: EditorNodeMoveInputSchema,
+      inputSchema: EditorNodeMoveHandlerInputSchema,
       outputSchema: EditorMutationResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs, nodePath, newParentPath, index, keepGlobalTransform }) =>
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, nodePath, newParentPath, index, keepGlobalTransform }) =>
       await handle(async () =>
         await moveEditorNode({
           projectPath,
           runId,
+          expectedProjectFingerprint,
+          expectedScenePath,
           nodePath,
           newParentPath,
           keepGlobalTransform,
@@ -1495,15 +1631,17 @@ export function createMcpServer(): McpServer {
     {
       title: "Create an inline Godot resource",
       description: "Creates a validated Resource, applies tagged Variant properties, and assigns it to one edited-scene node property as a native Undo/Redo action.",
-      inputSchema: EditorResourceCreateInputSchema,
+      inputSchema: EditorResourceCreateHandlerInputSchema,
       outputSchema: EditorResourceResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs, nodePath, property, type, properties }) =>
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, nodePath, property, type, properties }) =>
       await handle(async () =>
         await createEditorResource({
           projectPath,
           runId,
+          expectedProjectFingerprint,
+          expectedScenePath,
           nodePath,
           property,
           type,
@@ -1540,15 +1678,17 @@ export function createMcpServer(): McpServer {
     {
       title: "Update a Godot resource",
       description: "Applies validated Resource subproperties as one native Godot Undo/Redo action; it does not invoke methods or save an external file.",
-      inputSchema: EditorResourceUpdateInputSchema,
+      inputSchema: EditorResourceUpdateHandlerInputSchema,
       outputSchema: EditorResourceResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs, nodePath, property, properties }) =>
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, nodePath, property, properties }) =>
       await handle(async () =>
         await updateEditorResource({
           projectPath,
           runId,
+          expectedProjectFingerprint,
+          expectedScenePath,
           nodePath,
           property,
           properties,
@@ -1562,15 +1702,17 @@ export function createMcpServer(): McpServer {
     {
       title: "Save an external Godot resource",
       description: "Saves a node's Resource property as a project-local .tres. Overwrite is rejected by default; the filesystem side effect is not undoable.",
-      inputSchema: EditorResourceSaveInputSchema,
+      inputSchema: EditorResourceSaveHandlerInputSchema,
       outputSchema: EditorResourceSaveResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs, nodePath, property, path, overwrite }) =>
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, nodePath, property, path, overwrite }) =>
       await handle(async () =>
         await saveEditorResource({
           projectPath,
           runId,
+          expectedProjectFingerprint,
+          expectedScenePath,
           nodePath,
           property,
           path,
@@ -1605,15 +1747,17 @@ export function createMcpServer(): McpServer {
     {
       title: "Connect an edited scene signal",
       description: "Creates a persistent signal-to-method connection between edited-scene nodes as one native Undo/Redo action.",
-      inputSchema: EditorSignalConnectInputSchema,
+      inputSchema: EditorSignalConnectHandlerInputSchema,
       outputSchema: EditorSignalConnectionResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs, sourcePath, signal, targetPath, method, flags }) =>
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, sourcePath, signal, targetPath, method, flags }) =>
       await handle(async () =>
         await connectEditorSignal({
           projectPath,
           runId,
+          expectedProjectFingerprint,
+          expectedScenePath,
           sourcePath,
           signal,
           targetPath,
@@ -1629,15 +1773,18 @@ export function createMcpServer(): McpServer {
     {
       title: "Save the edited scene",
       description: "Saves the active edited scene through EditorInterface and returns the res:// path and Godot error code.",
-      inputSchema: RuntimeLookupInputSchema,
+      inputSchema: EditorSceneSaveHandlerInputSchema,
       outputSchema: EditorSceneSaveResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs }) =>
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, expectedHistoryVersion }) =>
       await handle(async () =>
         await saveEditorScene({
           projectPath,
           runId,
+          expectedProjectFingerprint,
+          expectedScenePath,
+          expectedHistoryVersion,
           ...(timeoutMs === undefined ? {} : { timeoutMs }),
         }),
       ),
@@ -1648,15 +1795,19 @@ export function createMcpServer(): McpServer {
     {
       title: "Undo an edited scene action",
       description: "Undoes the latest action in the active scene's native Godot Undo/Redo history.",
-      inputSchema: RuntimeLookupInputSchema,
+      inputSchema: EditorHistoryMutationHandlerInputSchema,
       outputSchema: EditorHistoryResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs }) =>
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, expectedHistoryVersion, expectedActionName }) =>
       await handle(async () =>
         await undoEditorAction({
           projectPath,
           runId,
+          expectedProjectFingerprint,
+          expectedScenePath,
+          expectedHistoryVersion,
+          ...(expectedActionName === undefined ? {} : { expectedActionName }),
           ...(timeoutMs === undefined ? {} : { timeoutMs }),
         }),
       ),
@@ -1667,15 +1818,19 @@ export function createMcpServer(): McpServer {
     {
       title: "Redo an edited scene action",
       description: "Redoes the next action in the active scene's native Godot Undo/Redo history.",
-      inputSchema: RuntimeLookupInputSchema,
+      inputSchema: EditorHistoryMutationHandlerInputSchema,
       outputSchema: EditorHistoryResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs }) =>
+    async ({ projectPath, runId, timeoutMs, expectedProjectFingerprint, expectedScenePath, expectedHistoryVersion, expectedActionName }) =>
       await handle(async () =>
         await redoEditorAction({
           projectPath,
           runId,
+          expectedProjectFingerprint,
+          expectedScenePath,
+          expectedHistoryVersion,
+          ...(expectedActionName === undefined ? {} : { expectedActionName }),
           ...(timeoutMs === undefined ? {} : { timeoutMs }),
         }),
       ),

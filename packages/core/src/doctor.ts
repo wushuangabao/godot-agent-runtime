@@ -4,7 +4,9 @@ import { createServer } from "node:net";
 import { resolve } from "node:path";
 
 import {
+  EDITOR_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
+  RUNTIME_PROTOCOL_VERSION,
   type DoctorResult,
 } from "@godot-agent-runtime/protocol";
 
@@ -162,6 +164,10 @@ export async function runDoctor(configPath?: string): Promise<DoctorResult> {
   return {
     ok: checks.every((check) => check.status !== "fail"),
     protocolVersion: PROTOCOL_VERSION,
+    protocolVersions: {
+      editor: EDITOR_PROTOCOL_VERSION,
+      runtime: RUNTIME_PROTOCOL_VERSION,
+    },
     checks,
   };
 }

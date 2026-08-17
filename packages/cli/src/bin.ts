@@ -17,6 +17,7 @@ import {
   findRuntimeUi,
   focusEditorResource,
   getEditorInstance,
+  getEditorInfo,
   getEditorNode,
   getEditorResource,
   getEditorSceneTree,
@@ -36,6 +37,7 @@ import {
   launchEditor,
   launchProject,
   moveEditorNode,
+  openEditorScene,
   readProjectFile,
   redoEditorAction,
   replaceProjectText,
@@ -54,6 +56,7 @@ import {
   waitForRuntime,
   writeProjectFile,
   type RuntimeInputStep,
+  RuntimeFailure,
 } from "@godot-agent-runtime/core";
 import { parseFiniteNumber, parseFiniteVector3, parseInteger } from "./numeric.js";
 
@@ -118,6 +121,50 @@ function parseBoolean(source: string | undefined, optionName: string): boolean |
   throw new Error(`${optionName} must be true or false.`);
 }
 
+function editorMutationGuard(args: string[]): {
+  expectedProjectFingerprint?: string;
+  expectedScenePath: string;
+} {
+  const expectedScenePath = option(args, "--expected-scene");
+  if (expectedScenePath === undefined) {
+    throw new RuntimeFailure({
+      code: "EDITOR_SCENE_PATH_REQUIRED",
+      stage: "validation",
+      message: "--expected-scene is required for persistent editor mutations.",
+      recovery: ["Run editor-status and pass its scene as --expected-scene."],
+    });
+  }
+  const expectedProjectFingerprint = sha256Option(args, "--expected-project-fingerprint");
+  return {
+    expectedScenePath,
+    ...(expectedProjectFingerprint === undefined ? {} : { expectedProjectFingerprint }),
+  };
+}
+
+function editorHistoryGuard(args: string[]): {
+  expectedProjectFingerprint?: string;
+  expectedScenePath: string;
+  expectedHistoryVersion: number;
+  expectedActionName?: string;
+} {
+  const mutation = editorMutationGuard(args);
+  const source = option(args, "--expected-history-version");
+  if (source === undefined) {
+    throw new RuntimeFailure({
+      code: "EDITOR_HISTORY_VERSION_REQUIRED",
+      stage: "validation",
+      message: "--expected-history-version is required for editor save, undo, and redo.",
+      recovery: ["Run editor-status or use the previous mutation receipt's historyVersion."],
+    });
+  }
+  const expectedActionName = option(args, "--expected-action");
+  return {
+    ...mutation,
+    expectedHistoryVersion: parseInteger(source, "--expected-history-version", { min: 0 }),
+    ...(expectedActionName === undefined ? {} : { expectedActionName }),
+  };
+}
+
 function printHelp(): void {
   process.stdout.write(`godot-agent-runtime commands:\n\n`);
   process.stdout.write(`  doctor [--config PATH]\n`);
@@ -136,6 +183,8 @@ function printHelp(): void {
   process.stdout.write(`  configure <codex|deepseek-harness|claude-code> [--project PATH] [--server PATH]\n`);
   process.stdout.write(`  addon-install PROJECT_PATH\n`);
   process.stdout.write(`  editor-launch PROJECT_PATH [--config PATH] [--timeout MS]\n`);
+  process.stdout.write(`  editor-status PROJECT_PATH RUN_ID\n`);
+  process.stdout.write(`  editor-scene-open PROJECT_PATH RUN_ID --project-fingerprint HASH --scene RES_PATH\n`);
   process.stdout.write(`  editor-tree PROJECT_PATH RUN_ID\n`);
   process.stdout.write(`  editor-node-get PROJECT_PATH RUN_ID --node NODE_PATH [--properties JSON_ARRAY]\n`);
   process.stdout.write(`  editor-node-create PROJECT_PATH RUN_ID --parent NODE_PATH --type TYPE --name NAME [--properties JSON_OBJECT]\n`);
@@ -154,9 +203,10 @@ function printHelp(): void {
   process.stdout.write(`  editor-selection-get PROJECT_PATH RUN_ID\n`);
   process.stdout.write(`  editor-selection-set PROJECT_PATH RUN_ID --paths JSON_ARRAY [--focus true|false]\n`);
   process.stdout.write(`  editor-signal-connect PROJECT_PATH RUN_ID --source NODE_PATH --signal NAME --target NODE_PATH --method NAME [--flags N]\n`);
-  process.stdout.write(`  editor-save PROJECT_PATH RUN_ID\n`);
-  process.stdout.write(`  editor-undo PROJECT_PATH RUN_ID\n`);
-  process.stdout.write(`  editor-redo PROJECT_PATH RUN_ID\n`);
+  process.stdout.write(`  persistent editor mutations also require --expected-scene RES_PATH [--expected-project-fingerprint HASH]\n`);
+  process.stdout.write(`  editor-save PROJECT_PATH RUN_ID --expected-scene RES_PATH --expected-history-version N\n`);
+  process.stdout.write(`  editor-undo PROJECT_PATH RUN_ID --expected-scene RES_PATH --expected-history-version N [--expected-action NAME]\n`);
+  process.stdout.write(`  editor-redo PROJECT_PATH RUN_ID --expected-scene RES_PATH --expected-history-version N [--expected-action NAME]\n`);
   process.stdout.write(`  editor-screenshot PROJECT_PATH RUN_ID [--viewport 2d|3d] [--viewport-index 0..3]\n`);
   process.stdout.write(`  runtime-ui PROJECT_PATH RUN_ID [--text TEXT] [--type TYPE] [--path NODE_PATH]\n`);
   process.stdout.write(`  runtime-tree PROJECT_PATH RUN_ID [--max-depth N] [--max-nodes N]\n`);
@@ -375,6 +425,25 @@ async function main(): Promise<void> {
         }),
       );
       return;
+    case "editor-status":
+      if (!values[0] || !values[1]) throw new Error("editor-status requires PROJECT_PATH and RUN_ID.");
+      print(await getEditorInfo({ projectPath: values[0], runId: values[1] }));
+      return;
+    case "editor-scene-open": {
+      if (!values[0] || !values[1]) throw new Error("editor-scene-open requires PROJECT_PATH and RUN_ID.");
+      const expectedProjectFingerprint = sha256Option(args, "--project-fingerprint");
+      const scenePath = option(args, "--scene");
+      if (expectedProjectFingerprint === undefined || scenePath === undefined) {
+        throw new Error("editor-scene-open requires --project-fingerprint and --scene.");
+      }
+      print(await openEditorScene({
+        projectPath: values[0],
+        runId: values[1],
+        expectedProjectFingerprint,
+        scenePath,
+      }));
+      return;
+    }
     case "editor-tree":
       if (!values[0] || !values[1]) throw new Error("editor-tree requires PROJECT_PATH and RUN_ID.");
       print(await getEditorSceneTree({ projectPath: values[0], runId: values[1] }));
@@ -404,6 +473,7 @@ async function main(): Promise<void> {
       print(await createEditorNode({
         projectPath: values[0],
         runId: values[1],
+        ...editorMutationGuard(args),
         parentPath,
         type,
         name,
@@ -423,6 +493,7 @@ async function main(): Promise<void> {
       print(await instantiateEditorScene({
         projectPath: values[0],
         runId: values[1],
+        ...editorMutationGuard(args),
         parentPath,
         scenePath,
         ...(name === undefined ? {} : { name }),
@@ -467,7 +538,13 @@ async function main(): Promise<void> {
       if (nodePath === undefined || editable === undefined) {
         throw new Error("editor-instance-set-editable requires --node and --editable.");
       }
-      print(await setEditorInstanceEditable({ projectPath: values[0], runId: values[1], nodePath, editable }));
+      print(await setEditorInstanceEditable({
+        projectPath: values[0],
+        runId: values[1],
+        ...editorMutationGuard(args),
+        nodePath,
+        editable,
+      }));
       return;
     }
     case "editor-node-update": {
@@ -481,6 +558,7 @@ async function main(): Promise<void> {
       print(await updateEditorNode({
         projectPath: values[0],
         runId: values[1],
+        ...editorMutationGuard(args),
         nodePath,
         ...(name === undefined ? {} : { name }),
         ...(properties === undefined ? {} : { properties }),
@@ -491,7 +569,12 @@ async function main(): Promise<void> {
       if (!values[0] || !values[1]) throw new Error("editor-node-delete requires PROJECT_PATH and RUN_ID.");
       const nodePath = option(args, "--node");
       if (nodePath === undefined) throw new Error("editor-node-delete requires --node NODE_PATH.");
-      print(await deleteEditorNode({ projectPath: values[0], runId: values[1], nodePath }));
+      print(await deleteEditorNode({
+        projectPath: values[0],
+        runId: values[1],
+        ...editorMutationGuard(args),
+        nodePath,
+      }));
       return;
     }
     case "editor-node-move": {
@@ -506,6 +589,7 @@ async function main(): Promise<void> {
       print(await moveEditorNode({
         projectPath: values[0],
         runId: values[1],
+        ...editorMutationGuard(args),
         nodePath,
         newParentPath,
         ...(indexSource === undefined ? {} : { index: parseInteger(indexSource, "--index", { min: -1 }) }),
@@ -525,6 +609,7 @@ async function main(): Promise<void> {
       print(await createEditorResource({
         projectPath: values[0],
         runId: values[1],
+        ...editorMutationGuard(args),
         nodePath,
         property,
         type,
@@ -554,7 +639,14 @@ async function main(): Promise<void> {
       if (nodePath === undefined || property === undefined || properties === undefined) {
         throw new Error("editor-resource-update requires --node, --property, and --properties.");
       }
-      print(await updateEditorResource({ projectPath: values[0], runId: values[1], nodePath, property, properties }));
+      print(await updateEditorResource({
+        projectPath: values[0],
+        runId: values[1],
+        ...editorMutationGuard(args),
+        nodePath,
+        property,
+        properties,
+      }));
       return;
     }
     case "editor-resource-save": {
@@ -569,6 +661,7 @@ async function main(): Promise<void> {
       print(await saveEditorResource({
         projectPath: values[0],
         runId: values[1],
+        ...editorMutationGuard(args),
         nodePath,
         property,
         path,
@@ -613,6 +706,7 @@ async function main(): Promise<void> {
       print(await connectEditorSignal({
         projectPath: values[0],
         runId: values[1],
+        ...editorMutationGuard(args),
         sourcePath,
         signal,
         targetPath,
@@ -623,15 +717,27 @@ async function main(): Promise<void> {
     }
     case "editor-save":
       if (!values[0] || !values[1]) throw new Error("editor-save requires PROJECT_PATH and RUN_ID.");
-      print(await saveEditorScene({ projectPath: values[0], runId: values[1] }));
+      print(await saveEditorScene({
+        projectPath: values[0],
+        runId: values[1],
+        ...editorHistoryGuard(args),
+      }));
       return;
     case "editor-undo":
       if (!values[0] || !values[1]) throw new Error("editor-undo requires PROJECT_PATH and RUN_ID.");
-      print(await undoEditorAction({ projectPath: values[0], runId: values[1] }));
+      print(await undoEditorAction({
+        projectPath: values[0],
+        runId: values[1],
+        ...editorHistoryGuard(args),
+      }));
       return;
     case "editor-redo":
       if (!values[0] || !values[1]) throw new Error("editor-redo requires PROJECT_PATH and RUN_ID.");
-      print(await redoEditorAction({ projectPath: values[0], runId: values[1] }));
+      print(await redoEditorAction({
+        projectPath: values[0],
+        runId: values[1],
+        ...editorHistoryGuard(args),
+      }));
       return;
     case "editor-screenshot": {
       if (!values[0] || !values[1]) throw new Error("editor-screenshot requires PROJECT_PATH and RUN_ID.");

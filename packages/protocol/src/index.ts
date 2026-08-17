@@ -1,6 +1,9 @@
 import * as z from "zod/v4";
 
-export const PROTOCOL_VERSION = "0.3.0";
+export const EDITOR_PROTOCOL_VERSION = "0.4.0";
+export const RUNTIME_PROTOCOL_VERSION = "0.3.0";
+/** @deprecated Use EDITOR_PROTOCOL_VERSION or RUNTIME_PROTOCOL_VERSION explicitly. */
+export const PROTOCOL_VERSION = RUNTIME_PROTOCOL_VERSION;
 
 export const ErrorStageSchema = z.enum([
   "configuration",
@@ -35,6 +38,10 @@ export const DoctorCheckSchema = z.object({
 export const DoctorResultSchema = z.object({
   ok: z.boolean(),
   protocolVersion: z.literal(PROTOCOL_VERSION),
+  protocolVersions: z.object({
+    editor: z.literal(EDITOR_PROTOCOL_VERSION),
+    runtime: z.literal(RUNTIME_PROTOCOL_VERSION),
+  }),
   checks: z.array(DoctorCheckSchema),
 });
 
@@ -218,7 +225,7 @@ export type SafeTextReplaceResult = z.infer<typeof SafeTextReplaceResultSchema>;
 export const RuntimeBridgeInfoSchema = z.object({
   ok: z.literal(true),
   runId: z.uuid(),
-  protocolVersion: z.literal(PROTOCOL_VERSION),
+  protocolVersion: z.literal(RUNTIME_PROTOCOL_VERSION),
   engineVersion: z.string().min(1),
   scene: z.string().nullable(),
   capabilities: z.array(z.enum(["screenshot", "ui", "scene_tree", "node", "observe", "simulate", "spatial_3d", "input", "input_sequence", "assert", "wait", "control"])),
@@ -472,9 +479,10 @@ export const AddonInstallResultSchema = z.object({
 export const EditorBridgeInfoSchema = z.object({
   ok: z.literal(true),
   runId: z.uuid(),
-  protocolVersion: z.literal(PROTOCOL_VERSION),
+  protocolVersion: z.literal(EDITOR_PROTOCOL_VERSION),
   engineVersion: z.string().min(1),
   scene: z.string().nullable(),
+  historyVersion: z.number().int().nonnegative().nullable(),
   capabilities: z.array(
     z.enum([
       "scene_tree",
@@ -490,12 +498,24 @@ export const EditorBridgeInfoSchema = z.object({
       "resource_focus",
       "signal_connect",
       "scene_save",
+      "scene_open",
       "undo_redo",
     ]),
   ),
 });
 
 export type EditorBridgeInfo = z.infer<typeof EditorBridgeInfoSchema>;
+
+export const EditorSceneOpenResultSchema = z.object({
+  ok: z.literal(true),
+  runId: z.uuid(),
+  opened: z.literal(true),
+  previousScene: z.string().startsWith("res://").nullable(),
+  scene: z.string().startsWith("res://").endsWith(".tscn"),
+  historyVersion: z.number().int().nonnegative(),
+});
+
+export type EditorSceneOpenResult = z.infer<typeof EditorSceneOpenResultSchema>;
 
 export const ProjectContextSchema = z.object({
   ok: z.literal(true),
@@ -583,6 +603,7 @@ export const EditorMutationResultSchema = z.object({
   scenePath: z.string().startsWith("res://").optional(),
   changedProperties: z.array(z.string()),
   undoable: z.literal(true),
+  historyVersion: z.number().int().nonnegative(),
 });
 
 export type EditorMutationResult = z.infer<typeof EditorMutationResultSchema>;
@@ -613,6 +634,7 @@ export const EditorSignalConnectionResultSchema = z.object({
   method: z.string().min(1),
   flags: z.number().int().nonnegative(),
   undoable: z.literal(true),
+  historyVersion: z.number().int().nonnegative(),
 });
 
 export type EditorSignalConnectionResult = z.infer<
@@ -625,6 +647,7 @@ export const EditorSceneSaveResultSchema = z.object({
   saved: z.literal(true),
   scene: z.string().startsWith("res://"),
   error: z.literal(0),
+  historyVersion: z.number().int().nonnegative(),
 });
 
 export type EditorSceneSaveResult = z.infer<typeof EditorSceneSaveResultSchema>;
@@ -637,6 +660,7 @@ export const EditorHistoryResultSchema = z.object({
   actionName: z.string(),
   beforeVersion: z.number().int().nonnegative(),
   afterVersion: z.number().int().nonnegative(),
+  historyVersion: z.number().int().nonnegative(),
 });
 
 export type EditorHistoryResult = z.infer<typeof EditorHistoryResultSchema>;
@@ -657,6 +681,7 @@ export const EditorResourceResultSchema = z.object({
   resource: EditorResourceSchema,
   changedProperties: z.array(z.string()),
   undoable: z.literal(true),
+  historyVersion: z.number().int().nonnegative(),
 });
 
 export type EditorResourceResult = z.infer<typeof EditorResourceResultSchema>;
@@ -685,6 +710,7 @@ export const EditorInstanceMutationResultSchema = EditorInstanceResultSchema.ext
   action: z.literal("instance_set_editable"),
   previousEditable: z.boolean(),
   undoable: z.literal(true),
+  historyVersion: z.number().int().nonnegative(),
 });
 
 export type EditorInstanceMutationResult = z.infer<typeof EditorInstanceMutationResultSchema>;
@@ -713,6 +739,7 @@ export const EditorResourceSaveResultSchema = z.object({
   undoable: z.literal(false),
   referenceUndoable: z.literal(true),
   fileUndoable: z.literal(false),
+  historyVersion: z.number().int().nonnegative(),
 });
 
 export type EditorResourceSaveResult = z.infer<typeof EditorResourceSaveResultSchema>;

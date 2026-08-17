@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { cp, mkdtemp, readFile, rm } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -20,6 +20,7 @@ import {
   getEditorSceneTree,
   getEditorSelection,
   getEditorResource,
+  getProjectIdentity,
   assertRuntime,
   injectRuntimeInput,
   installGodotAddon,
@@ -27,6 +28,7 @@ import {
   launchEditor,
   launchProject,
   moveEditorNode,
+  openEditorScene,
   redoEditorAction,
   saveEditorScene,
   saveEditorResource,
@@ -43,6 +45,232 @@ const hasLocalConfig = existsSync(configPath);
 
 describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
   it(
+    "guards the active scene and native history while explicitly opening scenes",
+    async () => {
+      const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-editor-guards-"));
+      await cp(resolve("examples", "control-ui"), projectPath, {
+        recursive: true,
+        filter: (source) => !source.includes(`${resolve("examples", "control-ui", ".godot")}`),
+      });
+      let editorRunId: string | null = null;
+      try {
+        await installGodotAddon(projectPath);
+        const identity = await getProjectIdentity(projectPath);
+        const launch = await launchEditor({ projectPath, configPath, timeoutMs: 30_000 });
+        editorRunId = launch.runId;
+
+        const initial = await getEditorInfo({ projectPath, runId: editorRunId });
+        expect(initial).toMatchObject({
+          protocolVersion: "0.4.0",
+          scene: "res://main.tscn",
+          historyVersion: expect.any(Number),
+        });
+        expect(initial.historyVersion).toBeGreaterThanOrEqual(0);
+
+        await expect(createEditorNode({
+          projectPath,
+          runId: editorRunId,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedScenePath: "res://not-open.tscn",
+          parentPath: "/root/Main",
+          type: "Label",
+          name: "WrongSceneProbe",
+          properties: {},
+        })).rejects.toMatchObject({ payload: { code: "EDITOR_SCENE_MISMATCH" } });
+        await expect(createEditorNode({
+          projectPath,
+          runId: editorRunId,
+          parentPath: "/root/Main",
+          type: "Label",
+          name: "MissingGuardProbe",
+          properties: {},
+        } as Parameters<typeof createEditorNode>[0])).rejects.toMatchObject({
+          payload: {
+            code: "EDITOR_SCENE_PATH_REQUIRED",
+            recovery: expect.arrayContaining([expect.any(String)]),
+          },
+        });
+        await expect(createEditorNode({
+          projectPath,
+          runId: editorRunId,
+          expectedProjectFingerprint: "0".repeat(64),
+          expectedScenePath: "res://main.tscn",
+          parentPath: "/root/Main",
+          type: "Label",
+          name: "WrongProjectProbe",
+          properties: {},
+        })).rejects.toMatchObject({ payload: { code: "PROJECT_IDENTITY_MISMATCH" } });
+        await expect(getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/WrongSceneProbe",
+        })).rejects.toMatchObject({ payload: { code: "EDITOR_NODE_NOT_FOUND" } });
+
+        const mainAction = await createEditorNode({
+          projectPath,
+          runId: editorRunId,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedScenePath: "res://main.tscn",
+          parentPath: "/root/Main",
+          type: "Label",
+          name: "MainHistoryProbe",
+          properties: { text: "main history" },
+        });
+        expect(mainAction.historyVersion).toBeGreaterThan(initial.historyVersion!);
+        expect((await getEditorInfo({ projectPath, runId: editorRunId })).historyVersion)
+          .toBe(mainAction.historyVersion);
+
+        const mainBefore = await readFile(resolve(projectPath, "main.tscn"), "utf8");
+        const badgeBefore = await readFile(resolve(projectPath, "badge.tscn"), "utf8");
+        const opened = await openEditorScene({
+          projectPath,
+          runId: editorRunId,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          scenePath: "res://badge.tscn",
+        });
+        expect(opened).toMatchObject({
+          opened: true,
+          previousScene: "res://main.tscn",
+          scene: "res://badge.tscn",
+          historyVersion: expect.any(Number),
+        });
+        expect((await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Badge",
+          properties: ["text"],
+        })).node.properties.text).toBe("Agent Badge");
+
+        const staleMainGuard = {
+          projectPath,
+          runId: editorRunId,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedScenePath: "res://main.tscn",
+          expectedHistoryVersion: mainAction.historyVersion,
+        };
+        await expect(saveEditorScene(staleMainGuard)).rejects.toMatchObject({
+          payload: { code: "EDITOR_SCENE_MISMATCH" },
+        });
+        await expect(undoEditorAction(staleMainGuard)).rejects.toMatchObject({
+          payload: { code: "EDITOR_SCENE_MISMATCH" },
+        });
+        await expect(redoEditorAction(staleMainGuard)).rejects.toMatchObject({
+          payload: { code: "EDITOR_SCENE_MISMATCH" },
+        });
+        expect(await readFile(resolve(projectPath, "main.tscn"), "utf8")).toBe(mainBefore);
+        expect(await readFile(resolve(projectPath, "badge.tscn"), "utf8")).toBe(badgeBefore);
+
+        const reopenedMain = await openEditorScene({
+          projectPath,
+          runId: editorRunId,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          scenePath: "res://main.tscn",
+        });
+        expect((await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/MainHistoryProbe",
+        })).node.name).toBe("MainHistoryProbe");
+        const interveningAction = await createEditorNode({
+          projectPath,
+          runId: editorRunId,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedScenePath: "res://main.tscn",
+          parentPath: "/root/Main",
+          type: "Label",
+          name: "InterveningHistoryProbe",
+          properties: {},
+        });
+        expect(interveningAction.historyVersion).toBeGreaterThan(reopenedMain.historyVersion);
+        await expect(saveEditorScene({
+          projectPath,
+          runId: editorRunId,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedScenePath: "res://main.tscn",
+        } as Parameters<typeof saveEditorScene>[0])).rejects.toMatchObject({
+          payload: {
+            code: "EDITOR_HISTORY_VERSION_REQUIRED",
+            recovery: expect.arrayContaining([expect.any(String)]),
+          },
+        });
+        await expect(undoEditorAction({
+          projectPath,
+          runId: editorRunId,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedScenePath: "res://main.tscn",
+          expectedHistoryVersion: reopenedMain.historyVersion,
+        })).rejects.toMatchObject({ payload: { code: "EDITOR_HISTORY_CONFLICT" } });
+        expect((await getEditorNode({
+          projectPath,
+          runId: editorRunId,
+          nodePath: "/root/Main/InterveningHistoryProbe",
+        })).node.name).toBe("InterveningHistoryProbe");
+        const guardedUndo = await undoEditorAction({
+          projectPath,
+          runId: editorRunId,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedScenePath: "res://main.tscn",
+          expectedHistoryVersion: interveningAction.historyVersion,
+          expectedActionName: "Agent: create InterveningHistoryProbe",
+        });
+        expect(guardedUndo.historyVersion).toBe(guardedUndo.afterVersion);
+        const guardedRedo = await redoEditorAction({
+          projectPath,
+          runId: editorRunId,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedScenePath: "res://main.tscn",
+          expectedHistoryVersion: guardedUndo.historyVersion,
+          expectedActionName: "Agent: create InterveningHistoryProbe",
+        });
+        expect(guardedRedo).toMatchObject({
+          action: "redo",
+          actionName: "Agent: create InterveningHistoryProbe",
+          historyVersion: guardedRedo.afterVersion,
+        });
+      } finally {
+        if (editorRunId !== null) {
+          await stopManagedRun({ projectPath, runId: editorRunId, timeoutMs: 15_000 });
+        }
+        await rm(projectPath, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "reports a null history version when no edited scene is open",
+    async () => {
+      const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-editor-empty-"));
+      await cp(resolve("examples", "control-ui"), projectPath, {
+        recursive: true,
+        filter: (source) => !source.includes(`${resolve("examples", "control-ui", ".godot")}`),
+      });
+      await writeFile(
+        resolve(projectPath, "project.godot"),
+        (await readFile(resolve(projectPath, "project.godot"), "utf8"))
+          .replace(/run\/main_scene=.*\r?\n/, ""),
+        "utf8",
+      );
+      let editorRunId: string | null = null;
+      try {
+        await installGodotAddon(projectPath);
+        const launch = await launchEditor({ projectPath, configPath, timeoutMs: 30_000 });
+        editorRunId = launch.runId;
+        expect(await getEditorInfo({ projectPath, runId: editorRunId })).toMatchObject({
+          scene: null,
+          historyVersion: null,
+        });
+      } finally {
+        if (editorRunId !== null) {
+          await stopManagedRun({ projectPath, runId: editorRunId, timeoutMs: 15_000 });
+        }
+        await rm(projectPath, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
     "edits and saves through Undo/Redo, then proves the result at runtime",
     async () => {
       const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-editor-"));
@@ -54,11 +282,23 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
       let runtimeRunId: string | null = null;
       try {
         await installGodotAddon(projectPath);
+        const identity = await getProjectIdentity(projectPath);
         const launch = await launchEditor({ projectPath, configPath, timeoutMs: 30_000 });
         editorRunId = launch.runId;
+        const mutationGuard = {
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedScenePath: "res://main.tscn",
+        } as const;
+        const historyGuard = async () => {
+          const historyVersion = (await getEditorInfo({ projectPath, runId: editorRunId! }))
+            .historyVersion;
+          if (historyVersion === null) throw new Error("Expected an active editor scene history.");
+          return { ...mutationGuard, expectedHistoryVersion: historyVersion };
+        };
 
         const info = await getEditorInfo({ projectPath, runId: editorRunId });
-        expect(info.protocolVersion).toBe("0.3.0");
+        expect(info.protocolVersion).toBe("0.4.0");
+        expect(info.historyVersion).toEqual(expect.any(Number));
         expect(info.capabilities).toEqual([
           "scene_tree",
           "selection",
@@ -73,6 +313,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           "resource_focus",
           "signal_connect",
           "scene_save",
+          "scene_open",
           "undo_redo",
         ]);
 
@@ -107,12 +348,14 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         await expect(updateEditorNode({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           nodePath: "/root/Main/StartButton",
           properties: { icon: { $type: "Resource", path: "res://../badge.tscn" } },
         })).rejects.toMatchObject({ payload: { code: "EDITOR_RESOURCE_PATH_ESCAPE" } });
         await expect(updateEditorNode({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           nodePath: "/root/Main/StartButton",
           properties: { icon: { $type: "Resource", path: "res://badge.tscn" } },
         })).rejects.toMatchObject({ payload: { code: "EDITOR_RESOURCE_CLASS_MISMATCH" } });
@@ -120,6 +363,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         await expect(instantiateEditorScene({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           parentPath: "/root/Main",
           scenePath: "res://../badge.tscn",
         })).rejects.toMatchObject({ payload: { code: "EDITOR_RESOURCE_PATH_ESCAPE" } });
@@ -127,6 +371,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         const instantiated = await instantiateEditorScene({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           parentPath: "/root/Main",
           scenePath: "res://badge.tscn",
           name: "AgentBadge",
@@ -137,13 +382,13 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           node: { path: "/root/Main/AgentBadge", type: "Label" },
           undoable: true,
         });
-        await undoEditorAction({ projectPath, runId: editorRunId });
+        await undoEditorAction({ projectPath, runId: editorRunId, ...await historyGuard() });
         await expect(getEditorNode({
           projectPath,
           runId: editorRunId,
           nodePath: "/root/Main/AgentBadge",
         })).rejects.toMatchObject({ payload: { code: "EDITOR_NODE_NOT_FOUND" } });
-        await redoEditorAction({ projectPath, runId: editorRunId });
+        await redoEditorAction({ projectPath, runId: editorRunId, ...await historyGuard() });
 
         expect(await getEditorInstance({
           projectPath,
@@ -153,6 +398,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         const editableInstance = await setEditorInstanceEditable({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           nodePath: "/root/Main/AgentBadge",
           editable: true,
         });
@@ -163,17 +409,18 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           editable: true,
           undoable: true,
         });
-        await undoEditorAction({ projectPath, runId: editorRunId });
+        await undoEditorAction({ projectPath, runId: editorRunId, ...await historyGuard() });
         expect((await getEditorInstance({
           projectPath,
           runId: editorRunId,
           nodePath: "/root/Main/AgentBadge",
         })).editable).toBe(false);
-        await redoEditorAction({ projectPath, runId: editorRunId });
+        await redoEditorAction({ projectPath, runId: editorRunId, ...await historyGuard() });
 
         await createEditorNode({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           parentPath: "/root/Main",
           type: "Node2D",
           name: "TransformProbe",
@@ -199,12 +446,14 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         await deleteEditorNode({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           nodePath: "/root/Main/TransformProbe",
         });
 
         const temporary = await createEditorNode({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           parentPath: "/root/Main",
           type: "Label",
           name: "TemporaryLabel",
@@ -214,6 +463,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         const deleted = await deleteEditorNode({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           nodePath: "/root/Main/TemporaryLabel",
         });
         expect(deleted.action).toBe("delete");
@@ -221,6 +471,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         const created = await createEditorNode({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           parentPath: "/root/Main",
           type: "Button",
           name: "AgentButton",
@@ -235,6 +486,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         const updated = await updateEditorNode({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           nodePath: "/root/Main/AgentButton",
           name: "EditorButton",
           properties: { text: "Editor Start" },
@@ -242,12 +494,13 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         expect(updated.node?.path).toBe("/root/Main/EditorButton");
         expect(updated.changedProperties).toContain("name");
 
-        const undone = await undoEditorAction({ projectPath, runId: editorRunId });
+        const undone = await undoEditorAction({ projectPath, runId: editorRunId, ...await historyGuard() });
         expect(undone).toMatchObject({
           action: "undo",
           performed: true,
           actionName: "Agent: update AgentButton",
         });
+        expect(undone.historyVersion).toBe(undone.afterVersion);
         const draftNode = await getEditorNode({
           projectPath,
           runId: editorRunId,
@@ -256,7 +509,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         });
         expect(draftNode.node.properties.text).toBe("Draft");
 
-        const redone = await redoEditorAction({ projectPath, runId: editorRunId });
+        const redone = await redoEditorAction({ projectPath, runId: editorRunId, ...await historyGuard() });
         expect(redone).toMatchObject({
           action: "redo",
           performed: true,
@@ -266,6 +519,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         await createEditorNode({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           parentPath: "/root/Main",
           type: "Panel",
           name: "AgentPanel",
@@ -276,6 +530,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         const moved = await moveEditorNode({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           nodePath: "/root/Main/EditorButton",
           newParentPath: "/root/Main/AgentPanel",
           index: 0,
@@ -287,17 +542,18 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           index: 0,
         });
         expect(moved.node?.path).toBe("/root/Main/AgentPanel/EditorButton");
-        await undoEditorAction({ projectPath, runId: editorRunId });
+        await undoEditorAction({ projectPath, runId: editorRunId, ...await historyGuard() });
         expect((await getEditorNode({
           projectPath,
           runId: editorRunId,
           nodePath: "/root/Main/EditorButton",
         })).node.path).toBe("/root/Main/EditorButton");
-        await redoEditorAction({ projectPath, runId: editorRunId });
+        await redoEditorAction({ projectPath, runId: editorRunId, ...await historyGuard() });
 
         const style = await createEditorResource({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           nodePath: "/root/Main/AgentPanel/EditorButton",
           property: "theme_override_styles/normal",
           type: "StyleBoxFlat",
@@ -338,6 +594,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         const updatedStyle = await updateEditorResource({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           nodePath: "/root/Main/AgentPanel/EditorButton",
           property: "theme_override_styles/normal",
           properties: {
@@ -362,7 +619,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         });
         expect(await getEditorSelection({ projectPath, runId: editorRunId })).toMatchObject(selection);
 
-        const resourceUpdateUndone = await undoEditorAction({ projectPath, runId: editorRunId });
+        const resourceUpdateUndone = await undoEditorAction({ projectPath, runId: editorRunId, ...await historyGuard() });
         expect(resourceUpdateUndone.actionName).toBe("Agent: update StyleBoxFlat resource");
         const restoredStyle = await getEditorResource({
           projectPath,
@@ -372,7 +629,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           properties: ["bg_color"],
         });
         expect((restoredStyle.resource.properties.bg_color as Record<string, unknown>).r).toBeCloseTo(0.1);
-        const resourceUndone = await undoEditorAction({ projectPath, runId: editorRunId });
+        const resourceUndone = await undoEditorAction({ projectPath, runId: editorRunId, ...await historyGuard() });
         expect(resourceUndone.actionName).toBe("Agent: create StyleBoxFlat resource");
         expect((await getEditorNode({
           projectPath,
@@ -380,8 +637,8 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           nodePath: "/root/Main/AgentPanel/EditorButton",
           properties: ["theme_override_styles/normal"],
         })).node.properties["theme_override_styles/normal"]).toBeNull();
-        await redoEditorAction({ projectPath, runId: editorRunId });
-        await redoEditorAction({ projectPath, runId: editorRunId });
+        await redoEditorAction({ projectPath, runId: editorRunId, ...await historyGuard() });
+        await redoEditorAction({ projectPath, runId: editorRunId, ...await historyGuard() });
         expect((await getEditorNode({
           projectPath,
           runId: editorRunId,
@@ -395,6 +652,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         const externalStyle = await saveEditorResource({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           nodePath: "/root/Main/AgentPanel/EditorButton",
           property: "theme_override_styles/normal",
           path: "res://agent_button_style.tres",
@@ -410,6 +668,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         await expect(saveEditorResource({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           nodePath: "/root/Main/AgentPanel/EditorButton",
           property: "theme_override_styles/normal",
           path: "res://../escaped.tres",
@@ -417,6 +676,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         await expect(saveEditorResource({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           nodePath: "/root/Main/AgentPanel/EditorButton",
           property: "theme_override_styles/normal",
           path: "res://agent_button_style.tres",
@@ -430,7 +690,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           path: "res://agent_button_style.tres",
           class: "StyleBoxFlat",
         });
-        expect((await undoEditorAction({ projectPath, runId: editorRunId })).actionName)
+        expect((await undoEditorAction({ projectPath, runId: editorRunId, ...await historyGuard() })).actionName)
           .toBe("Agent: externalize EditorButton resource");
         expect((await getEditorNode({
           projectPath,
@@ -441,7 +701,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           path: "res://agent_button_style.tres",
         });
         expect(existsSync(resolve(projectPath, "agent_button_style.tres"))).toBe(true);
-        await redoEditorAction({ projectPath, runId: editorRunId });
+        await redoEditorAction({ projectPath, runId: editorRunId, ...await historyGuard() });
         expect((await getEditorNode({
           projectPath,
           runId: editorRunId,
@@ -466,6 +726,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         const connection = await connectEditorSignal({
           projectPath,
           runId: editorRunId,
+          ...mutationGuard,
           sourcePath: "/root/Main/AgentPanel/EditorButton",
           signal: "pressed",
           targetPath: "/root/Main",
@@ -473,8 +734,9 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         });
         expect(connection.undoable).toBe(true);
 
-        const saved = await saveEditorScene({ projectPath, runId: editorRunId });
+        const saved = await saveEditorScene({ projectPath, runId: editorRunId, ...await historyGuard() });
         expect(saved).toMatchObject({ saved: true, scene: "res://main.tscn" });
+        expect(saved.historyVersion).toEqual(expect.any(Number));
 
         const editorScreenshot = await captureEditorScreenshot({
           projectPath,

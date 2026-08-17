@@ -3,6 +3,8 @@ import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+import { RUNTIME_PROTOCOL_VERSION } from "../../packages/protocol/src/index.js";
+
 import {
   assertRuntime,
   captureRuntimeScreenshot,
@@ -33,7 +35,7 @@ describe.skipIf(!hasLocalConfig)("runtime bridge integration", () => {
       const launch = await launchProject({ projectPath, configPath, timeoutMs: 20_000 });
       try {
         const info = await getRuntimeInfo({ projectPath, runId: launch.runId });
-        expect(info.protocolVersion).toBe("0.3.0");
+        expect(info.protocolVersion).toBe(RUNTIME_PROTOCOL_VERSION);
         expect(info.capabilities).toEqual(["screenshot", "ui", "scene_tree", "node", "observe", "simulate", "spatial_3d", "input", "input_sequence", "assert", "wait", "control"]);
 
         const observation = await observeRuntime({
