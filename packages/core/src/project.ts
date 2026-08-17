@@ -1,8 +1,9 @@
-import { access, readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { access, readFile, realpath } from "node:fs/promises";
 import { constants } from "node:fs";
 import { resolve } from "node:path";
 
-import type { ProjectInfo } from "@godot-agent-runtime/protocol";
+import type { ProjectIdentity, ProjectInfo } from "@godot-agent-runtime/protocol";
 
 import { RuntimeFailure } from "./errors.js";
 
@@ -65,4 +66,37 @@ export async function inspectProject(projectPath: string): Promise<ProjectInfo> 
       readSetting(source, "renderer/rendering_method.mobile"),
     enabledPlugins: readEnabledPlugins(source),
   };
+}
+
+export async function getProjectIdentity(projectPath: string): Promise<ProjectIdentity> {
+  const project = await inspectProject(projectPath);
+  const canonicalPath = await realpath(project.projectPath);
+  const projectFile = resolve(canonicalPath, "project.godot");
+  const bytes = await readFile(projectFile);
+  const identityPath = process.platform === "win32" ? canonicalPath.toLowerCase() : canonicalPath;
+  return {
+    projectPath: canonicalPath,
+    projectFile,
+    projectFingerprint: createHash("sha256").update(identityPath, "utf8").digest("hex"),
+    projectFileSha256: createHash("sha256").update(bytes).digest("hex"),
+  };
+}
+
+export async function assertProjectFingerprint(
+  projectPath: string,
+  expected?: string,
+): Promise<ProjectIdentity> {
+  const identity = await getProjectIdentity(projectPath);
+  if (expected !== undefined && expected !== identity.projectFingerprint) {
+    throw new RuntimeFailure({
+      code: "PROJECT_IDENTITY_MISMATCH",
+      stage: "validation",
+      message: "The requested project does not match the previously inspected project.",
+      details: { expected, actual: identity.projectFingerprint, projectPath: identity.projectPath },
+      recovery: [
+        "Call godot_project_context for the intended project and retry with its projectFingerprint.",
+      ],
+    });
+  }
+  return identity;
 }

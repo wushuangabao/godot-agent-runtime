@@ -75,7 +75,11 @@ export type {
   ManagedRunLookupOptions,
   ManagedRunConnection,
 } from "./managed-run.js";
-export { inspectProject } from "./project.js";
+export {
+  assertProjectFingerprint,
+  getProjectIdentity,
+  inspectProject,
+} from "./project.js";
 export { runProcess } from "./process.js";
 export type { ProcessResult, RunProcessOptions } from "./process.js";
 export { readProjectFile, writeProjectFile } from "./safe-file.js";

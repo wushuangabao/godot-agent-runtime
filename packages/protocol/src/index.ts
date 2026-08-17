@@ -65,6 +65,17 @@ export const ProjectInfoSchema = z.object({
 
 export type ProjectInfo = z.infer<typeof ProjectInfoSchema>;
 
+export const Sha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
+
+export const ProjectIdentitySchema = z.object({
+  projectPath: z.string().min(1),
+  projectFile: z.string().min(1),
+  projectFingerprint: Sha256Schema,
+  projectFileSha256: Sha256Schema,
+});
+
+export type ProjectIdentity = z.infer<typeof ProjectIdentitySchema>;
+
 export const ProjectDiscoveryResultSchema = z.object({
   root: z.string().min(1),
   scannedDirectories: z.number().int().nonnegative(),
