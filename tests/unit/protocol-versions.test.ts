@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 
 import * as Protocol from "../../packages/protocol/src/index.js";
 
@@ -12,6 +14,21 @@ import {
 } from "../../packages/protocol/src/index.js";
 
 describe("bridge protocol versions", () => {
+  it("publishes every workspace package as 0.2.0 without changing transport versions", async () => {
+    for (const path of [
+      "package.json",
+      "packages/protocol/package.json",
+      "packages/core/package.json",
+      "packages/mcp-server/package.json",
+      "packages/cli/package.json",
+    ]) {
+      const manifest = JSON.parse(await readFile(resolve(path), "utf8")) as { version?: string };
+      expect(manifest.version, path).toBe("0.2.0");
+    }
+    expect(EDITOR_PROTOCOL_VERSION).toBe("0.7.0");
+    expect(RUNTIME_PROTOCOL_VERSION).toBe("0.4.0");
+  });
+
   it("negotiates screenshot receipts with independent editor and runtime versions", () => {
     expect(EDITOR_PROTOCOL_VERSION).toBe("0.7.0");
     expect(RUNTIME_PROTOCOL_VERSION).toBe("0.4.0");

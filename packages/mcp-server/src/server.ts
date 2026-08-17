@@ -774,7 +774,7 @@ function loggedInputSchema<Schema extends StandardSchemaWithJSON>(tool: string, 
 
 export function createMcpServer(): McpServer {
   const server = new McpServer(
-    { name: "godot-agent-runtime", version: "0.1.0" },
+    { name: "godot-agent-runtime", version: "0.2.0" },
     {
       instructions:
         "Start with godot_project_context; do not guess project or main-scene identity. Call godot_agent_guide when a detailed playbook or recipe is needed. Follow the fixed ladder: context, compile, edit, visual evidence, runtime observation, interactive wait/assert, cleanup. Use guarded file writes and typed editor batches. Run script/project checks before runtime claims. Call godot_diagnostics before bounded log reads. Screenshots prove only their evidence class; interaction requires godot_runtime_assert (normally after godot_runtime_wait). Always stop every managed process with godot_run_stop.",

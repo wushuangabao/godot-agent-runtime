@@ -47,6 +47,11 @@ interface DecisionManifest {
   readonly decisions: readonly Decision[];
 }
 
+interface ComparisonProjection {
+  readonly itemCount: number;
+  readonly decisionCounts: Record<(typeof DECISIONS)[number], number>;
+}
+
 interface McpBaseline {
   readonly commit: string;
   readonly serialization: {
@@ -254,5 +259,20 @@ describe("Summer capability decision closure", () => {
     expect(sha256(serializedTools)).toBe(baseline.toolSchemaSha256);
     expect(Buffer.byteLength(instructions, "utf8")).toBe(baseline.instructionsBytes);
     expect(sha256(instructions)).toBe(baseline.instructionsSha256);
+  });
+
+  it("keeps the comparisons projection equal to the frozen decision manifest", async () => {
+    const manifest = await readJson<DecisionManifest>("docs/research/summer-mcp-decisions.json");
+    const comparisons = await readFile(resolve("docs/comparisons.md"), "utf8");
+    const match = comparisons.match(/<!-- summer-capability-projection (\{.*\}) -->/);
+    expect(match?.[1], "docs/comparisons.md is missing its machine projection marker").toBeDefined();
+    const projection = JSON.parse(match?.[1] ?? "{}") as ComparisonProjection;
+    const decisionCounts = Object.fromEntries(
+      DECISIONS.map((decision) => [
+        decision,
+        manifest.decisions.filter((entry) => entry.decision === decision).length,
+      ]),
+    );
+    expect(projection).toEqual({ itemCount: manifest.decisions.length, decisionCounts });
   });
 });

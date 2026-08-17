@@ -1,6 +1,6 @@
 # 路线图
 
-当前进度（2026-08-16）：里程碑 1、2、3 均已通过统一真实 Godot 验收；阶段 1 已完成；阶段 2 已完成插件安装、受管连接、场景树/属性读取、节点增删改与移动、PackedScene 实例化与 Editable Children、场景继承、Resource 子属性读写及内置/外部保存、信号连接、选择/聚焦、原生 Undo/Redo、场景保存、2D/3D 视口截图和编辑器相机元数据，以及常用 2D/3D 数学 Variant 的写入纵切；阶段 3 已完成截图、运行时场景树/节点属性观察、面向游戏状态的批量观察、Camera3D 世界坐标投影与屏幕物理射线、UI 发现、单次与组合输入、结构化断言、有界条件等待、暂停后有限 process/physics 帧推进，以及独立 2D/3D World 中的有界物理采样。阶段 4 按当前本机条件收敛为 Codex 与 DeepSeek Harness，不要求安装 Claude Code；项目级配置、共享配方、DSH Headless 启动器、双客户端基准契约及无凭据 MCP 启动验收已经完成，下一项是使用用户自有 DSH 模型凭据执行真实 Headless 闭环并与 Codex 结果对比。
+当前进度（2026-08-17）：里程碑 1、2、3 均已通过统一真实 Godot 验收；阶段 1–3 的基础闭环已完成。0.2.0 已实现项目上下文、fail-closed 文件 guard、活动场景/history guard、单 action typed batch、结构化项目设置/InputMap、诊断漏斗、增量日志/脱敏报告、截图证据回执，以及 Core 单源 playbook/recipes。Editor/Runtime transport 独立保持 `0.7.0`/`0.4.0`。里程碑 5 脚本已建立，但是否通过仍以 Gate D 实际运行生成的新证据为准；没有用户模型凭据时，DeepSeek Harness 只验证 MCP 握手、Schema 和确定性上下文预算并保持 `hostExecutionVerified:false`。
 
 首个里程碑见 [AGENTS.md](../AGENTS.md)。三个基础闭环稳定后，再扩展动画、TileMap、导航、性能分析和更复杂的自动游玩能力。
 
@@ -9,6 +9,8 @@
 里程碑 2 的统一验收命令为 `pnpm run benchmark:milestone-2`：它通过 EditorPlugin 创建带根节点覆盖的真实继承场景，要求 Godot 重新解析并启动该场景；随后批量观察 CharacterBody2D 状态，在私有 World2D/World3D 中复制当前场景、注入动作并逐物理帧采样，证明模拟副本移动而真实运行树位置不变；最后向真实游戏注入同一动作，用等待、断言、前后观察和截图证明 Player 实际移动。继承场景、逐帧样本、结构化报告和截图归档到 `artifacts/milestone-2/<时间戳>/`，临时项目与进程在成功或失败路径都会清理。
 
 里程碑 3 的统一验收命令为 `pnpm run benchmark:milestone-3`：它通过 EditorPlugin 读取和修改 CharacterBody3D 的 Node3D 变换，保存后捕获指定 3D 编辑器视口及其活动相机；随后启动真实 3D 游戏，把 Player 世界坐标投影为截图像素并从该像素发射物理射线证明命中，通过私有 World3D 仿真证明副本移动且真实状态不变，最后注入真实动作并以接地状态、结构化断言、再次投影/射线和变化后的截图证明完整闭环。场景副本、编辑器/运行时截图、逐帧样本和结构化报告归档到 `artifacts/milestone-3/<时间戳>/`。
+
+里程碑 5 的统一验收命令为 `pnpm run benchmark:milestone-5`：它在临时 Control UI 项目中覆盖 guarded 文本替换/stale conflict、错场景零修改、typed batch 一次 Undo/Redo 且不隐式保存、失败/成功保存的独立诚实回执、InputMap 新 SHA 与 Editor 重启回读、脚本/项目检查、运行时 find/input/wait/assert、runtime-frame evidence、诊断/增量日志/调试报告和最终清理。报告记录 62 tools、稳定 schema bytes 与 instructions bytes；Gate D 另以冻结矩阵测试证明 Summer 未分类数为 0。不运行模型时不得生成工具选择率。
 
 ## 阶段 0：参考实现审计与协议设计
 
@@ -80,5 +82,6 @@
 - 完成单元测试、Godot headless 集成测试和端到端 Agent 基准。
 - 发布 npm 包、插件 ZIP、Godot Asset Library 包和迁移文档。
 - 建立贡献指南、工具兼容策略和安全说明。
+- 0.2.0 的本地优化收口不扩大产品边界：云、AI 资产、账号、任意探针、导出签名和托管发布仍需独立设计与风险评审。
 
 完成标准：新用户可在十分钟内完成安装，并让 Codex 或 DeepSeek Harness 控制示例项目完成一次自动验证。

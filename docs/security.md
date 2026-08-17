@@ -8,7 +8,8 @@ Godot 项目本身可以执行任意本机代码。本项目的安全目标不�
 - 拒绝路径中的符号链接/联接点，不跟随它们逃逸项目。
 - 只读写 Godot 脚本、文本资源、场景、配置和文档等白名单后缀；拒绝 NUL 字节和二进制资产。
 - 默认最大 1 MiB。写入先落到同目录随机临时文件，再原子重命名。
-- 读取返回 SHA-256；写入可要求 `expectedSha256`，不匹配时返回 `FILE_CONFLICT`，防止覆盖编辑器或用户刚刚完成的修改。传 `null` 表示“仅当文件尚不存在时创建”。
+- 读取返回 SHA-256；写入必须携带 create guard 或 matching SHA-256 guard，无 guard 直接失败。legacy `expectedSha256` 仍兼容相同语义，`null` 表示“仅当文件尚不存在时创建”；stale 更新返回结构化 `FILE_WRITE_CONFLICT`，不会覆盖编辑器或用户刚完成的修改。
+- 持久文件写入还可绑定 `godot_project_context` 返回的 project fingerprint。正常本地开发中的并发写入通过同一 mutation lease 串行并在权威落盘点重验；不把同用户恶意进程在最后检查后替换父目录作为当前威胁模型。
 
 ## 进程生命周期
 
@@ -34,6 +35,7 @@ Godot 项目本身可以执行任意本机代码。本项目的安全目标不�
 - EditorPlugin 只允许创建可实例化的 `Node`/`Resource` 类型；节点名、移动环路、目标节点、属性描述符、只读标志、Resource 类兼容性、值类型、信号和目标方法均在 Godot 内验证。`owner`、`scene_file_path`、`resource_path` 等结构属性不能作为普通属性写入。
 - 编辑器增删改、Resource 子属性更新、PackedScene Editable Children 和信号连接均记录到当前场景的 Godot 原生 Undo/Redo 历史；保存必须单独显式调用。Resource 更新只允许已声明、非只读属性，不允许动态方法调用。
 - `godot_editor_batch` 先在逻辑场景索引中验证全部操作及前序 rename/move/delete 后的路径，再创建且只创建一个原生 Undo/Redo action；任一步失败都不会修改真实场景或历史。删除必须显式 `confirmDestructive: true`。批处理没有保存字段且永不落盘；随后保存失败只表示未持久化，不会自动回滚已经应用、仍可整体撤销的内存动作。
+- 所有持久 Editor mutation 在 Bridge 权威点校验活动 `expectedScenePath`；save/undo/redo 还校验 native `expectedHistoryVersion`。这些 guard 是 MCP/CLI 0.2.0 的必填迁移，不提供静默无 guard 兼容期。
 - 项目设置写入只允许已有的 `application/config/*`、`application/run/main_scene`、`display/window/*`、`rendering/*`、`physics/2d/*`、`physics/3d/*`，并限制为 bool/int/float、16 KiB 字符串或最多 256 项的字符串数组；`autoload/*`、`editor_plugins/*`、`filesystem/import/*` 与通用 `input/*` 必须走其他专用流程。InputMap 只接受有界的 key、mouse button、joypad button union，每次最多 32 个事件。
 - `project.godot` 的持久设置和 InputMap 写入同时校验项目 fingerprint、调用方 SHA-256、Bridge 启动时缓存的 SHA-256，并在整个 Bridge 往返期间复用文本写入的同一 mutation lease。客户端先超时时通过有界 operation receipt 调和；无法证明操作终态或受管 Editor 已退出时保留 quarantine，阻止第二个参与写入者插入。该协调面向正常本地开发中的并发、超时与崩溃，不把同用户恶意进程作为威胁模型。
 - 外部 Resource 检查是只读接口，只加载项目内非链接 `.tres/.res`；未请求属性时仅返回类、路径与可编辑属性名，请求时最多编码 100 个属性。
@@ -46,3 +48,5 @@ Godot 项目本身可以执行任意本机代码。本项目的安全目标不�
 ## 仍需由调用方确认的边界
 
 启动项目会执行项目已有的 autoload、场景脚本、原生扩展和工具脚本。对来源不可信的项目，应在操作系统级隔离环境中运行；本项目当前不提供容器或低权限账户沙箱。
+
+截图回执只证明单个 `editor_viewport` 或真实 `runtime_frame` 及其项目/场景身份，始终不证明输入已产生预期交互；交互必须另用结构化 wait/assert 证明。核心也不提供云服务、账号、AI 资产生成、任意网络下载、任意脚本/对象探针、导出签名或托管发布。这些排除项不能通过 guidance、batch 或 debug report 绕过。

@@ -58,6 +58,17 @@ DeepSeek Harness（DSH）是本项目支持的可选外部客户端和基准测�
 
 所有工具使用严格 Zod Schema，同时返回文本摘要和 MCP `structuredContent`。工具处理失败时返回 `isError: true`，结构化错误包含 `code`、`stage`、`message`、可选 `details` 和至少一条 `recovery`。
 
+0.2.0 共注册 62 个 MCP 工具。`godot_agent_guide` 是唯一新增的 guidance surface：无 id 返回 playbook 与五个 recipe 摘要，有 id 返回目标、前置条件、有序工具、成功标准、证据要求与清理步骤。数据只来自 Core `getAgentGuide()`，接口为静态、只读、无状态，不执行 recipe。冻结 0.1 基线为 49 tools / 96404 schema bytes / 332 instructions bytes；0.2 的确定性预算上限为 62 tools、144606 schema bytes 与 4096 instructions bytes，不统计未运行模型的工具选择指标。
+
+### 0.2 写入与证据规则
+
+- `godot_project_context` 返回项目 fingerprint、`project.godot` SHA-256 和显式 bridge 状态，是后续写入身份真源。
+- `godot_file_write` 必须二选一携带 create guard 或 matching SHA-256；legacy `expectedSha256` 仍映射到相同安全语义。`godot_file_replace` 默认只接受唯一匹配，并要求项目 fingerprint。
+- 持久 Editor mutation 必须携带 `expectedScenePath`；save/undo/redo 还携带最新 native `expectedHistoryVersion`。错误项目、场景或历史在真实修改前失败。
+- `godot_editor_batch` 是 1–32 项严格 typed fixed-command union，不是 raw op。它先完整验证逻辑路径，只生成一个 Undo/Redo action，返回 dirty/undoable receipt，永不隐式保存。
+- 项目设置只允许文档列出的前缀；InputMap 使用专用 event union。两类落盘都执行 project fingerprint + `project.godot` SHA-256 CAS，返回 `undoable:false`，并要求重启 Editor 后验证 cache 回读。
+- Editor 截图是 `editor_viewport`，Runtime 截图是 `runtime_frame`；二者都不证明交互。行为完成必须由结构化 wait/assert 或等价运行状态证据支持。
+
 | 工具 | 属性 | 输入 | 成功结果 | 验证 |
 |---|---|---|---|---|
 | `godot_doctor` | 只读、幂等 | 可选 `configPath` | Node、配置、Godot、DSH、loopback 检查列表 | 环境集成测试与 MCP 列表测试 |
@@ -69,7 +80,11 @@ DeepSeek Harness（DSH）是本项目支持的可选外部客户端和基准测�
 | `godot_run_status` | 只读、幂等 | 项目、`runId` 和输出上限 | 运行状态、有界日志、诊断及失败信息 | 运行会话集成测试 |
 | `godot_run_stop` | 停止本地进程、幂等 | 项目、`runId`、停止超时和输出上限 | 最终运行状态、有界日志和诊断 | 首次停止与重复停止测试 |
 | `godot_file_read` | 只读、幂等、项目内、1 MiB 上限 | 项目、`res://`/相对路径、可选上限 | UTF-8 内容、字节数、SHA-256 | 路径逃逸、类型和读取测试 |
-| `godot_file_write` | 原子写、项目内、乐观锁 | 项目、路径、内容、可选 `expectedSha256` | created/updated、前后 SHA-256 | 冲突、类型、嵌套创建测试 |
+| `godot_file_write` | 原子写、项目内、fail-closed guard | 项目、路径、内容、create 或 matching SHA-256 guard、可选项目 fingerprint | created/updated、前后 SHA-256 | 无 guard、stale、并发冲突、类型和嵌套创建测试 |
+| `godot_file_replace` | 唯一替换、项目内、乐观锁 | 项目 fingerprint、路径、old/new、可选显式 replace-all | replacements、前后 SHA-256 | 零匹配、多匹配、并发冲突测试 |
+| `godot_project_context` | 只读、幂等、显式 run 绑定 | 项目、可选 Editor/Runtime runId | 项目、identity、可选 bridge context | 单快照身份与 alias 测试 |
+| `godot_script_check` | 只启动原版 Godot check-only、幂等 | 项目、`.gd`、配置和上限 | 文件级解析诊断 | 真实正确/错误脚本测试 |
+| `godot_agent_guide` | 只读、幂等、无状态 | 可选固定 recipe id | playbook/摘要或完整 recipe | Core/MCP/CLI 单源等价测试 |
 | `godot_addon_install` | 项目写入、幂等 | 项目 | 插件文件与配置变更标志 | 保留已有插件并重复安装 |
 | `godot_runtime_status` | 只读、幂等 | 项目、`runId` | 引擎、场景和能力协商 | 真实桥接握手 |
 | `godot_runtime_screenshot` | 写入运行证据 | 项目、`runId`、超时 | PNG 路径、尺寸、字节数、SHA-256 | 真实视口截图与路径约束 |
@@ -102,8 +117,8 @@ DeepSeek Harness（DSH）是本项目支持的可选外部客户端和基准测�
 | `godot_editor_resource_focus` | 改变瞬时编辑器状态 | 项目资源路径 | FileSystem 选择与资源类型 | 外部 StyleBoxFlat 聚焦 |
 | `godot_editor_selection_get` / `godot_editor_selection_set` | 读取或替换瞬时编辑器状态 | 最多 100 个节点路径、聚焦标志 | 选中和聚焦路径 | Inspector 聚焦回读测试 |
 | `godot_editor_signal_connect` | 写入、非幂等、持久连接 | 源/信号/目标/方法 | 连接描述 | 保存后运行时点击测试 |
-| `godot_editor_scene_save` | 写入、幂等 | 项目、`runId` | 保存状态与 `res://` 路径 | 保存文件内容检查 |
-| `godot_editor_undo` / `godot_editor_redo` | 写入、非幂等 | 项目、`runId` | 动作名与历史版本 | 实际回退并恢复属性 |
+| `godot_editor_scene_save` | 写入、幂等、guarded | 项目、`runId`、活动 scene、history version | 保存状态、scene 与当前历史 | 保存失败不改写 batch 状态 |
+| `godot_editor_undo` / `godot_editor_redo` | 写入、非幂等、guarded | 项目、`runId`、活动 scene、history version、可选 action name | 动作名与前后历史版本 | 一次完整回退/恢复 batch |
 | `godot_editor_screenshot` | 写入编辑器证据并切换主屏 | 项目、`runId`、`2d/3d`、3D 视口索引 0–3、超时 | PNG、视口及活动 3D 编辑器相机元数据 | 真实 2D/3D 编辑器截图测试 |
 
 `godot_scene_run` 用于自动验证，不创建窗口，并在有限帧后自动退出。`godot_scene_launch` 用于人工观察或后续运行时交互：它创建可见窗口并返回 `runId`，调用方不应等待进程退出，而应使用 `godot_run_status` 和 `godot_run_stop` 管理生命周期。

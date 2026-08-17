@@ -84,6 +84,7 @@ describe("MCP server", () => {
   });
 
   it("advertises high-level tools with schemas", async () => {
+    expect(client.getServerVersion()).toEqual({ name: "godot-agent-runtime", version: "0.2.0" });
     const { tools } = await client.listTools();
     const names = tools.map((tool) => tool.name);
 
