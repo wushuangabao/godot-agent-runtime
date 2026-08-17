@@ -107,6 +107,20 @@ export const GodotRunResultSchema = z.object({
 
 export type GodotRunResult = z.infer<typeof GodotRunResultSchema>;
 
+export const ScriptCheckResultSchema = z.object({
+  ok: z.boolean(),
+  path: z.string().startsWith("res://").regex(/\.gd$/i),
+  exitCode: z.number().int().nullable(),
+  timedOut: z.boolean(),
+  durationMs: z.number().nonnegative(),
+  stdout: z.string(),
+  stderr: z.string(),
+  truncated: z.boolean(),
+  diagnostics: z.array(DiagnosticSchema),
+}).strict();
+
+export type ScriptCheckResult = z.infer<typeof ScriptCheckResultSchema>;
+
 export const ManagedRunStateSchema = z.enum([
   "starting",
   "running",
@@ -482,6 +496,16 @@ export const EditorBridgeInfoSchema = z.object({
 });
 
 export type EditorBridgeInfo = z.infer<typeof EditorBridgeInfoSchema>;
+
+export const ProjectContextSchema = z.object({
+  ok: z.literal(true),
+  project: ProjectInfoSchema,
+  identity: ProjectIdentitySchema,
+  editor: EditorBridgeInfoSchema.nullable(),
+  runtime: RuntimeBridgeInfoSchema.nullable(),
+}).strict();
+
+export type ProjectContext = z.infer<typeof ProjectContextSchema>;
 
 export const EditorCamera3DSchema = z.object({
   projection: z.enum(["perspective", "orthogonal", "frustum"]),

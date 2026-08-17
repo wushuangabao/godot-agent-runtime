@@ -28,7 +28,7 @@ const NON_FATAL_ENGINE_DIAGNOSTICS = [
   /^ERROR: Condition "p_format_loader\.is_null\(\)" is true\.$/,
 ];
 
-function compactOutput(output: string): string {
+export function compactGodotOutput(output: string): string {
   return output
     .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, "")
     .split(/\r?\n/)
@@ -42,7 +42,7 @@ function compactOutput(output: string): string {
     .join("\n");
 }
 
-function collectDiagnostics(stdout: string, stderr: string) {
+export function collectGodotDiagnostics(stdout: string, stderr: string) {
   const diagnostics: Array<{ severity: "error" | "warning"; message: string }> = [];
   const lines = `${stdout}\n${stderr}`.split(/\r?\n/);
   for (const line of lines) {
@@ -82,6 +82,7 @@ export async function prepareHostEnvironment(projectPath: string): Promise<NodeJ
     XDG_DATA_HOME: dataRoot,
     XDG_CONFIG_HOME: dataRoot,
     XDG_CACHE_HOME: cacheRoot,
+    GODOT_USER_DATA_DIR: dataRoot,
   };
 }
 
@@ -108,9 +109,9 @@ async function executeGodot(
       : { maxOutputBytes: options.maxOutputBytes }),
     env,
   });
-  const stdout = compactOutput(result.stdout);
-  const stderr = compactOutput(result.stderr);
-  const diagnostics = collectDiagnostics(stdout, stderr);
+  const stdout = compactGodotOutput(result.stdout);
+  const stderr = compactGodotOutput(result.stderr);
+  const diagnostics = collectGodotDiagnostics(stdout, stderr);
   const ok =
     !result.timedOut &&
     result.exitCode === 0 &&

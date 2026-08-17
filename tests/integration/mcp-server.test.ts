@@ -82,7 +82,9 @@ describe("MCP server", () => {
       "godot_doctor",
       "godot_projects_find",
       "godot_project_inspect",
+      "godot_project_context",
       "godot_project_check",
+      "godot_script_check",
       "godot_file_read",
       "godot_file_write",
       "godot_file_replace",
@@ -136,6 +138,20 @@ describe("MCP server", () => {
     }
     const fileWrite = tools.find(({ name }) => name === "godot_file_write");
     const fileReplace = tools.find(({ name }) => name === "godot_file_replace");
+    const projectContext = tools.find(({ name }) => name === "godot_project_context");
+    const scriptCheck = tools.find(({ name }) => name === "godot_script_check");
+    expect(projectContext?.inputSchema.additionalProperties).toBe(false);
+    expect(projectContext?.outputSchema?.additionalProperties).toBe(false);
+    expect(projectContext?.annotations).toEqual({
+      readOnlyHint: true,
+      idempotentHint: true,
+    });
+    expect(scriptCheck?.inputSchema.additionalProperties).toBe(false);
+    expect(scriptCheck?.outputSchema?.additionalProperties).toBe(false);
+    expect(scriptCheck?.annotations).toEqual({
+      readOnlyHint: false,
+      idempotentHint: true,
+    });
     expect(fileWrite?.inputSchema.additionalProperties).toBe(false);
     expect(fileWrite?.annotations).toMatchObject({
       readOnlyHint: false,
@@ -380,6 +396,42 @@ describe("MCP server", () => {
       name: "Godot Agent Runtime Minimal 2D",
       mainScene: "res://main.tscn",
     });
+  });
+
+  it("offers equivalent project context through MCP and CLI", async () => {
+    const projectPath = resolveProject("examples/minimal-2d");
+    const result = await client.callTool({
+      name: "godot_project_context",
+      arguments: { projectPath },
+    });
+    const cli = await runCli(["context", projectPath]);
+
+    expect(result.isError).not.toBe(true);
+    expect(cli.code).toBe(0);
+    expect(cli.payload).toEqual(result.structuredContent);
+    expect(cli.payload).toMatchObject({
+      ok: true,
+      project: { mainScene: "res://main.tscn" },
+      editor: null,
+      runtime: null,
+    });
+  });
+
+  it("offers equivalent unsupported script errors through MCP and CLI", async () => {
+    const projectPath = resolveProject("tests/fixtures/script-check");
+    const result = await client.callTool({
+      name: "godot_script_check",
+      arguments: { projectPath, path: "res://project.godot" },
+    });
+    const cli = await runCli(["script-check", projectPath, "res://project.godot"]);
+
+    expect(result.isError).toBe(true);
+    expect(cli.code).toBe(1);
+    expect(result.structuredContent).toMatchObject({
+      ok: false,
+      error: { code: "SCRIPT_TYPE_UNSUPPORTED", stage: "validation" },
+    });
+    expect(cli.payload).toEqual(result.structuredContent);
   });
 
   it("preserves structured recovery data on failure", async () => {

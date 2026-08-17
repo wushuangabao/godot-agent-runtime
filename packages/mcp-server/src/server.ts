@@ -6,6 +6,7 @@ import * as z from "zod/v4";
 
 import {
   checkProject,
+  checkScript,
   assertRuntime,
   captureEditorScreenshot,
   captureRuntimeScreenshot,
@@ -25,6 +26,7 @@ import {
   getEditorSelection,
   getEditorResource,
   getManagedRunStatus,
+  getProjectContext,
   getRuntimeInfo,
   getRuntimeNode,
   observeRuntime,
@@ -81,6 +83,7 @@ import {
   GodotRunResultSchema,
   GodotRunStatusSchema,
   ProjectDiscoveryResultSchema,
+  ProjectContextSchema,
   ProjectInfoSchema,
   RuntimeAssertionResultSchema,
   RuntimeBridgeInfoSchema,
@@ -99,6 +102,7 @@ import {
   SafeFileReadResultSchema,
   SafeFileWriteResultSchema,
   SafeTextReplaceResultSchema,
+  ScriptCheckResultSchema,
   FileMutationGuardSchema,
   Sha256Schema,
 } from "@godot-agent-runtime/protocol";
@@ -110,6 +114,12 @@ const ConfigInputSchema = z.object({
 const ProjectInputSchema = z.object({
   projectPath: z.string().min(1),
 });
+
+const ProjectContextInputSchema = z.object({
+  projectPath: z.string().min(1),
+  editorRunId: z.uuid().optional(),
+  runtimeRunId: z.uuid().optional(),
+}).strict();
 
 const ProjectDiscoveryInputSchema = z.object({
   searchRoot: z.string().min(1),
@@ -123,6 +133,14 @@ const GodotOperationInputSchema = z.object({
   timeoutMs: z.number().int().min(100).max(120_000).optional(),
   maxOutputBytes: z.number().int().min(1_024).max(1_048_576).optional(),
 });
+
+const ScriptCheckInputSchema = z.object({
+  projectPath: z.string().min(1),
+  path: z.string().min(1),
+  configPath: z.string().min(1).optional(),
+  timeoutMs: z.number().int().min(100).max(120_000).optional(),
+  maxOutputBytes: z.number().int().min(1_024).max(1_048_576).optional(),
+}).strict();
 
 const RunInputSchema = GodotOperationInputSchema.extend({
   scene: z.string().min(1).optional(),
@@ -541,6 +559,26 @@ export function createMcpServer(): McpServer {
   );
 
   server.registerTool(
+    "godot_project_context",
+    {
+      title: "Get explicit Godot project context",
+      description:
+        "Returns project metadata and identity, plus editor/runtime bridge information only for explicitly supplied run IDs.",
+      inputSchema: ProjectContextInputSchema,
+      outputSchema: ProjectContextSchema,
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ projectPath, editorRunId, runtimeRunId }) =>
+      await handle(async () =>
+        await getProjectContext({
+          projectPath,
+          ...(editorRunId === undefined ? {} : { editorRunId }),
+          ...(runtimeRunId === undefined ? {} : { runtimeRunId }),
+        }),
+      ),
+  );
+
+  server.registerTool(
     "godot_project_check",
     {
       title: "Import and validate a Godot project",
@@ -554,6 +592,28 @@ export function createMcpServer(): McpServer {
       await handle(async () =>
         await checkProject({
           projectPath,
+          ...(configPath === undefined ? {} : { configPath }),
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
+          ...(maxOutputBytes === undefined ? {} : { maxOutputBytes }),
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "godot_script_check",
+    {
+      title: "Check one GDScript file",
+      description:
+        "Runs the configured Godot editor with --script and --check-only for one project-internal, non-linked .gd file.",
+      inputSchema: ScriptCheckInputSchema,
+      outputSchema: ScriptCheckResultSchema,
+      annotations: { readOnlyHint: false, idempotentHint: true },
+    },
+    async ({ projectPath, path, configPath, timeoutMs, maxOutputBytes }) =>
+      await handle(async () =>
+        await checkScript({
+          projectPath,
+          path,
           ...(configPath === undefined ? {} : { configPath }),
           ...(timeoutMs === undefined ? {} : { timeoutMs }),
           ...(maxOutputBytes === undefined ? {} : { maxOutputBytes }),

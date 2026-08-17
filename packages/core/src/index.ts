@@ -64,6 +64,8 @@ export {
   runProject,
 } from "./godot.js";
 export type { GodotOperationOptions } from "./godot.js";
+export { getProjectContext } from "./project-context.js";
+export type { ProjectContextOptions } from "./project-context.js";
 export {
   getManagedRunStatus,
   getManagedRunConnection,
@@ -78,10 +80,14 @@ export type {
 export {
   assertProjectFingerprint,
   getProjectIdentity,
+  getProjectSnapshot,
   inspectProject,
 } from "./project.js";
+export type { ProjectSnapshot } from "./project.js";
 export { runProcess } from "./process.js";
 export type { ProcessResult, RunProcessOptions } from "./process.js";
+export { checkScript } from "./script-check.js";
+export type { ScriptCheckOptions } from "./script-check.js";
 export {
   readProjectFile,
   replaceProjectText,

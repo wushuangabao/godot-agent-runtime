@@ -2,6 +2,7 @@
 
 import {
   checkProject,
+  checkScript,
   configureClient,
   assertRuntime,
   captureEditorScreenshot,
@@ -21,6 +22,7 @@ import {
   getEditorSceneTree,
   getEditorSelection,
   getManagedRunStatus,
+  getProjectContext,
   getRuntimeNode,
   observeRuntime,
   projectRuntime3D,
@@ -121,7 +123,9 @@ function printHelp(): void {
   process.stdout.write(`  doctor [--config PATH]\n`);
   process.stdout.write(`  find [SEARCH_ROOT] [--max-depth N] [--limit N]\n`);
   process.stdout.write(`  inspect PROJECT_PATH\n`);
+  process.stdout.write(`  context PROJECT_PATH [--editor-run-id RUN_ID] [--runtime-run-id RUN_ID]\n`);
   process.stdout.write(`  check PROJECT_PATH [--config PATH] [--timeout MS]\n`);
+  process.stdout.write(`  script-check PROJECT_PATH RES_PATH [--config PATH] [--timeout MS] [--max-output BYTES]\n`);
   process.stdout.write(`  file-read PROJECT_PATH RES_PATH\n`);
   process.stdout.write(`  file-write PROJECT_PATH RES_PATH --content TEXT (--create-only | --expected-sha256 HASH) [--expected-project-fingerprint HASH]\n`);
   process.stdout.write(`  file-replace PROJECT_PATH RES_PATH --project-fingerprint HASH --old TEXT --new TEXT [--replace-all true|false]\n`);
@@ -201,6 +205,17 @@ async function main(): Promise<void> {
       if (!values[0]) throw new Error("inspect requires PROJECT_PATH.");
       print(await inspectProject(values[0]));
       return;
+    case "context": {
+      if (!values[0]) throw new Error("context requires PROJECT_PATH.");
+      const editorRunId = option(args, "--editor-run-id");
+      const runtimeRunId = option(args, "--runtime-run-id");
+      print(await getProjectContext({
+        projectPath: values[0],
+        ...(editorRunId === undefined ? {} : { editorRunId }),
+        ...(runtimeRunId === undefined ? {} : { runtimeRunId }),
+      }));
+      return;
+    }
     case "file-read":
       if (!values[0] || !values[1]) throw new Error("file-read requires PROJECT_PATH and RES_PATH.");
       print(await readProjectFile({ projectPath: values[0], path: values[1] }));
@@ -252,6 +267,29 @@ async function main(): Promise<void> {
         }),
       );
       return;
+    case "script-check": {
+      if (!values[0] || !values[1]) {
+        throw new Error("script-check requires PROJECT_PATH and RES_PATH.");
+      }
+      const maxOutput = option(args, "--max-output");
+      print(
+        await checkScript({
+          projectPath: values[0],
+          path: values[1],
+          ...(configPath === undefined ? {} : { configPath }),
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
+          ...(maxOutput === undefined
+            ? {}
+            : {
+                maxOutputBytes: parseInteger(maxOutput, "--max-output", {
+                  min: 1_024,
+                  max: 1_048_576,
+                }),
+              }),
+        }),
+      );
+      return;
+    }
     case "run":
       if (!values[0]) throw new Error("run requires PROJECT_PATH.");
       print(

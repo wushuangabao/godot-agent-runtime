@@ -4,6 +4,7 @@ import {
   mkdir,
   open,
   readFile,
+  realpath,
   rename,
   stat,
   writeFile,
@@ -104,43 +105,65 @@ async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
   await rename(temporaryPath, path);
 }
 
+function runNotFoundFailure(
+  runId: string,
+  projectPath: string,
+  metadataPath: string,
+  error: unknown,
+): RuntimeFailure {
+  return new RuntimeFailure({
+    code: "RUN_NOT_FOUND",
+    stage: "discovery",
+    message: `Run ${runId} was not found for ${projectPath}.`,
+    details: {
+      runId,
+      projectPath,
+      metadataPath,
+      cause: error instanceof Error ? error.message : String(error),
+    },
+    recovery: ["Use a runId returned for the same project by godot_scene_launch."],
+  });
+}
+
 async function readMetadata(projectPath: string, runId: string): Promise<RunMetadata> {
   assertRunId(runId);
   const resolvedProjectPath = resolve(projectPath);
-  const { metadataPath } = runPaths(resolvedProjectPath, runId);
+  const unresolvedMetadataPath = runPaths(resolvedProjectPath, runId).metadataPath;
+  let canonicalProjectPath: string;
+  try {
+    canonicalProjectPath = await realpath(resolvedProjectPath);
+  } catch (error) {
+    throw runNotFoundFailure(runId, resolvedProjectPath, unresolvedMetadataPath, error);
+  }
+  const { metadataPath } = runPaths(canonicalProjectPath, runId);
   let metadata: RunMetadata;
   try {
     metadata = JSON.parse(await readFile(metadataPath, "utf8")) as RunMetadata;
   } catch (error) {
-    throw new RuntimeFailure({
-      code: "RUN_NOT_FOUND",
-      stage: "discovery",
-      message: `Run ${runId} was not found for ${resolvedProjectPath}.`,
-      details: {
-        runId,
-        projectPath: resolvedProjectPath,
-        metadataPath,
-        cause: error instanceof Error ? error.message : String(error),
-      },
-      recovery: ["Use a runId returned for the same project by godot_scene_launch."],
-    });
+    throw runNotFoundFailure(runId, canonicalProjectPath, metadataPath, error);
   }
 
+  let metadataProjectPath: string | null = null;
+  try {
+    metadataProjectPath = await realpath(resolve(metadata.projectPath));
+  } catch {
+    // Invalid or stale metadata is rejected below with the stable run error.
+  }
   if (
     metadata.schemaVersion !== 1 ||
     metadata.runId !== runId ||
-    resolve(metadata.projectPath) !== resolvedProjectPath
+    metadataProjectPath !== canonicalProjectPath
   ) {
     throw new RuntimeFailure({
       code: "RUN_METADATA_INVALID",
       stage: "validation",
       message: `Run metadata for ${runId} is invalid or belongs to another project.`,
-      details: { runId, projectPath: resolvedProjectPath, metadataPath },
+      details: { runId, projectPath: canonicalProjectPath, metadataPath },
       recovery: ["Launch a new run and use its returned projectPath and runId together."],
     });
   }
 
-  return metadata;
+  return { ...metadata, projectPath: canonicalProjectPath };
 }
 
 function isProcessAlive(processId: number): boolean {
@@ -222,7 +245,7 @@ async function waitForMetadata(
 export async function launchManagedProcess(
   options: ManagedProcessLaunchOptions,
 ): Promise<GodotLaunchResult> {
-  const projectPath = resolve(options.projectPath);
+  const projectPath = await realpath(resolve(options.projectPath));
   const runId = randomUUID();
   const token = randomBytes(32).toString("hex");
   const paths = runPaths(projectPath, runId);
