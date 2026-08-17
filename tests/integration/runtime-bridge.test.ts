@@ -1,4 +1,6 @@
 import { existsSync } from "node:fs";
+import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -36,7 +38,7 @@ describe.skipIf(!hasLocalConfig)("runtime bridge integration", () => {
       try {
         const info = await getRuntimeInfo({ projectPath, runId: launch.runId });
         expect(info.protocolVersion).toBe(RUNTIME_PROTOCOL_VERSION);
-        expect(info.capabilities).toEqual(["screenshot", "ui", "scene_tree", "node", "observe", "simulate", "spatial_3d", "input", "input_sequence", "assert", "wait", "control"]);
+        expect(info.capabilities).toEqual(["screenshot", "screenshot_receipt", "ui", "scene_tree", "node", "observe", "simulate", "spatial_3d", "input", "input_sequence", "assert", "wait", "control"]);
 
         const observation = await observeRuntime({
           projectPath,
@@ -154,9 +156,30 @@ describe.skipIf(!hasLocalConfig)("runtime bridge integration", () => {
         const button = ui.elements[0];
         expect(button?.path).toContain("StartButton");
 
-        const before = await captureRuntimeScreenshot({ projectPath, runId: launch.runId });
+        await expect(captureRuntimeScreenshot({
+          projectPath,
+          runId: launch.runId,
+          expectedScenePath: "res://not-current.tscn",
+        })).rejects.toMatchObject({ payload: { code: "EVIDENCE_SCENE_MISMATCH" } });
+        const before = await captureRuntimeScreenshot({
+          projectPath,
+          runId: launch.runId,
+          expectedScenePath: "res://main.tscn",
+        });
         expect(existsSync(before.path)).toBe(true);
         expect(before.bytes).toBeGreaterThan(0);
+        expect(before.evidence).toMatchObject({
+          class: "runtime_frame",
+          projectFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+          scenePath: "res://main.tscn",
+          runId: launch.runId,
+          provesRuntime: true,
+          provesInteraction: false,
+          warnings: [],
+        });
+        expect(before.evidence.limitations).toContain(
+          "A single frame does not prove motion or input-driven behavior.",
+        );
 
         const input = await injectRuntimeInputSequence({
           projectPath,
@@ -214,6 +237,57 @@ describe.skipIf(!hasLocalConfig)("runtime bridge integration", () => {
       } finally {
         const stopped = await stopManagedRun({ projectPath, runId: launch.runId });
         expect(stopped.state).toBe("stopped");
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "deletes a runtime PNG when the live scene changes during capture",
+    async () => {
+      const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-runtime-evidence-race-"));
+      await cp(resolve("examples", "control-ui"), projectPath, {
+        recursive: true,
+        filter: (source) => !source.includes(`${resolve("examples", "control-ui", ".godot")}`),
+      });
+      await writeFile(
+        resolve(projectPath, "alternate.tscn"),
+        '[gd_scene format=3]\n\n[node name="Alternate" type="Control"]\n',
+        "utf8",
+      );
+      const previousSwitch = process.env.GODOT_AGENT_RUNTIME_TEST_SCREENSHOT_SWITCH_SCENE_PATH;
+      process.env.GODOT_AGENT_RUNTIME_TEST_SCREENSHOT_SWITCH_SCENE_PATH = "res://alternate.tscn";
+      let runId: string | null = null;
+      try {
+        const launch = await launchProject({ projectPath, configPath, timeoutMs: 20_000 });
+        runId = launch.runId;
+        let removedPath = "";
+        try {
+          await captureRuntimeScreenshot({
+            projectPath,
+            runId,
+            expectedScenePath: "res://main.tscn",
+          });
+          expect.fail("capture should reject a scene switch during capture");
+        } catch (error) {
+          expect(error).toMatchObject({
+            payload: {
+              code: "EVIDENCE_SCENE_CHANGED_DURING_CAPTURE",
+              details: { beforeScenePath: "res://main.tscn", afterScenePath: "res://alternate.tscn" },
+            },
+          });
+          removedPath = String((error as { payload?: { details?: { path?: unknown } } }).payload?.details?.path ?? "");
+        }
+        expect(removedPath).not.toBe("");
+        expect(existsSync(removedPath)).toBe(false);
+      } finally {
+        if (previousSwitch === undefined) {
+          delete process.env.GODOT_AGENT_RUNTIME_TEST_SCREENSHOT_SWITCH_SCENE_PATH;
+        } else {
+          process.env.GODOT_AGENT_RUNTIME_TEST_SCREENSHOT_SWITCH_SCENE_PATH = previousSwitch;
+        }
+        if (runId !== null) await stopManagedRun({ projectPath, runId, timeoutMs: 15_000 });
+        await rm(projectPath, { recursive: true, force: true });
       }
     },
     60_000,

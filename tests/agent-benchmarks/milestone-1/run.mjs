@@ -66,6 +66,7 @@ async function preserveScreenshot(screenshot, filename) {
     height: screenshot.height,
     bytes: screenshot.bytes,
     sha256: screenshot.sha256,
+    evidence: screenshot.evidence,
   };
 }
 
@@ -168,7 +169,7 @@ try {
   if (runtimeTree.root?.path !== "/root/Main") throw new Error("Running Main scene was not discovered.");
 
   const beforeScreenshot = await step("capture-runtime-before", async () =>
-    await captureRuntimeScreenshot({ projectPath, runId: runtimeRun.runId }),
+    await captureRuntimeScreenshot({ projectPath, runId: runtimeRun.runId, expectedScenePath: "res://main.tscn" }),
   );
   const preservedBeforeScreenshot = await preserveScreenshot(beforeScreenshot, "runtime-before-click.png");
 
@@ -217,12 +218,18 @@ try {
   if (!started.satisfied || !label.passed) throw new Error("Structured runtime verification failed.");
 
   const afterScreenshot = await step("capture-runtime-after", async () =>
-    await captureRuntimeScreenshot({ projectPath, runId: runtimeRun.runId }),
+    await captureRuntimeScreenshot({ projectPath, runId: runtimeRun.runId, expectedScenePath: "res://main.tscn" }),
   );
   const preservedAfterScreenshot = await preserveScreenshot(afterScreenshot, "runtime-after-click.png");
   if (preservedBeforeScreenshot.sha256 === preservedAfterScreenshot.sha256) {
     throw new Error("Runtime screenshots did not change after the verified interaction.");
   }
+  if (preservedAfterScreenshot.evidence.class !== "runtime_frame" ||
+      !preservedAfterScreenshot.evidence.provesRuntime ||
+      preservedAfterScreenshot.evidence.provesInteraction) {
+    throw new Error("Runtime screenshot evidence was misclassified or claimed interaction proof.");
+  }
+  if (!label.passed) throw new Error("A runtime frame cannot replace godot_runtime_assert evidence.");
 
   const runtimeStopped = await stopRun("runtime", runtimeRun);
   runtimeRun = null;

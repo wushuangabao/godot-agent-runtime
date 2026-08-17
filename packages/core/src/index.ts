@@ -33,6 +33,11 @@ export {
 export type { CreateDebugReportOptions } from "./debug-report.js";
 export { RuntimeFailure, toRuntimeError } from "./errors.js";
 export {
+  createEditorEvidenceMetadata,
+  createRuntimeEvidenceMetadata,
+} from "./evidence.js";
+export type { ScreenshotReceipt } from "./evidence.js";
+export {
   batchEditorScene,
   captureEditorScreenshot,
   connectEditorSignal,
@@ -170,6 +175,7 @@ export type {
   RuntimeProjection3DOptions,
   RuntimeRaycast3DOptions,
   RuntimeSceneTreeOptions,
+  RuntimeScreenshotOptions,
   RuntimeSimulationOptions,
   RuntimeUiFindOptions,
   RuntimeUiSelector,

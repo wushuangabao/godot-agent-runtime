@@ -51,13 +51,15 @@ describe("Godot addon installer", () => {
     expect(second.projectConfigurationChanged).toBe(false);
     expect(project.enabledPlugins).toEqual(["existing_plugin", "godot_agent_runtime"]);
     expect(configuration.match(/godot_agent_runtime/g)).toHaveLength(1);
-    expect(editorBridge).toContain('const PROTOCOL_VERSION := "0.6.0"');
+    expect(editorBridge).toContain('const PROTOCOL_VERSION := "0.7.0"');
+    expect(editorBridge).toContain('"screenshot_receipt"');
     expect(editorBridge).toContain('"scene_open"');
     expect(editorBridge).toContain('"scene_batch"');
     expect(editorBridge).toContain('"project_settings"');
     expect(editorBridge).toContain('"input_map"');
     expect(editorBridge).toContain('"resource_inspect"');
     expect(editorBridge).toContain('"project_setting_operation_status"');
-    expect(runtimeBridge).toContain('const PROTOCOL_VERSION := "0.3.0"');
+    expect(runtimeBridge).toContain('const PROTOCOL_VERSION := "0.4.0"');
+    expect(runtimeBridge).toContain('"screenshot_receipt"');
   });
 });

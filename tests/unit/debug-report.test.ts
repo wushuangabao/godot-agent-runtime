@@ -26,7 +26,7 @@ describe("debug reports", () => {
         issue: 'Button crashes; {"token":"json issue secret tail"}',
         reproduction: "  ' password ' = 'single quoted reproduction secret tail'  ",
         projectPath: "C:/Users/Alice/game",
-        protocolVersions: { editor: "0.6.0", runtime: "0.3.0" },
+        protocolVersions: { editor: "0.7.0", runtime: "0.4.0" },
         doctor: { ok: true, checks: [] },
         diagnostics: {
           counts: { errors: 1, warnings: 0, unique: 1, repeated: 0 },
@@ -93,7 +93,7 @@ describe("debug reports", () => {
       format: "json",
       issue: "large logs",
       projectPath: "C:/game",
-      protocolVersions: { editor: "0.6.0", runtime: "0.3.0" },
+      protocolVersions: { editor: "0.7.0", runtime: "0.4.0" },
       doctor: { ok: true, checks: [] },
       diagnostics: {
         counts: { errors: 500, warnings: 0, unique: 500, repeated: 0 },

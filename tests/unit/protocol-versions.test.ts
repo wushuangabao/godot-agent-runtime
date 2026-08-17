@@ -12,9 +12,9 @@ import {
 } from "../../packages/protocol/src/index.js";
 
 describe("bridge protocol versions", () => {
-  it("evolves the editor protocol without changing runtime compatibility", () => {
-    expect(EDITOR_PROTOCOL_VERSION).toBe("0.6.0");
-    expect(RUNTIME_PROTOCOL_VERSION).toBe("0.3.0");
+  it("negotiates screenshot receipts with independent editor and runtime versions", () => {
+    expect(EDITOR_PROTOCOL_VERSION).toBe("0.7.0");
+    expect(RUNTIME_PROTOCOL_VERSION).toBe("0.4.0");
     expect(PROTOCOL_VERSION).toBe(RUNTIME_PROTOCOL_VERSION);
 
     expect(EditorBridgeInfoSchema.safeParse({
@@ -24,7 +24,7 @@ describe("bridge protocol versions", () => {
       engineVersion: "4.4",
       scene: null,
       historyVersion: null,
-      capabilities: ["scene_open", "scene_batch", "project_settings", "input_map", "resource_inspect"],
+      capabilities: ["scene_open", "scene_batch", "project_settings", "input_map", "resource_inspect", "screenshot_receipt"],
     }).success).toBe(true);
     expect(EditorBridgeInfoSchema.safeParse({
       ok: true,
@@ -33,7 +33,7 @@ describe("bridge protocol versions", () => {
       engineVersion: "4.4",
       scene: null,
       historyVersion: null,
-      capabilities: [],
+      capabilities: ["screenshot_receipt"],
     }).success).toBe(false);
 
     const runtime = {

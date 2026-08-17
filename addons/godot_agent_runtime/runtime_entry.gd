@@ -1,6 +1,6 @@
 extends SceneTree
 
-const PROTOCOL_VERSION := "0.3.0"
+const PROTOCOL_VERSION := "0.4.0"
 const MAX_MESSAGE_BYTES := 1024 * 1024
 
 
@@ -116,10 +116,10 @@ class RuntimeBridge:
 					"protocolVersion": PROTOCOL_VERSION,
 					"engineVersion": Engine.get_version_info().get("string", "unknown"),
 					"scene": get_tree().current_scene.scene_file_path if get_tree().current_scene != null else null,
-					"capabilities": ["screenshot", "ui", "scene_tree", "node", "observe", "simulate", "spatial_3d", "input", "input_sequence", "assert", "wait", "control"],
+					"capabilities": ["screenshot", "screenshot_receipt", "ui", "scene_tree", "node", "observe", "simulate", "spatial_3d", "input", "input_sequence", "assert", "wait", "control"],
 				}
 			"screenshot":
-				return await _capture_screenshot()
+				return await _capture_screenshot(params)
 			"ui_find":
 				return _find_ui(params)
 			"scene_tree":
@@ -164,8 +164,33 @@ class RuntimeBridge:
 				return _failure("RUNTIME_COMMAND_UNKNOWN", "Unknown runtime command: %s" % command)
 
 
-	func _capture_screenshot() -> Dictionary:
+	func _runtime_scene_identity() -> Dictionary:
+		var scene := get_tree().current_scene
+		if scene == null:
+			return {"instanceId": 0, "scenePath": null}
+		return {
+			"instanceId": scene.get_instance_id(),
+			"scenePath": scene.scene_file_path if not scene.scene_file_path.is_empty() else null,
+		}
+
+
+	func _capture_screenshot(params: Dictionary) -> Dictionary:
+		var before := _runtime_scene_identity()
+		if params.has("expectedScenePath"):
+			var expected_scene_path := str(params.get("expectedScenePath", ""))
+			if before.scenePath != expected_scene_path:
+				return _failure("EVIDENCE_SCENE_MISMATCH", "The live runtime scene does not match expectedScenePath.", {
+					"expectedScenePath": expected_scene_path,
+					"actualScenePath": before.scenePath,
+				})
 		await get_tree().process_frame
+		var test_switch_scene_path := OS.get_environment("GODOT_AGENT_RUNTIME_TEST_SCREENSHOT_SWITCH_SCENE_PATH")
+		if not test_switch_scene_path.is_empty():
+			var switch_error := get_tree().change_scene_to_file(test_switch_scene_path)
+			if switch_error != OK:
+				return _failure("RUNTIME_SCREENSHOT_TEST_SCENE_SWITCH_FAILED", "Could not switch the screenshot race fixture scene.", {"error": switch_error})
+			await get_tree().process_frame
+			await get_tree().process_frame
 		RenderingServer.force_draw(false, 0.0)
 		var image := get_viewport().get_texture().get_image()
 		if image == null or image.is_empty():
@@ -181,10 +206,21 @@ class RuntimeBridge:
 		var save_error := image.save_png(path)
 		if save_error != OK:
 			return _failure("RUNTIME_SCREENSHOT_SAVE_FAILED", "Could not save the screenshot.", {"error": save_error})
+		var after := _runtime_scene_identity()
+		if before.instanceId != after.instanceId or before.scenePath != after.scenePath:
+			var cleanup_error := DirAccess.remove_absolute(path)
+			return _failure("EVIDENCE_SCENE_CHANGED_DURING_CAPTURE", "The live runtime scene changed while the screenshot was being captured.", {
+				"beforeScenePath": before.scenePath,
+				"afterScenePath": after.scenePath,
+				"path": path.replace("\\", "/"),
+				"cleanupError": cleanup_error,
+			})
 		return {
 			"path": path.replace("\\", "/"),
 			"width": image.get_width(),
 			"height": image.get_height(),
+			"scenePath": after.scenePath,
+			"capturedAt": Time.get_datetime_string_from_system(true, false) + "Z",
 		}
 
 

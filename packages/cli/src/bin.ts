@@ -265,7 +265,7 @@ function printHelp(): void {
   process.stdout.write(`  editor-save PROJECT_PATH RUN_ID --expected-scene RES_PATH --expected-history-version N\n`);
   process.stdout.write(`  editor-undo PROJECT_PATH RUN_ID --expected-scene RES_PATH --expected-history-version N [--expected-action NAME]\n`);
   process.stdout.write(`  editor-redo PROJECT_PATH RUN_ID --expected-scene RES_PATH --expected-history-version N [--expected-action NAME]\n`);
-  process.stdout.write(`  editor-screenshot PROJECT_PATH RUN_ID [--viewport 2d|3d] [--viewport-index 0..3]\n`);
+  process.stdout.write(`  editor-screenshot PROJECT_PATH RUN_ID [--expected-scene RES_PATH] [--viewport 2d|3d] [--viewport-index 0..3]\n`);
   process.stdout.write(`  runtime-ui PROJECT_PATH RUN_ID [--text TEXT] [--type TYPE] [--path NODE_PATH]\n`);
   process.stdout.write(`  runtime-tree PROJECT_PATH RUN_ID [--max-depth N] [--max-nodes N]\n`);
   process.stdout.write(`  runtime-node-get PROJECT_PATH RUN_ID --node NODE_PATH [--properties JSON_ARRAY]\n`);
@@ -273,7 +273,7 @@ function printHelp(): void {
   process.stdout.write(`  runtime-simulate PROJECT_PATH RUN_ID --node NODE_PATH [--frames N] [--properties JSON_ARRAY] [--action NAME] [--strength N]\n`);
   process.stdout.write(`  runtime-3d-project PROJECT_PATH RUN_ID (--node NODE_PATH | --position JSON_OBJECT) [--camera NODE_PATH]\n`);
   process.stdout.write(`  runtime-3d-raycast PROJECT_PATH RUN_ID --x N --y N [--camera NODE_PATH] [--max-distance N] [--collision-mask N]\n`);
-  process.stdout.write(`  screenshot PROJECT_PATH RUN_ID\n`);
+  process.stdout.write(`  screenshot PROJECT_PATH RUN_ID [--expected-scene RES_PATH]\n`);
   process.stdout.write(`  click PROJECT_PATH RUN_ID --path NODE_PATH\n`);
   process.stdout.write(`  input-sequence PROJECT_PATH RUN_ID --steps JSON_ARRAY\n`);
   process.stdout.write(`  assert-property PROJECT_PATH RUN_ID --node NODE_PATH --property NAME --expected JSON\n`);
@@ -986,6 +986,7 @@ async function main(): Promise<void> {
     case "editor-screenshot": {
       if (!values[0] || !values[1]) throw new Error("editor-screenshot requires PROJECT_PATH and RUN_ID.");
       const viewport = option(args, "--viewport");
+      const expectedScenePath = option(args, "--expected-scene");
       if (viewport !== undefined && viewport !== "2d" && viewport !== "3d") {
         throw new Error("--viewport must be 2d or 3d.");
       }
@@ -993,6 +994,7 @@ async function main(): Promise<void> {
       print(await captureEditorScreenshot({
         projectPath: values[0],
         runId: values[1],
+        ...(expectedScenePath === undefined ? {} : { expectedScenePath }),
         ...(viewport === undefined ? {} : { viewport }),
         ...(indexSource === undefined ? {} : { viewportIndex: parseInteger(indexSource, "--viewport-index", { min: 0, max: 3 }) }),
       }));
@@ -1113,10 +1115,16 @@ async function main(): Promise<void> {
       }));
       return;
     }
-    case "screenshot":
+    case "screenshot": {
       if (!values[0] || !values[1]) throw new Error("screenshot requires PROJECT_PATH and RUN_ID.");
-      print(await captureRuntimeScreenshot({ projectPath: values[0], runId: values[1] }));
+      const expectedScenePath = option(args, "--expected-scene");
+      print(await captureRuntimeScreenshot({
+        projectPath: values[0],
+        runId: values[1],
+        ...(expectedScenePath === undefined ? {} : { expectedScenePath }),
+      }));
       return;
+    }
     case "click": {
       if (!values[0] || !values[1]) throw new Error("click requires PROJECT_PATH and RUN_ID.");
       const path = option(args, "--path");

@@ -223,6 +223,10 @@ const RuntimeLookupInputSchema = z.object({
   timeoutMs: z.number().int().min(100).max(30_000).optional(),
 });
 
+const RuntimeScreenshotInputSchema = RuntimeLookupInputSchema.extend({
+  expectedScenePath: z.string().startsWith("res://").endsWith(".tscn").optional(),
+});
+
 const RuntimeSelectorSchema = z.object({
   path: z.string().min(1).optional(),
   text: z.string().min(1).optional(),
@@ -497,7 +501,7 @@ const EditorSelectionSetInputSchema = RuntimeLookupInputSchema.extend({
   focus: z.boolean().default(true),
 });
 
-const EditorScreenshotInputSchema = RuntimeLookupInputSchema.extend({
+const EditorScreenshotInputSchema = RuntimeScreenshotInputSchema.extend({
   viewport: z.enum(["2d", "3d"]).default("2d"),
   viewportIndex: z.number().int().min(0).max(3).default(0),
 });
@@ -1173,14 +1177,19 @@ export function createMcpServer(): McpServer {
     "godot_runtime_screenshot",
     {
       title: "Capture the running game",
-      description: "Captures the root viewport to a PNG under the run-specific evidence directory and returns path, dimensions, size, and SHA-256.",
-      inputSchema: loggedInputSchema("godot_runtime_screenshot", RuntimeLookupInputSchema),
+      description: "Captures the root viewport to a PNG and returns additive runtime-frame evidence metadata bound to the live scene.",
+      inputSchema: loggedInputSchema("godot_runtime_screenshot", RuntimeScreenshotInputSchema),
       outputSchema: RuntimeScreenshotResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs }) =>
+    async ({ projectPath, runId, timeoutMs, expectedScenePath }) =>
       await handle("godot_runtime_screenshot", async () =>
-        await captureRuntimeScreenshot({ projectPath, runId, ...(timeoutMs === undefined ? {} : { timeoutMs }) }),
+        await captureRuntimeScreenshot({
+          projectPath,
+          runId,
+          ...(expectedScenePath === undefined ? {} : { expectedScenePath }),
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        }),
       ),
   );
 
@@ -2168,16 +2177,17 @@ export function createMcpServer(): McpServer {
     "godot_editor_screenshot",
     {
       title: "Capture an editor 2D or 3D viewport",
-      description: "Captures the managed editor's 2D viewport or one of four 3D viewports and returns active 3D editor camera metadata with the PNG evidence.",
+      description: "Captures a managed editor viewport and returns additive editor-view evidence metadata bound to the edited scene.",
       inputSchema: loggedInputSchema("godot_editor_screenshot", EditorScreenshotInputSchema),
       outputSchema: EditorScreenshotResultSchema,
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ projectPath, runId, timeoutMs, viewport, viewportIndex }) =>
+    async ({ projectPath, runId, timeoutMs, expectedScenePath, viewport, viewportIndex }) =>
       await handle("godot_editor_screenshot", async () =>
         await captureEditorScreenshot({
           projectPath,
           runId,
+          ...(expectedScenePath === undefined ? {} : { expectedScenePath }),
           viewport,
           viewportIndex,
           ...(timeoutMs === undefined ? {} : { timeoutMs }),

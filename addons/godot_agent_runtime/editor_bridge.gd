@@ -1,7 +1,7 @@
 @tool
 extends Node
 
-const PROTOCOL_VERSION := "0.6.0"
+const PROTOCOL_VERSION := "0.7.0"
 const MAX_MESSAGE_BYTES := 1024 * 1024
 const MAX_PROJECT_SETTING_OPERATIONS := 128
 
@@ -95,7 +95,7 @@ func _handle(peer: Dictionary, line: String) -> void:
 				"engineVersion": Engine.get_version_info().get("string", "unknown"),
 				"scene": root.scene_file_path if root != null else null,
 				"historyVersion": _history_version(root) if root != null else null,
-				"capabilities": ["scene_tree", "selection", "screenshot", "viewport_3d", "node_edit", "scene_instantiate", "scene_inheritance", "instance_editable", "resource_edit", "resource_save", "resource_focus", "signal_connect", "scene_save", "scene_open", "scene_batch", "undo_redo", "project_settings", "input_map", "resource_inspect"],
+				"capabilities": ["scene_tree", "selection", "screenshot", "screenshot_receipt", "viewport_3d", "node_edit", "scene_instantiate", "scene_inheritance", "instance_editable", "resource_edit", "resource_save", "resource_focus", "signal_connect", "scene_save", "scene_open", "scene_batch", "undo_redo", "project_settings", "input_map", "resource_inspect"],
 			})
 		"project_setting_get":
 			_send_ok(peer, request_id, _project_setting_get(params))
@@ -2248,6 +2248,16 @@ func _failure(code: String, message: String, details: Dictionary = {}) -> Dictio
 	return {"_error": {"code": code, "message": message, "details": details}}
 
 
+func _editor_scene_identity() -> Dictionary:
+	var root := _editor.get_edited_scene_root()
+	if root == null:
+		return {"instanceId": 0, "scenePath": null}
+	return {
+		"instanceId": root.get_instance_id(),
+		"scenePath": root.scene_file_path if not root.scene_file_path.is_empty() else null,
+	}
+
+
 func _screenshot(params: Dictionary) -> Dictionary:
 	var viewport_kind := str(params.get("viewport", "2d"))
 	if viewport_kind not in ["2d", "3d"]:
@@ -2255,9 +2265,20 @@ func _screenshot(params: Dictionary) -> Dictionary:
 	var viewport_index := int(params.get("viewportIndex", 0))
 	if viewport_index < 0 or viewport_index > 3:
 		return _failure("EDITOR_SCREENSHOT_VIEWPORT_INDEX_INVALID", "viewportIndex must be between 0 and 3.", {"viewportIndex": viewport_index})
+	var before := _editor_scene_identity()
+	if params.has("expectedScenePath"):
+		var expected_scene_path := str(params.get("expectedScenePath", ""))
+		if before.scenePath != expected_scene_path:
+			return _failure("EVIDENCE_SCENE_MISMATCH", "The active editor scene does not match expectedScenePath.", {
+				"expectedScenePath": expected_scene_path,
+				"actualScenePath": before.scenePath,
+			})
 	_editor.set_main_screen_editor("3D" if viewport_kind == "3d" else "2D")
+	var test_switch_scene_path := OS.get_environment("GODOT_AGENT_RUNTIME_TEST_SCREENSHOT_SWITCH_SCENE_PATH")
 	for _frame in range(3):
 		await get_tree().process_frame
+		if _frame == 0 and not test_switch_scene_path.is_empty():
+			_editor.open_scene_from_path(test_switch_scene_path)
 	RenderingServer.force_draw(false, 0.0)
 	var viewport := _editor.get_editor_viewport_3d(viewport_index) if viewport_kind == "3d" else _editor.get_editor_viewport_2d()
 	if viewport == null:
@@ -2294,6 +2315,15 @@ func _screenshot(params: Dictionary) -> Dictionary:
 			"near": camera.near,
 			"far": camera.far,
 		}
+	var after := _editor_scene_identity()
+	if before.instanceId != after.instanceId or before.scenePath != after.scenePath:
+		var cleanup_error := DirAccess.remove_absolute(path)
+		return _failure("EVIDENCE_SCENE_CHANGED_DURING_CAPTURE", "The active editor scene changed while the screenshot was being captured.", {
+			"beforeScenePath": before.scenePath,
+			"afterScenePath": after.scenePath,
+			"path": path.replace("\\", "/"),
+			"cleanupError": cleanup_error,
+		})
 	return {
 		"path": path.replace("\\", "/"),
 		"width": image.get_width(),
@@ -2301,6 +2331,8 @@ func _screenshot(params: Dictionary) -> Dictionary:
 		"viewport": viewport_kind,
 		"viewportIndex": viewport_index if viewport_kind == "3d" else null,
 		"camera": camera_data,
+		"scenePath": after.scenePath,
+		"capturedAt": Time.get_datetime_string_from_system(true, false) + "Z",
 	}
 
 

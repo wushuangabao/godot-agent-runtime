@@ -62,6 +62,7 @@ async function preserveScreenshot(screenshot, filename) {
     height: screenshot.height,
     bytes: screenshot.bytes,
     sha256: screenshot.sha256,
+    evidence: screenshot.evidence,
   };
 }
 
@@ -156,7 +157,7 @@ try {
   if (!Number.isFinite(startX)) throw new Error("Player start position was not numeric.");
 
   const beforeScreenshot = await step("capture-runtime-before", async () =>
-    await captureRuntimeScreenshot({ projectPath, runId: runtimeRun.runId }),
+    await captureRuntimeScreenshot({ projectPath, runId: runtimeRun.runId, expectedScenePath: inheritedSceneResource }),
   );
   const preservedBefore = await preserveScreenshot(beforeScreenshot, "runtime-before-movement.png");
 
@@ -231,12 +232,18 @@ try {
   );
 
   const afterScreenshot = await step("capture-runtime-after", async () =>
-    await captureRuntimeScreenshot({ projectPath, runId: runtimeRun.runId }),
+    await captureRuntimeScreenshot({ projectPath, runId: runtimeRun.runId, expectedScenePath: inheritedSceneResource }),
   );
   const preservedAfter = await preserveScreenshot(afterScreenshot, "runtime-after-movement.png");
   if (preservedBefore.sha256 === preservedAfter.sha256) {
     throw new Error("Runtime screenshots did not change after live Player movement.");
   }
+  if (preservedAfter.evidence.class !== "runtime_frame" ||
+      !preservedAfter.evidence.provesRuntime ||
+      preservedAfter.evidence.provesInteraction) {
+    throw new Error("Runtime screenshot evidence was misclassified or claimed interaction proof.");
+  }
+  if (!inheritedAssertion.passed) throw new Error("A runtime frame cannot replace godot_runtime_assert evidence.");
 
   const runtimeStopped = await stopRun("runtime", runtimeRun);
   runtimeRun = null;

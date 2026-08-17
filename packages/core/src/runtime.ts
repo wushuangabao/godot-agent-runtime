@@ -22,11 +22,13 @@ import {
 } from "@godot-agent-runtime/protocol";
 
 import { RuntimeFailure } from "./errors.js";
+import { createRuntimeEvidenceMetadata } from "./evidence.js";
 import { getManagedRunConnection, getManagedRunStatus } from "./managed-run.js";
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const RUNTIME_CAPABILITIES = [
   "screenshot",
+  "screenshot_receipt",
   "ui",
   "scene_tree",
   "node",
@@ -94,6 +96,10 @@ export interface RuntimeLookupOptions {
   readonly projectPath: string;
   readonly runId: string;
   readonly timeoutMs?: number;
+}
+
+export interface RuntimeScreenshotOptions extends RuntimeLookupOptions {
+  readonly expectedScenePath?: string;
 }
 
 export interface RuntimeUiSelector {
@@ -512,9 +518,13 @@ export async function raycastRuntime3D(
 }
 
 export async function captureRuntimeScreenshot(
-  options: RuntimeLookupOptions,
+  options: RuntimeScreenshotOptions,
 ): Promise<RuntimeScreenshotResult> {
-  const result = await sendBridgeCommand(options, "screenshot");
+  const result = await sendBridgeCommand(options, "screenshot", {
+    ...(options.expectedScenePath === undefined
+      ? {}
+      : { expectedScenePath: options.expectedScenePath }),
+  });
   const path = resolve(String(result.path ?? ""));
   const evidenceRoot = resolve(
     options.projectPath,
@@ -533,7 +543,18 @@ export async function captureRuntimeScreenshot(
       recovery: ["Stop this run and launch a fresh bridge session."],
     });
   }
-  const [buffer, information] = await Promise.all([readFile(path), stat(path)]);
+  const [buffer, information, evidence] = await Promise.all([
+    readFile(path),
+    stat(path),
+    createRuntimeEvidenceMetadata({
+      projectPath: options.projectPath,
+      runId: options.runId,
+      receipt: {
+        capturedAt: result.capturedAt,
+        scenePath: result.scenePath,
+      },
+    }),
+  ]);
   return {
     ok: true,
     runId: options.runId,
@@ -542,6 +563,7 @@ export async function captureRuntimeScreenshot(
     height: Number(result.height),
     bytes: information.size,
     sha256: createHash("sha256").update(buffer).digest("hex"),
+    evidence,
   };
 }
 

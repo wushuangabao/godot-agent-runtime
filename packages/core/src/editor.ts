@@ -43,6 +43,7 @@ import {
 } from "@godot-agent-runtime/protocol";
 
 import { RuntimeFailure } from "./errors.js";
+import { createEditorEvidenceMetadata } from "./evidence.js";
 import {
   prepareHostEnvironment,
   resolveGodotExecutable,
@@ -66,6 +67,7 @@ const EDITOR_CAPABILITIES = [
   "scene_tree",
   "selection",
   "screenshot",
+  "screenshot_receipt",
   "viewport_3d",
   "node_edit",
   "scene_instantiate",
@@ -372,6 +374,7 @@ export interface EditorSignalConnectOptions extends EditorMutationLookupOptions 
 }
 
 export interface EditorScreenshotOptions extends RuntimeLookupOptions {
+  readonly expectedScenePath?: string;
   readonly viewport?: "2d" | "3d";
   readonly viewportIndex?: number;
 }
@@ -1094,6 +1097,9 @@ export async function captureEditorScreenshot(
   options: EditorScreenshotOptions,
 ): Promise<EditorScreenshotResult> {
   const result = await sendBridgeCommand(options, "screenshot", {
+    ...(options.expectedScenePath === undefined
+      ? {}
+      : { expectedScenePath: options.expectedScenePath }),
     viewport: options.viewport ?? "2d",
     viewportIndex: options.viewportIndex ?? 0,
   });
@@ -1115,7 +1121,18 @@ export async function captureEditorScreenshot(
       recovery: ["Stop this editor run and launch a fresh bridge session."],
     });
   }
-  const [buffer, information] = await Promise.all([readFile(path), stat(path)]);
+  const [buffer, information, evidence] = await Promise.all([
+    readFile(path),
+    stat(path),
+    createEditorEvidenceMetadata({
+      projectPath: options.projectPath,
+      runId: options.runId,
+      receipt: {
+        capturedAt: result.capturedAt,
+        scenePath: result.scenePath,
+      },
+    }),
+  ]);
   return {
     ok: true,
     runId: options.runId,
@@ -1124,6 +1141,7 @@ export async function captureEditorScreenshot(
     height: Number(result.height),
     bytes: information.size,
     sha256: createHash("sha256").update(buffer).digest("hex"),
+    evidence,
     viewport: result.viewport as "2d" | "3d",
     viewportIndex: result.viewportIndex === null ? null : Number(result.viewportIndex),
     camera: result.camera as EditorScreenshotResult["camera"],

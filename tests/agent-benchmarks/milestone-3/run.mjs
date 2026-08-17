@@ -69,6 +69,7 @@ async function preserveScreenshot(screenshot, filename) {
     height: screenshot.height,
     bytes: screenshot.bytes,
     sha256: screenshot.sha256,
+    evidence: screenshot.evidence,
     ...(screenshot.viewport === undefined ? {} : {
       viewport: screenshot.viewport,
       viewportIndex: screenshot.viewportIndex,
@@ -146,6 +147,7 @@ try {
     await captureEditorScreenshot({
       projectPath,
       runId: editorRun.runId,
+      expectedScenePath: "res://main.tscn",
       viewport: "3d",
       viewportIndex: 0,
     }),
@@ -154,6 +156,9 @@ try {
     throw new Error("Editor 3D screenshot did not expose viewport and camera metadata.");
   }
   const preservedEditor = await preserveScreenshot(editorScreenshot, "editor-3d-viewport.png");
+  if (preservedEditor.evidence.class !== "editor_viewport" || preservedEditor.evidence.provesRuntime) {
+    throw new Error("Editor screenshot evidence cannot satisfy runtime completion.");
+  }
 
   const editorStopped = await stopRun("editor", editorRun);
   editorRun = null;
@@ -202,7 +207,7 @@ try {
     throw new Error("CharacterBody3D observation did not expose a grounded numeric start state.");
   }
   const runtimeBefore = await step("capture-runtime-3d-before", async () =>
-    await captureRuntimeScreenshot({ projectPath, runId: runtimeRun.runId }),
+    await captureRuntimeScreenshot({ projectPath, runId: runtimeRun.runId, expectedScenePath: "res://main.tscn" }),
   );
   const preservedBefore = await preserveScreenshot(runtimeBefore, "runtime-3d-before.png");
 
@@ -300,12 +305,18 @@ try {
   if (raycastAfter.collider?.path !== playerPath) throw new Error("Moved Player could not be selected by 3D raycast.");
 
   const runtimeAfter = await step("capture-runtime-3d-after", async () =>
-    await captureRuntimeScreenshot({ projectPath, runId: runtimeRun.runId }),
+    await captureRuntimeScreenshot({ projectPath, runId: runtimeRun.runId, expectedScenePath: "res://main.tscn" }),
   );
   const preservedAfter = await preserveScreenshot(runtimeAfter, "runtime-3d-after.png");
   if (preservedBefore.sha256 === preservedAfter.sha256) {
     throw new Error("Runtime 3D screenshots did not change after verified movement.");
   }
+  if (preservedAfter.evidence.class !== "runtime_frame" ||
+      !preservedAfter.evidence.provesRuntime ||
+      preservedAfter.evidence.provesInteraction) {
+    throw new Error("Runtime screenshot evidence was misclassified or claimed interaction proof.");
+  }
+  if (!scenarioAssertion.passed) throw new Error("A runtime frame cannot replace godot_runtime_assert evidence.");
 
   const runtimeStopped = await stopRun("runtime", runtimeRun);
   runtimeRun = null;

@@ -11,18 +11,21 @@ import {
 describe("bridge handshake negotiation", () => {
   it("preserves the bridge's actual supported capability subset", () => {
     const result = validateBridgeHandshake(
-      { protocolVersion: "0.3.0", capabilities: ["ui"] },
+      { protocolVersion: RUNTIME_PROTOCOL_VERSION, capabilities: ["ui", "screenshot_receipt"] },
       "runtime",
       RUNTIME_PROTOCOL_VERSION,
-      ["ui", "input"],
+      ["ui", "input", "screenshot_receipt"],
     );
 
-    expect(result).toEqual({ protocolVersion: "0.3.0", capabilities: ["ui"] });
+    expect(result).toEqual({
+      protocolVersion: "0.4.0",
+      capabilities: ["ui", "screenshot_receipt"],
+    });
   });
 
   it("rejects an incompatible protocol version with a stable error", () => {
     expect(() => validateBridgeHandshake(
-      { protocolVersion: "0.4.0", capabilities: [] },
+      { protocolVersion: "0.6.0", capabilities: [] },
       "editor",
       EDITOR_PROTOCOL_VERSION,
       [],
@@ -30,7 +33,7 @@ describe("bridge handshake negotiation", () => {
 
     try {
       validateBridgeHandshake(
-        { protocolVersion: "0.4.0", capabilities: [] },
+        { protocolVersion: "0.6.0", capabilities: [] },
         "editor",
         EDITOR_PROTOCOL_VERSION,
         [],
@@ -40,7 +43,7 @@ describe("bridge handshake negotiation", () => {
         payload: {
           code: "EDITOR_PROTOCOL_VERSION_MISMATCH",
           stage: "protocol",
-          details: { expected: "0.6.0", actual: "0.4.0" },
+          details: { expected: "0.7.0", actual: "0.6.0" },
         },
       });
     }
@@ -48,7 +51,7 @@ describe("bridge handshake negotiation", () => {
 
   it("rejects unknown capabilities for the negotiated version", () => {
     expect(() => validateBridgeHandshake(
-      { protocolVersion: "0.3.0", capabilities: ["run_script"] },
+      { protocolVersion: RUNTIME_PROTOCOL_VERSION, capabilities: ["run_script"] },
       "runtime",
       RUNTIME_PROTOCOL_VERSION,
       ["ui"],

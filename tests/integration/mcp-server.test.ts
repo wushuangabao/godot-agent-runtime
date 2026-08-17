@@ -157,6 +157,8 @@ describe("MCP server", () => {
     const editorNodeCreate = tools.find(({ name }) => name === "godot_editor_node_create");
     const editorBatch = tools.find(({ name }) => name === "godot_editor_batch");
     const editorSceneSave = tools.find(({ name }) => name === "godot_editor_scene_save");
+    const editorScreenshot = tools.find(({ name }) => name === "godot_editor_screenshot");
+    const runtimeScreenshot = tools.find(({ name }) => name === "godot_runtime_screenshot");
     const logRead = tools.find(({ name }) => name === "godot_log_read");
     const diagnostics = tools.find(({ name }) => name === "godot_diagnostics");
     const debugReport = tools.find(({ name }) => name === "godot_debug_report");
@@ -224,6 +226,12 @@ describe("MCP server", () => {
       "expectedScenePath",
       "expectedHistoryVersion",
     ]));
+    expect(editorScreenshot?.inputSchema.properties).toHaveProperty("expectedScenePath");
+    expect(runtimeScreenshot?.inputSchema.properties).toHaveProperty("expectedScenePath");
+    expect(editorScreenshot?.outputSchema?.required).toContain("evidence");
+    expect(runtimeScreenshot?.outputSchema?.required).toContain("evidence");
+    expect(editorScreenshot?.outputSchema?.properties).toHaveProperty("evidence");
+    expect(runtimeScreenshot?.outputSchema?.properties).toHaveProperty("evidence");
     expect(logRead?.inputSchema.additionalProperties).toBe(false);
     expect(diagnostics?.inputSchema.additionalProperties).toBe(false);
     expect(debugReport?.inputSchema.required).toEqual(expect.arrayContaining([

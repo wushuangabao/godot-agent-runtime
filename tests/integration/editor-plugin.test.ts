@@ -182,7 +182,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         let identity = await getProjectIdentity(projectPath);
 
         expect(await getEditorInfo({ projectPath, runId })).toMatchObject({
-          protocolVersion: "0.6.0",
+          protocolVersion: "0.7.0",
           capabilities: expect.arrayContaining(["project_settings", "input_map", "resource_inspect"]),
         });
         expect(await getEditorProjectSetting({
@@ -368,7 +368,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         } as const;
 
         expect(await getEditorInfo({ projectPath, runId: editorRunId })).toMatchObject({
-          protocolVersion: "0.6.0",
+          protocolVersion: "0.7.0",
           capabilities: expect.arrayContaining(["scene_batch"]),
         });
 
@@ -718,7 +718,7 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
 
         const initial = await getEditorInfo({ projectPath, runId: editorRunId });
         expect(initial).toMatchObject({
-          protocolVersion: "0.6.0",
+          protocolVersion: "0.7.0",
           scene: "res://main.tscn",
           historyVersion: expect.any(Number),
         });
@@ -954,12 +954,13 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         };
 
         const info = await getEditorInfo({ projectPath, runId: editorRunId });
-        expect(info.protocolVersion).toBe("0.6.0");
+        expect(info.protocolVersion).toBe("0.7.0");
         expect(info.historyVersion).toEqual(expect.any(Number));
         expect(info.capabilities).toEqual([
           "scene_tree",
           "selection",
           "screenshot",
+          "screenshot_receipt",
           "viewport_3d",
           "node_edit",
           "scene_instantiate",
@@ -1481,9 +1482,18 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         await installGodotAddon(projectPath);
         const launch = await launchEditor({ projectPath, configPath, timeoutMs: 30_000 });
         runId = launch.runId;
+        const identity = await getProjectIdentity(projectPath);
+        await expect(captureEditorScreenshot({
+          projectPath,
+          runId,
+          expectedScenePath: "res://not-current.tscn",
+          viewport: "3d",
+          viewportIndex: 0,
+        })).rejects.toMatchObject({ payload: { code: "EVIDENCE_SCENE_MISMATCH" } });
         const screenshot = await captureEditorScreenshot({
           projectPath,
           runId,
+          expectedScenePath: "res://main.tscn",
           viewport: "3d",
           viewportIndex: 0,
         });
@@ -1492,10 +1502,73 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           viewport: "3d",
           viewportIndex: 0,
           camera: { projection: "perspective" },
+          evidence: {
+            class: "editor_viewport",
+            projectFingerprint: identity.projectFingerprint,
+            scenePath: "res://main.tscn",
+            runId,
+            provesRuntime: false,
+            provesInteraction: false,
+            warnings: [],
+          },
         });
         expect(screenshot.width).toBeGreaterThan(0);
         expect(screenshot.height).toBeGreaterThan(0);
       } finally {
+        if (runId !== null) await stopManagedRun({ projectPath, runId, timeoutMs: 15_000 });
+        await rm(projectPath, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "deletes an editor PNG when the edited scene changes during capture",
+    async () => {
+      const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-editor-evidence-race-"));
+      await cp(resolve("examples", "physics-3d"), projectPath, {
+        recursive: true,
+        filter: (source) => !source.includes(`${resolve("examples", "physics-3d", ".godot")}`),
+      });
+      await writeFile(
+        resolve(projectPath, "alternate.tscn"),
+        '[gd_scene format=3]\n\n[node name="Alternate" type="Node3D"]\n',
+        "utf8",
+      );
+      const previousSwitch = process.env.GODOT_AGENT_RUNTIME_TEST_SCREENSHOT_SWITCH_SCENE_PATH;
+      process.env.GODOT_AGENT_RUNTIME_TEST_SCREENSHOT_SWITCH_SCENE_PATH = "res://alternate.tscn";
+      let runId: string | null = null;
+      try {
+        await installGodotAddon(projectPath);
+        const launch = await launchEditor({ projectPath, configPath, timeoutMs: 30_000 });
+        runId = launch.runId;
+        let removedPath = "";
+        try {
+          await captureEditorScreenshot({
+            projectPath,
+            runId,
+            expectedScenePath: "res://main.tscn",
+            viewport: "3d",
+            viewportIndex: 0,
+          });
+          expect.fail("capture should reject an edited-scene switch during capture");
+        } catch (error) {
+          expect(error).toMatchObject({
+            payload: {
+              code: "EVIDENCE_SCENE_CHANGED_DURING_CAPTURE",
+              details: { beforeScenePath: "res://main.tscn", afterScenePath: "res://alternate.tscn" },
+            },
+          });
+          removedPath = String((error as { payload?: { details?: { path?: unknown } } }).payload?.details?.path ?? "");
+        }
+        expect(removedPath).not.toBe("");
+        expect(existsSync(removedPath)).toBe(false);
+      } finally {
+        if (previousSwitch === undefined) {
+          delete process.env.GODOT_AGENT_RUNTIME_TEST_SCREENSHOT_SWITCH_SCENE_PATH;
+        } else {
+          process.env.GODOT_AGENT_RUNTIME_TEST_SCREENSHOT_SWITCH_SCENE_PATH = previousSwitch;
+        }
         if (runId !== null) await stopManagedRun({ projectPath, runId, timeoutMs: 15_000 });
         await rm(projectPath, { recursive: true, force: true });
       }

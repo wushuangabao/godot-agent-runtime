@@ -1,7 +1,7 @@
 import * as z from "zod/v4";
 
-export const EDITOR_PROTOCOL_VERSION = "0.6.0";
-export const RUNTIME_PROTOCOL_VERSION = "0.3.0";
+export const EDITOR_PROTOCOL_VERSION = "0.7.0";
+export const RUNTIME_PROTOCOL_VERSION = "0.4.0";
 /** @deprecated Use EDITOR_PROTOCOL_VERSION or RUNTIME_PROTOCOL_VERSION explicitly. */
 export const PROTOCOL_VERSION = RUNTIME_PROTOCOL_VERSION;
 
@@ -73,6 +73,33 @@ export const ProjectInfoSchema = z.object({
 export type ProjectInfo = z.infer<typeof ProjectInfoSchema>;
 
 export const Sha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
+
+const EvidenceBaseSchema = z.object({
+  capturedAt: z.string().datetime(),
+  projectFingerprint: Sha256Schema,
+  scenePath: z.string().startsWith("res://").nullable(),
+  runId: z.uuid(),
+  provesInteraction: z.literal(false),
+  limitations: z.array(z.string().min(1)).min(1),
+  warnings: z.array(z.string().min(1)),
+}).strict();
+
+export const EditorViewportEvidenceSchema = EvidenceBaseSchema.extend({
+  class: z.literal("editor_viewport"),
+  provesRuntime: z.literal(false),
+}).strict();
+
+export const RuntimeFrameEvidenceSchema = EvidenceBaseSchema.extend({
+  class: z.literal("runtime_frame"),
+  provesRuntime: z.literal(true),
+}).strict();
+
+export const EvidenceMetadataSchema = z.discriminatedUnion("class", [
+  EditorViewportEvidenceSchema,
+  RuntimeFrameEvidenceSchema,
+]);
+
+export type EvidenceMetadata = z.infer<typeof EvidenceMetadataSchema>;
 
 export const ProjectIdentitySchema = z.object({
   projectPath: z.string().min(1),
@@ -314,7 +341,7 @@ export const RuntimeBridgeInfoSchema = z.object({
   protocolVersion: z.literal(RUNTIME_PROTOCOL_VERSION),
   engineVersion: z.string().min(1),
   scene: z.string().nullable(),
-  capabilities: z.array(z.enum(["screenshot", "ui", "scene_tree", "node", "observe", "simulate", "spatial_3d", "input", "input_sequence", "assert", "wait", "control"])),
+  capabilities: z.array(z.enum(["screenshot", "screenshot_receipt", "ui", "scene_tree", "node", "observe", "simulate", "spatial_3d", "input", "input_sequence", "assert", "wait", "control"])),
 });
 
 export type RuntimeBridgeInfo = z.infer<typeof RuntimeBridgeInfoSchema>;
@@ -480,7 +507,7 @@ export const RuntimeSimulationResultSchema = z.object({
 
 export type RuntimeSimulationResult = z.infer<typeof RuntimeSimulationResultSchema>;
 
-export const RuntimeScreenshotResultSchema = z.object({
+const ScreenshotResultBaseSchema = z.object({
   ok: z.literal(true),
   runId: z.uuid(),
   path: z.string().min(1),
@@ -488,7 +515,11 @@ export const RuntimeScreenshotResultSchema = z.object({
   height: z.number().int().positive(),
   bytes: z.number().int().nonnegative(),
   sha256: z.string().regex(/^[0-9a-f]{64}$/),
-});
+}).strict();
+
+export const RuntimeScreenshotResultSchema = ScreenshotResultBaseSchema.extend({
+  evidence: RuntimeFrameEvidenceSchema,
+}).strict();
 
 export type RuntimeScreenshotResult = z.infer<typeof RuntimeScreenshotResultSchema>;
 
@@ -828,6 +859,7 @@ export const EditorBridgeInfoSchema = z.object({
       "scene_tree",
       "selection",
       "screenshot",
+      "screenshot_receipt",
       "node_edit",
       "scene_instantiate",
       "scene_inheritance",
@@ -881,11 +913,12 @@ export const EditorCamera3DSchema = z.object({
   far: z.number().positive(),
 });
 
-export const EditorScreenshotResultSchema = RuntimeScreenshotResultSchema.extend({
+export const EditorScreenshotResultSchema = ScreenshotResultBaseSchema.extend({
+  evidence: EditorViewportEvidenceSchema,
   viewport: z.enum(["2d", "3d"]),
   viewportIndex: z.number().int().min(0).max(3).nullable(),
   camera: EditorCamera3DSchema.nullable(),
-});
+}).strict();
 
 export type EditorScreenshotResult = z.infer<typeof EditorScreenshotResultSchema>;
 
