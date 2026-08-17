@@ -1,4 +1,14 @@
 export { defaultConfigPath, loadDevelopmentConfig } from "./config.js";
+export { getAgentGuide } from "./agent-guidance.js";
+export type {
+  AgentGuideOverview,
+  AgentGuideRecipeResult,
+  AgentGuideResult,
+  AgentPlaybook,
+  AgentRecipe,
+  AgentRecipeSummary,
+  RecipeId,
+} from "@godot-agent-runtime/protocol";
 export { installGodotAddon } from "./addon.js";
 export type { AddonInstallResult } from "./addon.js";
 export { configureClient } from "./client-config.js";

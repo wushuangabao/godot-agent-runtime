@@ -5,12 +5,21 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { getProjectIdentity, readProjectFile } from "../../packages/core/src/index.js";
+import { getAgentGuide, getProjectIdentity, readProjectFile } from "../../packages/core/src/index.js";
 import { createMcpServer } from "../../packages/mcp-server/src/server.js";
-import {
-  SafeFileWriteResultSchema,
-  SafeTextReplaceResultSchema,
-} from "../../packages/protocol/src/index.js";
+import { SafeFileWriteResultSchema, SafeTextReplaceResultSchema } from "../../packages/protocol/src/index.js";
+
+function stable(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stable);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, stable((value as Record<string, unknown>)[key])]),
+    );
+  }
+  return value;
+}
 
 let compiledCli: Promise<void> | undefined;
 
@@ -83,6 +92,7 @@ describe("MCP server", () => {
       "godot_projects_find",
       "godot_project_inspect",
       "godot_project_context",
+      "godot_agent_guide",
       "godot_project_check",
       "godot_script_check",
       "godot_file_read",
@@ -144,6 +154,23 @@ describe("MCP server", () => {
     for (const tool of tools) {
       expect(tool.inputSchema.type).toBe("object");
       expect(tool.outputSchema).toBeDefined();
+    }
+    expect(tools).toHaveLength(62);
+    expect(Buffer.byteLength(JSON.stringify(stable(tools)), "utf8")).toBeLessThanOrEqual(144_606);
+    const instructions = client.getInstructions() ?? "";
+    expect(Buffer.byteLength(instructions, "utf8")).toBeLessThanOrEqual(4_096);
+    for (const required of [
+      "godot_project_context",
+      "godot_agent_guide",
+      "godot_diagnostics",
+      "godot_runtime_assert",
+      "godot_run_stop",
+    ]) {
+      expect(instructions).toContain(required);
+    }
+    const advertised = new Set(names);
+    for (const recipe of getAgentGuide().recipes) {
+      for (const tool of recipe.tools) expect(advertised.has(tool), `${recipe.id}: ${tool}`).toBe(true);
     }
     const fileWrite = tools.find(({ name }) => name === "godot_file_write");
     const fileReplace = tools.find(({ name }) => name === "godot_file_replace");
@@ -254,6 +281,23 @@ describe("MCP server", () => {
       destructiveHint: false,
       openWorldHint: false,
     });
+  });
+
+  it("offers the same static agent guidance through MCP and CLI", async () => {
+    const overview = await client.callTool({ name: "godot_agent_guide", arguments: {} });
+    const recipe = await client.callTool({
+      name: "godot_agent_guide",
+      arguments: { recipeId: "safe-scene-batch" },
+    });
+    const cliOverview = await runCli(["agent-guide"]);
+    const cliRecipe = await runCli(["agent-guide", "safe-scene-batch"]);
+
+    expect(overview.isError).not.toBe(true);
+    expect(recipe.isError).not.toBe(true);
+    expect(overview.structuredContent).toEqual(getAgentGuide());
+    expect(recipe.structuredContent).toEqual(getAgentGuide("safe-scene-batch"));
+    expect(cliOverview).toEqual({ code: 0, payload: overview.structuredContent as Record<string, unknown> });
+    expect(cliRecipe).toEqual({ code: 0, payload: recipe.structuredContent as Record<string, unknown> });
   });
 
   it("returns the stable scene guard error when expectedScenePath is omitted", async () => {

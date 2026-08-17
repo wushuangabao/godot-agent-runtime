@@ -31,6 +31,7 @@ import {
   inspectEditorResourcePath,
   getManagedRunStatus,
   getDiagnosticsSummary,
+  getAgentGuide,
   getProjectContext,
   getRuntimeInfo,
   getRuntimeNode,
@@ -72,6 +73,7 @@ import {
 } from "@godot-agent-runtime/core";
 import {
   DoctorResultSchema,
+  AgentGuideResultSchema,
   DebugReportResultSchema,
   DiagnosticsSummarySchema,
   AddonInstallResultSchema,
@@ -130,6 +132,7 @@ import {
   ScriptCheckResultSchema,
   FileMutationGuardSchema,
   Sha256Schema,
+  RecipeIdSchema,
 } from "@godot-agent-runtime/protocol";
 
 const ConfigInputSchema = z.object({
@@ -144,6 +147,10 @@ const ProjectContextInputSchema = z.object({
   projectPath: z.string().min(1),
   editorRunId: z.uuid().optional(),
   runtimeRunId: z.uuid().optional(),
+}).strict();
+
+const AgentGuideInputSchema = z.object({
+  recipeId: RecipeIdSchema.optional(),
 }).strict();
 
 const ProjectDiscoveryInputSchema = z.object({
@@ -770,7 +777,7 @@ export function createMcpServer(): McpServer {
     { name: "godot-agent-runtime", version: "0.1.0" },
     {
       instructions:
-        "Start with godot_doctor. After mutations, save and call godot_project_check. For interactive verification, launch the scene, observe structured state, capture screenshots only as visual evidence, inject bounded input, wait and assert the expected state, then always call godot_run_stop. Do not claim success from a screenshot alone.",
+        "Start with godot_project_context; do not guess project or main-scene identity. Call godot_agent_guide when a detailed playbook or recipe is needed. Follow the fixed ladder: context, compile, edit, visual evidence, runtime observation, interactive wait/assert, cleanup. Use guarded file writes and typed editor batches. Run script/project checks before runtime claims. Call godot_diagnostics before bounded log reads. Screenshots prove only their evidence class; interaction requires godot_runtime_assert (normally after godot_runtime_wait). Always stop every managed process with godot_run_stop.",
     },
   );
 
@@ -837,6 +844,22 @@ export function createMcpServer(): McpServer {
           ...(editorRunId === undefined ? {} : { editorRunId }),
           ...(runtimeRunId === undefined ? {} : { runtimeRunId }),
         }),
+      ),
+  );
+
+  server.registerTool(
+    "godot_agent_guide",
+    {
+      title: "Read the Godot agent playbook or one task recipe",
+      description:
+        "Returns static, read-only guidance from Core. Omit recipeId for the playbook and summaries, or select one complete recipe; it never executes a workflow or stores task state.",
+      inputSchema: loggedInputSchema("godot_agent_guide", AgentGuideInputSchema),
+      outputSchema: AgentGuideResultSchema,
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ recipeId }) =>
+      await handle("godot_agent_guide", async () =>
+        recipeId === undefined ? getAgentGuide() : getAgentGuide(recipeId),
       ),
   );
 

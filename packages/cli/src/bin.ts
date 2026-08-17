@@ -27,6 +27,7 @@ import {
   getEditorSelection,
   getManagedRunStatus,
   getDiagnosticsSummary,
+  getAgentGuide,
   getProjectContext,
   getRuntimeNode,
   observeRuntime,
@@ -68,6 +69,7 @@ import {
   type EditorInputActionUpsertOptions,
   type EditorProjectSettingSetOptions,
   RuntimeFailure,
+  type RecipeId,
 } from "@godot-agent-runtime/core";
 import { parseFiniteNumber, parseFiniteVector3, parseInteger } from "./numeric.js";
 
@@ -221,6 +223,7 @@ function printHelp(): void {
   process.stdout.write(`  find [SEARCH_ROOT] [--max-depth N] [--limit N]\n`);
   process.stdout.write(`  inspect PROJECT_PATH\n`);
   process.stdout.write(`  context PROJECT_PATH [--editor-run-id RUN_ID] [--runtime-run-id RUN_ID]\n`);
+  process.stdout.write(`  agent-guide [edit-and-verify-ui|edit-and-verify-3d|fix-script-error|safe-scene-batch|collect-debug-report]\n`);
   process.stdout.write(`  check PROJECT_PATH [--config PATH] [--timeout MS]\n`);
   process.stdout.write(`  script-check PROJECT_PATH RES_PATH [--config PATH] [--timeout MS] [--max-output BYTES]\n`);
   process.stdout.write(`  file-read PROJECT_PATH RES_PATH\n`);
@@ -322,6 +325,26 @@ async function main(): Promise<void> {
         ...(editorRunId === undefined ? {} : { editorRunId }),
         ...(runtimeRunId === undefined ? {} : { runtimeRunId }),
       }));
+      return;
+    }
+    case "agent-guide": {
+      assertCommandShape(args, "agent-guide", values.length, new Set());
+      if (values.length > 1) throw new Error("agent-guide accepts at most one recipe id.");
+      const recipeId = values[0];
+      if (recipeId === undefined) {
+        print(getAgentGuide());
+        return;
+      }
+      if (![
+        "edit-and-verify-ui",
+        "edit-and-verify-3d",
+        "fix-script-error",
+        "safe-scene-batch",
+        "collect-debug-report",
+      ].includes(recipeId)) {
+        throw new Error(`Unknown agent recipe: ${recipeId}`);
+      }
+      print(getAgentGuide(recipeId as RecipeId));
       return;
     }
     case "file-read":

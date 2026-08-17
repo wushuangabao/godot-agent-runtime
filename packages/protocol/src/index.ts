@@ -74,6 +74,68 @@ export type ProjectInfo = z.infer<typeof ProjectInfoSchema>;
 
 export const Sha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
 
+export const RecipeIdSchema = z.enum([
+  "edit-and-verify-ui",
+  "edit-and-verify-3d",
+  "fix-script-error",
+  "safe-scene-batch",
+  "collect-debug-report",
+]);
+
+export const AgentVerificationStepSchema = z.object({
+  id: z.enum(["context", "compile", "edit", "visual", "runtime", "interactive", "cleanup"]),
+  goal: z.string().min(1),
+  tools: z.array(z.string().min(1)),
+  successCriteria: z.array(z.string().min(1)).min(1),
+}).strict();
+
+export const AgentPlaybookSchema = z.object({
+  startupChecklist: z.array(z.string().min(1)).min(1),
+  verificationLadder: z.array(AgentVerificationStepSchema).length(7),
+  editingRules: z.array(z.string().min(1)).min(1),
+  diagnosticRules: z.array(z.string().min(1)).min(1),
+  honestyRules: z.array(z.string().min(1)).min(1),
+}).strict();
+
+export const AgentRecipeSummarySchema = z.object({
+  id: RecipeIdSchema,
+  title: z.string().min(1),
+  summary: z.string().min(1),
+  tools: z.array(z.string().min(1)).min(1),
+}).strict();
+
+export const AgentRecipeSchema = AgentRecipeSummarySchema.extend({
+  goal: z.string().min(1),
+  prerequisites: z.array(z.string().min(1)).min(1),
+  successCriteria: z.array(z.string().min(1)).min(1),
+  evidenceRequirements: z.array(z.string().min(1)).min(1),
+  cleanup: z.array(z.string().min(1)).min(1),
+}).strict();
+
+export const AgentGuideOverviewSchema = z.object({
+  kind: z.literal("overview"),
+  playbook: AgentPlaybookSchema,
+  recipes: z.array(AgentRecipeSummarySchema).length(5),
+}).strict();
+
+export const AgentGuideRecipeResultSchema = z.object({
+  kind: z.literal("recipe"),
+  recipe: AgentRecipeSchema,
+}).strict();
+
+export const AgentGuideResultSchema = z.discriminatedUnion("kind", [
+  AgentGuideOverviewSchema,
+  AgentGuideRecipeResultSchema,
+]);
+
+export type RecipeId = z.infer<typeof RecipeIdSchema>;
+export type AgentPlaybook = z.infer<typeof AgentPlaybookSchema>;
+export type AgentRecipeSummary = z.infer<typeof AgentRecipeSummarySchema>;
+export type AgentRecipe = z.infer<typeof AgentRecipeSchema>;
+export type AgentGuideOverview = z.infer<typeof AgentGuideOverviewSchema>;
+export type AgentGuideRecipeResult = z.infer<typeof AgentGuideRecipeResultSchema>;
+export type AgentGuideResult = z.infer<typeof AgentGuideResultSchema>;
+
 const EvidenceBaseSchema = z.object({
   capturedAt: z.string().datetime(),
   projectFingerprint: Sha256Schema,
