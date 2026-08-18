@@ -4,6 +4,10 @@ extends Node
 const PROTOCOL_VERSION := "0.7.0"
 const MAX_MESSAGE_BYTES := 1024 * 1024
 const MAX_PROJECT_SETTING_OPERATIONS := 128
+const LOCK_FREE_EDITOR_COMMANDS: PackedStringArray = [
+	"hello",
+	"project_setting_operation_status",
+]
 
 var _editor: EditorInterface
 var _undo_redo: EditorUndoRedoManager
@@ -90,7 +94,8 @@ func _handle(peer: Dictionary, line: String) -> void:
 		return
 	var request_timeout_ms := clampi(int(request.get("timeoutMs", 5000)), 100, 32000)
 	var deadline_ms := Time.get_ticks_msec() + request_timeout_ms
-	if not await _acquire_exclusive_operation(peer, deadline_ms):
+	var exclusive := _command_requires_exclusive_lock(command)
+	if exclusive and not await _acquire_exclusive_operation(peer, deadline_ms):
 		_send(peer, {"id": request_id, "ok": false, "error": {"code": "EDITOR_REQUEST_CANCELLED", "message": "The editor request expired or its client disconnected before execution."}})
 		return
 	match command:
@@ -168,7 +173,12 @@ func _handle(peer: Dictionary, line: String) -> void:
 			_send_ok(peer, request_id, _history_step("redo", params))
 		_:
 			_send(peer, {"id": request_id, "ok": false, "error": {"code": "EDITOR_COMMAND_UNKNOWN", "message": "Unknown editor command."}})
-	_release_exclusive_operation()
+	if exclusive:
+		_release_exclusive_operation()
+
+
+func _command_requires_exclusive_lock(command: String) -> bool:
+	return not LOCK_FREE_EDITOR_COMMANDS.has(command)
 
 
 func _acquire_exclusive_operation(peer: Dictionary, deadline_ms: int) -> bool:

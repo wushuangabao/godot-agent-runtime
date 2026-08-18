@@ -59,6 +59,47 @@ describe("Godot addon installer", () => {
     expect(editorBridge).toContain('"input_map"');
     expect(editorBridge).toContain('"resource_inspect"');
     expect(editorBridge).toContain('"project_setting_operation_status"');
+    const lockFree = quotedStrings(sliceConst(editorBridge, "LOCK_FREE_EDITOR_COMMANDS"));
+    const dispatched = matchCommandLiterals(sliceFunction(editorBridge, "_handle"));
+    expect(lockFree).toEqual(["hello", "project_setting_operation_status"]);
+    expect(dispatched).toEqual([
+      "hello",
+      "project_setting_get",
+      "project_setting_set",
+      "project_setting_operation_status",
+      "input_action_upsert",
+      "resource_inspect",
+      "scene_open",
+      "scene_tree",
+      "selection",
+      "selection_set",
+      "screenshot",
+      "node_get",
+      "scene_batch",
+      "node_create",
+      "scene_instantiate",
+      "scene_create_inherited",
+      "node_update",
+      "node_delete",
+      "node_move",
+      "resource_create",
+      "resource_get",
+      "resource_update",
+      "resource_save",
+      "resource_focus",
+      "instance_get",
+      "instance_set_editable",
+      "signal_connect",
+      "scene_save",
+      "history_undo",
+      "history_redo",
+    ]);
+    const locked = dispatched.filter((command) => !lockFree.includes(command));
+    for (const command of lockFree) {
+      expect(locked).not.toContain(command);
+    }
+    expect(sliceFunction(editorBridge, "_command_requires_exclusive_lock"))
+      .toContain("LOCK_FREE_EDITOR_COMMANDS.has");
     const cameraUnavailableStart = editorBridge.indexOf("if camera == null:");
     const cameraUnavailableEnd = editorBridge.indexOf("var projection_name :=", cameraUnavailableStart);
     expect(cameraUnavailableStart).toBeGreaterThan(-1);
@@ -69,3 +110,32 @@ describe("Godot addon installer", () => {
     expect(runtimeBridge).toContain('"screenshot_receipt"');
   });
 });
+
+function sliceConst(source: string, name: string): string {
+  const start = source.indexOf(`const ${name}`);
+  const end = source.indexOf("]", start);
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  return source.slice(start, end + 1);
+}
+
+function sliceFunction(source: string, name: string): string {
+  const start = source.indexOf(`func ${name}(`);
+  const end = source.indexOf("\nfunc ", start + 1);
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  return source.slice(start, end);
+}
+
+function quotedStrings(source: string): string[] {
+  return [...source.matchAll(/"([a-z0-9_]+)"/g)].map((match) => match[1]);
+}
+
+function matchCommandLiterals(handleSource: string): string[] {
+  const matchStart = handleSource.indexOf("match command:");
+  const matchEnd = handleSource.indexOf("\tif exclusive:");
+  expect(matchStart).toBeGreaterThan(-1);
+  expect(matchEnd).toBeGreaterThan(matchStart);
+  return [...handleSource.slice(matchStart, matchEnd).matchAll(/^\t\t"([a-z0-9_]+)":/gm)]
+    .map((match) => match[1]);
+}

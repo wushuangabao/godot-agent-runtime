@@ -38,6 +38,7 @@ Godot 项目本身可以执行任意本机代码。本项目的安全目标不�
 - 所有持久 Editor mutation 在 Bridge 权威点校验活动 `expectedScenePath`；save/undo/redo 还校验 native `expectedHistoryVersion`。这些 guard 是 MCP/CLI 0.2.0 的必填迁移，不提供静默无 guard 兼容期。
 - 项目设置写入只允许已有的 `application/config/*`、`application/run/main_scene`、`display/window/*`、`rendering/*`、`physics/2d/*`、`physics/3d/*`，并限制为 bool/int/float、16 KiB 字符串或最多 256 项的字符串数组；`autoload/*`、`editor_plugins/*`、`filesystem/import/*` 与通用 `input/*` 必须走其他专用流程。InputMap 只接受有界的 key、mouse button、joypad button union，每次最多 32 个事件。
 - `project.godot` 的持久设置和 InputMap 写入同时校验项目 fingerprint、调用方 SHA-256、Bridge 启动时缓存的 SHA-256，并在整个 Bridge 往返期间复用文本写入的同一 mutation lease。客户端先超时时通过有界 operation receipt 调和；无法证明操作终态或受管 Editor 已退出时保留 quarantine，阻止第二个参与写入者插入。该协调面向正常本地开发中的并发、超时与崩溃，不把同用户恶意进程作为威胁模型。
+- Editor Bridge 默认对命令串行执行。仅 `hello` 与 `project_setting_operation_status` 可在写操作的 `await` 挂起期间并发执行，分别用于写前置握手和超时后的 operation receipt 调和，避免调和被写锁饿死。场景树、节点/资源读取和 `project_setting_get` 会等到当前写操作完成（含存盘或回滚），因此不会看到 `scene_open` 或继承场景创建过程中的临时场景，也不会读到尚未落盘、随后可能被回滚的项目设置。未知命令同样走串行路径。
 - 外部 Resource 检查是只读接口，只加载项目内非链接 `.tres/.res`；未请求属性时仅返回类、路径与可编辑属性名，请求时最多编码 100 个属性。
 - 继承场景创建复用 Godot `EditorInterface.open_scene_from_path(..., true)` 与原生场景保存，不手写 `.tscn` 内部字段。目标必须是项目内规范化 `.tscn` 路径且默认拒绝覆盖；创建出的文件不属于当前场景 Undo/Redo，调用方应使用 Git 恢复或删除。
 - PackedScene、外部 Resource 以及 tagged Variant 中的 Resource 引用都必须是规范化的项目内 `res://` 路径，并逐段拒绝符号链接、目录联接点及其他重解析点。加载 Resource 时还会验证其类型与目标属性声明兼容。外部资源只写 `.tres` 且默认拒绝覆盖；Undo/Redo 可恢复节点引用，但不会删除已经创建的文件。

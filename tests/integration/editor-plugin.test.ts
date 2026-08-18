@@ -44,6 +44,7 @@ import {
   upsertEditorInputAction,
   undoEditorAction,
   inspectEditorResourcePath,
+  sendBridgeCommand,
   writeProjectFile,
 } from "../../packages/core/src/index.js";
 
@@ -110,7 +111,7 @@ async function waitForPath(path: string): Promise<void> {
 
 describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
   it(
-    "holds the shared project.godot lease while reconciling a timed-out Bridge response",
+    "holds the shared project.godot lease and serializes editor commands without blocking handshake or operation-status reconcile",
     async () => {
       const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-editor-settings-lease-"));
       await cp(resolve("examples", "control-ui"), projectPath, {
@@ -142,10 +143,26 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
         });
         pending.push(setting);
         await waitForPath(enteredPath);
-        let editorInfoSettled = false;
-        const queuedEditorInfo = getEditorInfo({ projectPath, runId })
-          .finally(() => { editorInfoSettled = true; });
-        pending.push(queuedEditorInfo);
+        let nodeWriteSettled = false;
+        const queuedNodeWrite = createEditorNode({
+          projectPath,
+          runId,
+          timeoutMs: 15_000,
+          expectedProjectFingerprint: identity.projectFingerprint,
+          expectedScenePath: "res://main.tscn",
+          parentPath: "/root/Main",
+          type: "Label",
+          name: "WriteLockProbe",
+          properties: {},
+        }).finally(() => { nodeWriteSettled = true; });
+        pending.push(queuedNodeWrite);
+        let sceneTreeSettled = false;
+        const queuedSceneTree = getEditorSceneTree({
+          projectPath,
+          runId,
+          timeoutMs: 15_000,
+        }).finally(() => { sceneTreeSettled = true; });
+        pending.push(queuedSceneTree);
         let writerSettled = false;
         const writer = writeProjectFile({
           projectPath,
@@ -155,8 +172,17 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           expectedProjectFingerprint: identity.projectFingerprint,
         }).finally(() => { writerSettled = true; });
         pending.push(writer);
+        await expect(getEditorInfo({ projectPath, runId, timeoutMs: 2_000 })).resolves.toMatchObject({
+          protocolVersion: "0.7.0",
+        });
+        await expect(sendBridgeCommand(
+          { projectPath, runId, timeoutMs: 2_000 },
+          "project_setting_operation_status",
+          { operationId: "00000000-0000-4000-8000-000000000000" },
+        )).resolves.toMatchObject({ state: "unknown" });
         await new Promise((complete) => setTimeout(complete, 200));
-        expect(editorInfoSettled).toBe(false);
+        expect(nodeWriteSettled).toBe(false);
+        expect(sceneTreeSettled).toBe(false);
         expect(writerSettled).toBe(false);
         await rm(barrierPath, { force: true });
 
@@ -166,7 +192,13 @@ describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
           beforeSha256: identity.projectFileSha256,
           afterSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
         });
-        await expect(queuedEditorInfo).resolves.toMatchObject({ protocolVersion: "0.7.0" });
+        await expect(queuedNodeWrite).resolves.toMatchObject({
+          action: "create",
+          node: { name: "WriteLockProbe" },
+        });
+        await expect(queuedSceneTree).resolves.toMatchObject({
+          root: { name: "Main" },
+        });
         await expect(writer).rejects.toMatchObject({ payload: { code: "FILE_WRITE_CONFLICT" } });
       } finally {
         await rm(barrierPath, { force: true });
