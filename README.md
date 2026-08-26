@@ -16,6 +16,19 @@ Godot Agent Runtime 是面向外部编码 Agent 的本地 Godot 4.x 自动化与
 
 里程碑 5 的验收命令为 `pnpm run benchmark:milestone-5`。它在 `examples/control-ui` 的临时副本中串联项目上下文、guarded 文本替换与 stale conflict、错场景零修改、单 action typed batch、Undo/Redo、失败保存诚实性、显式保存、InputMap SHA/重启回读、脚本/项目检查、运行时 find/input/wait/assert、诊断/增量日志/脱敏报告和全量清理。报告记录逐步耗时、调用数、证据类别、路径与 SHA-256；截图始终不充当交互成功证明。该命令的实际通过状态以本机新生成的 Gate D 报告为准。
 
+## 公共 npm 包
+
+要求 Node.js 20+ 和原版 Godot 4.x。以下命令从公共包为一个现有 Godot 项目安装 MIT addon、写入本机 Godot 路径，并只维护项目级 `.codex/config.toml` 中带标记的 MCP 区段：
+
+```powershell
+npx -y godot-agent-runtime@0.2.0 setup codex --workspace "E:\github\GalGame" --godot-project "E:\github\GalGame\GodotPrj" --godot "D:\Godot\Godot_v4.6.2-stable_win64.exe"
+npx -y godot-agent-runtime@0.2.0 mcp
+```
+
+新安装的 EditorPlugin 启用项固定为 `res://addons/godot_agent_runtime/plugin.cfg`；0.2.x 会读取并迁移旧的裸名称 `godot_agent_runtime`。`setup codex` 可重复执行，第二次应全部报告 `unchanged`，并保留 Codex 配置中的非受管内容。Codex 当前任务不能热加载新增 MCP Server；执行 setup 后必须重新打开任务，再先调用 `godot_doctor`。
+
+本机配置解析顺序为：命令显式 `--config`、`GODOT_AGENT_RUNTIME_CONFIG`、当前工作区 `.godot-agent-runtime/config.local.json`、兼容旧路径 `config/development.local.json`。
+
 ## 开发
 
 要求 Node.js 20+、pnpm 和 Godot 4.x。复制本机配置示例并填写绝对路径：
@@ -70,6 +83,7 @@ node packages/cli/dist/bin.js screenshot examples/control-ui <RUN_ID>
 
 ```powershell
 pnpm run mcp
+npx -y godot-agent-runtime@0.2.0 mcp
 ```
 
 stdio 的标准输出只承载 MCP JSON-RPC；服务端诊断写入标准错误。当前工具及契约见 [docs/tool-contracts.md](docs/tool-contracts.md)。
@@ -115,6 +129,7 @@ node packages/cli/dist/bin.js stop examples/control-ui <RUN_ID>
 ```powershell
 pnpm run typecheck
 pnpm run test
+pnpm run verify:npm
 pnpm run benchmark:milestone-1
 pnpm run benchmark:milestone-2
 pnpm run benchmark:milestone-3

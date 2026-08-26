@@ -87,6 +87,13 @@ describe("MCP server", () => {
     expect(client.getServerVersion()).toEqual({ name: "godot-agent-runtime", version: "0.2.0" });
     const { tools } = await client.listTools();
     const names = tools.map((tool) => tool.name);
+    const baseline = JSON.parse(
+      await readFile(resolve("tests", "fixtures", "mcp-tool-baseline-0.1.json"), "utf8"),
+    ) as { capture: { toolsList: { tools: Array<{ name: string }> } } };
+    const missingBaselineTools = baseline.capture.toolsList.tools
+      .map(({ name }) => name)
+      .filter((name) => !names.includes(name));
+    expect(missingBaselineTools).toEqual([]);
 
     expect(names).toEqual([
       "godot_doctor",

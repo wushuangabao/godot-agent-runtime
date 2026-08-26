@@ -1,0 +1,13 @@
+[
+  "LICENSE",
+  "LICENSING.md",
+  "README.md",
+  "dist/npm/assets/addons/godot_agent_runtime/LICENSE",
+  "dist/npm/assets/addons/godot_agent_runtime/editor_bridge.gd",
+  "dist/npm/assets/addons/godot_agent_runtime/plugin.cfg",
+  "dist/npm/assets/addons/godot_agent_runtime/plugin.gd",
+  "dist/npm/assets/addons/godot_agent_runtime/runtime_entry.gd",
+  "dist/npm/assets/host/run-host.mjs",
+  "dist/npm/bin/godot-agent-runtime.js",
+  "package.json"
+]

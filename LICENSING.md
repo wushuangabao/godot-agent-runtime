@@ -9,6 +9,7 @@ Godot Agent Runtime 当前仓库默认采用 **GNU Affero General Public License
 - Codex、Claude Code 或其他程序仅通过 MCP/CLI 协议与本项目通信，不会仅因这种通信而自动适用本项目许可证。
 - 使用本工具创建、修改或验证的用户 Godot 项目及游戏，不会仅因使用本工具而自动适用 AGPL。
 - `addons/godot_agent_runtime/` 可以复制进用户 Godot 项目；该目录的 MIT 许可避免仅因插件快照而把用户游戏置于 AGPL 下。npm 缓存中的 AGPL 核心继续作为独立 MCP/CLI 程序运行。
+- 公开 npm 包同时携带两条明确边界：`dist/npm/assets/addons/godot_agent_runtime/` 是上述 MIT addon 的逐文件快照；`dist/npm/bin/godot-agent-runtime.js`、host 与其余根包内容沿用 AGPL-3.0-or-later。安装器只把 MIT 子目录复制进用户游戏。
 - 未来若提供其他需要复制进用户游戏的模板或生成脚手架，应在对应目录和文件中明确标注 `MIT` 或 `CC0-1.0`，避免将用户游戏置于 AGPL 下。
 - 未来若将文档单独改为 `CC-BY-SA-4.0`，必须在文档目录中增加明确的 SPDX 标识和对应许可证正文；在此之前，文档沿用仓库默认许可证。
 - 第三方代码和资源继续服从各自的许可证，并应保留原有版权和许可声明。

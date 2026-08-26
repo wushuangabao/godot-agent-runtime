@@ -51,9 +51,11 @@
     "doctor": "node packages/cli/dist/bin.js doctor",
     "mcp": "node packages/mcp-server/dist/bin.js",
     "prepack": "pnpm run build:npm",
+    "prepublishOnly": "pnpm run verify:npm",
     "test": "pnpm run build && vitest run",
     "typecheck": "tsc -b --pretty false",
-    "check": "pnpm run typecheck && pnpm run test"
+    "check": "pnpm run typecheck && pnpm run test",
+    "verify:npm": "pnpm run check && node scripts/verify-npm-package.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.0.0",
