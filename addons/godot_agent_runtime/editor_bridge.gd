@@ -103,11 +103,13 @@ func _handle(peer: Dictionary, line: String) -> void:
 	match command:
 		"hello":
 			var root := _editor.get_edited_scene_root()
+			var resource_filesystem := _editor.get_resource_filesystem()
 			_send_ok(peer, request_id, {
 				"protocolVersion": PROTOCOL_VERSION,
 				"engineVersion": Engine.get_version_info().get("string", "unknown"),
 				"scene": root.scene_file_path if root != null else null,
 				"historyVersion": _history_version(root) if root != null else null,
+				"filesystemScanning": resource_filesystem != null and resource_filesystem.is_scanning(),
 				"capabilities": ["scene_tree", "selection", "screenshot", "screenshot_receipt", "viewport_3d", "node_edit", "scene_instantiate", "scene_inheritance", "instance_editable", "resource_edit", "resource_save", "resource_focus", "signal_connect", "scene_save", "scene_open", "scene_batch", "undo_redo", "project_settings", "input_map", "resource_inspect"],
 			})
 		"project_setting_get":
@@ -709,8 +711,10 @@ func _scene_open(params: Dictionary) -> Dictionary:
 		return _failure("EDITOR_SCENE_RESOURCE_NOT_FOUND", "PackedScene file was not found.", {"scenePath": scene_path})
 	var previous_root := _editor.get_edited_scene_root()
 	var previous_scene = previous_root.scene_file_path if previous_root != null and not previous_root.scene_file_path.is_empty() else null
-	_editor.open_scene_from_path(scene_path)
 	for _frame in range(120):
+		# EditorInterface silently ignores this call while Godot is already
+		# changing scenes, so retry until the requested root is observable.
+		_editor.open_scene_from_path(scene_path)
 		await get_tree().process_frame
 		var opened_root := _editor.get_edited_scene_root()
 		if opened_root != null and opened_root.scene_file_path == scene_path:
@@ -1418,9 +1422,16 @@ func _scene_create_inherited(params: Dictionary) -> Dictionary:
 	# This is the same standard API path used by Scene > New Inherited Scene.
 	# It attaches the internal SceneState that is intentionally not exposed as a
 	# public Node method, then save_scene_as serializes the true base-scene link.
-	_editor.open_scene_from_path(source_path, true)
-	var inherited_root := _editor.get_edited_scene_root()
-	if inherited_root == null or not inherited_root.scene_file_path.is_empty():
+	var inherited_root: Node = null
+	for _frame in range(120):
+		# The standard API is a no-op while another scene change is active.
+		_editor.open_scene_from_path(source_path, true)
+		await get_tree().process_frame
+		var candidate := _editor.get_edited_scene_root()
+		if candidate != null and candidate.scene_file_path.is_empty():
+			inherited_root = candidate
+			break
+	if inherited_root == null:
 		await _restore_or_close_edited_scene(previous_scene)
 		return _failure("EDITOR_INHERITED_SCENE_INSTANTIATE_FAILED", "Godot could not open a new inherited scene from the source.", {"sourceScenePath": source_path})
 
@@ -1447,10 +1458,13 @@ func _scene_create_inherited(params: Dictionary) -> Dictionary:
 	if inherited_root.scene_file_path != target_path or not FileAccess.file_exists(target_path):
 		await _restore_or_close_edited_scene(previous_scene)
 		return _failure("EDITOR_INHERITED_SCENE_SAVE_FAILED", "Godot could not save the inherited scene.", {"targetScenePath": target_path})
-	_editor.get_resource_filesystem().scan()
 	var requested_open := bool(params.get("open", false))
 	if not requested_open:
 		await _restore_or_close_edited_scene(previous_scene)
+	# Scan only after the final requested scene is active. Godot preserves the
+	# scene tab that was current when a scan began, so scanning the temporary
+	# inherited tab before restoring can race the restore and reselect it.
+	_editor.get_resource_filesystem().scan()
 	var active_root := _editor.get_edited_scene_root()
 	var open_scene := active_root != null and active_root.scene_file_path == target_path
 	return {
@@ -1472,8 +1486,10 @@ func _restore_or_close_edited_scene(scene_path: String) -> void:
 
 
 func _restore_edited_scene(scene_path: String) -> bool:
-	_editor.open_scene_from_path(scene_path)
 	for _frame in range(120):
+		# Retry because EditorInterface drops open requests while a save/open
+		# transition is still changing the active scene.
+		_editor.open_scene_from_path(scene_path)
 		await get_tree().process_frame
 		var restored_root := _editor.get_edited_scene_root()
 		if restored_root != null and restored_root.scene_file_path == scene_path:

@@ -90,7 +90,14 @@ const EDITOR_CAPABILITIES = [
 const PROJECT_SETTINGS_DEADLINE_MS = 30_000;
 const PROJECT_SETTINGS_RECONCILE_GRACE_MS = 5_000;
 
-export async function getEditorInfo(options: RuntimeLookupOptions): Promise<EditorBridgeInfo> {
+interface EditorHandshakeStatus {
+  readonly info: EditorBridgeInfo;
+  readonly filesystemScanning: boolean;
+}
+
+async function readEditorHandshake(
+  options: RuntimeLookupOptions,
+): Promise<EditorHandshakeStatus> {
   const result = await sendBridgeCommand(options, "hello");
   const handshake = validateBridgeHandshake(
     result,
@@ -123,14 +130,23 @@ export async function getEditorInfo(options: RuntimeLookupOptions): Promise<Edit
     });
   }
   return {
-    ok: true,
-    runId: options.runId,
-    protocolVersion: handshake.protocolVersion,
-    engineVersion: String(result.engineVersion ?? "unknown"),
-    scene,
-    historyVersion,
-    capabilities: handshake.capabilities as EditorBridgeInfo["capabilities"],
+    info: {
+      ok: true,
+      runId: options.runId,
+      protocolVersion: handshake.protocolVersion,
+      engineVersion: String(result.engineVersion ?? "unknown"),
+      scene,
+      historyVersion,
+      capabilities: handshake.capabilities as EditorBridgeInfo["capabilities"],
+    },
+    filesystemScanning: result.filesystemScanning === true,
   };
+}
+
+export async function getEditorInfo(
+  options: RuntimeLookupOptions,
+): Promise<EditorBridgeInfo> {
+  return (await readEditorHandshake(options)).info;
 }
 
 async function waitForEditor(
@@ -141,9 +157,15 @@ async function waitForEditor(
   let lastError: unknown;
   while (Date.now() < deadline) {
     try {
-      const info = await getEditorInfo({ ...options, timeoutMs: 750 });
-      if (!requireOpenScene || info.scene !== null) return info;
-      lastError = new Error("Editor bridge is ready but the main scene is still opening.");
+      const status = await readEditorHandshake({ ...options, timeoutMs: 750 });
+      if (!status.filesystemScanning && (!requireOpenScene || status.info.scene !== null)) {
+        return status.info;
+      }
+      lastError = new Error(
+        status.filesystemScanning
+          ? "Editor bridge is ready but the project filesystem is still scanning."
+          : "Editor bridge is ready but the main scene is still opening.",
+      );
     } catch (error) {
       lastError = error;
       if (error instanceof RuntimeFailure && error.payload.code.startsWith("EDITOR_PROTOCOL_")) {
