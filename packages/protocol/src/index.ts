@@ -651,9 +651,36 @@ export const AddonInstallResultSchema = z.object({
   ok: z.literal(true),
   projectPath: z.string().min(1),
   plugin: z.literal("godot_agent_runtime"),
+  pluginPath: z.literal("res://addons/godot_agent_runtime/plugin.cfg"),
   files: z.array(z.string().startsWith("res://")),
   projectConfigurationChanged: z.boolean(),
 });
+
+export const SetupTargetResultSchema = z.object({
+  target: z.enum([
+    "local-config",
+    "codex-config",
+    "addon-assets",
+    "project-plugin",
+  ]),
+  path: z.string().min(1),
+  operation: z.enum(["created", "updated", "unchanged"]),
+});
+
+export type SetupTargetResult = z.infer<typeof SetupTargetResultSchema>;
+
+export const SetupCodexResultSchema = z.object({
+  ok: z.literal(true),
+  packageVersion: z.literal("0.2.0"),
+  workspacePath: z.string().min(1),
+  godotProjectPath: z.string().min(1),
+  godotExecutable: z.string().min(1),
+  godotVersion: z.string().startsWith("4."),
+  targets: z.array(SetupTargetResultSchema),
+  restartRequired: z.literal(true),
+});
+
+export type SetupCodexResult = z.infer<typeof SetupCodexResultSchema>;
 
 const BoundedEditorPropertiesSchema = z.record(z.string().min(1), z.unknown())
   .refine(

@@ -10,7 +10,6 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 
 import type {
   GodotLaunchResult,
@@ -19,6 +18,7 @@ import type {
 } from "@godot-agent-runtime/protocol";
 
 import { RuntimeFailure } from "./errors.js";
+import { getDistribution } from "./distribution.js";
 
 interface RunMetadata {
   readonly schemaVersion: 1;
@@ -280,7 +280,7 @@ export async function launchManagedProcess(
     ...paths,
   });
 
-  const hostScript = fileURLToPath(new URL("../host/run-host.mjs", import.meta.url));
+  const hostScript = getDistribution().hostScript;
   const supervisor = spawn(process.execPath, [hostScript, paths.jobPath], {
     cwd: dirname(hostScript),
     detached: true,

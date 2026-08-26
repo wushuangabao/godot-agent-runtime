@@ -53,6 +53,7 @@ import {
   stopManagedRun,
   saveEditorScene,
   saveEditorResource,
+  setupCodex,
   simulateRuntimePhysics,
   setEditorSelection,
   setEditorProjectSetting,
@@ -237,6 +238,7 @@ function printHelp(): void {
   process.stdout.write(`  debug-report PROJECT_PATH --project-fingerprint HASH --issue TEXT [--run-id RUN_ID] [--reproduction TEXT] [--cursor JSON] [--format markdown|json]\n`);
   process.stdout.write(`  stop PROJECT_PATH RUN_ID [--timeout MS] [--max-output BYTES]\n`);
   process.stdout.write(`  configure <codex|deepseek-harness|claude-code> [--project PATH] [--server PATH]\n`);
+  process.stdout.write(`  setup codex --workspace PATH --godot-project PATH --godot EXE\n`);
   process.stdout.write(`  addon-install PROJECT_PATH\n`);
   process.stdout.write(`  editor-launch PROJECT_PATH [--config PATH] [--timeout MS]\n`);
   process.stdout.write(`  editor-status PROJECT_PATH RUN_ID\n`);
@@ -580,6 +582,35 @@ async function main(): Promise<void> {
           ...(serverPath === undefined ? {} : { serverPath }),
         }),
       );
+      return;
+    }
+    case "setup": {
+      assertCommandShape(
+        args,
+        "setup codex",
+        1,
+        new Set(["--workspace", "--godot-project", "--godot"]),
+      );
+      if (values.length !== 1 || values[0] !== "codex") {
+        throw new Error("setup requires the codex target.");
+      }
+      const workspacePath = option(args, "--workspace");
+      const godotProjectPath = option(args, "--godot-project");
+      const godotExecutable = option(args, "--godot");
+      if (
+        workspacePath === undefined ||
+        godotProjectPath === undefined ||
+        godotExecutable === undefined
+      ) {
+        throw new Error(
+          "setup codex requires --workspace PATH, --godot-project PATH, and --godot EXE.",
+        );
+      }
+      print(await setupCodex({
+        workspacePath,
+        godotProjectPath,
+        godotExecutable,
+      }));
       return;
     }
     case "addon-install":

@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import {
@@ -9,13 +10,55 @@ import {
 import { RuntimeFailure } from "./errors.js";
 
 export function defaultConfigPath(cwd = process.cwd()): string {
-  return resolve(cwd, "config", "development.local.json");
+  return resolve(cwd, ".godot-agent-runtime", "config.local.json");
+}
+
+async function isReadable(path: string): Promise<boolean> {
+  try {
+    await access(path, constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function resolveConfigPath(
+  explicitPath?: string,
+  cwd = process.cwd(),
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
+  if (explicitPath !== undefined) return resolve(cwd, explicitPath);
+  const environmentPath = environment.GODOT_AGENT_RUNTIME_CONFIG?.trim();
+  if (environmentPath) return resolve(cwd, environmentPath);
+
+  const workspacePath = defaultConfigPath(cwd);
+  if (await isReadable(workspacePath)) return workspacePath;
+  const legacyPath = resolve(cwd, "config", "development.local.json");
+  if (await isReadable(legacyPath)) return legacyPath;
+
+  throw new RuntimeFailure({
+    code: "CONFIG_NOT_FOUND",
+    stage: "configuration",
+    message: "No Godot Agent Runtime configuration source was found.",
+    details: {
+      explicitPath: null,
+      environmentVariable: "GODOT_AGENT_RUNTIME_CONFIG",
+      workspacePath,
+      legacyPath,
+    },
+    recovery: [
+      "Pass --config with an explicit schema version 1 configuration path.",
+      "Set GODOT_AGENT_RUNTIME_CONFIG to an explicit configuration path.",
+      "Run setup codex to create .godot-agent-runtime/config.local.json.",
+      "For a source checkout, create config/development.local.json.",
+    ],
+  });
 }
 
 export async function loadDevelopmentConfig(
-  configPath = defaultConfigPath(),
+  configPath?: string,
 ): Promise<DevelopmentConfig> {
-  const resolvedPath = resolve(configPath);
+  const resolvedPath = await resolveConfigPath(configPath);
   let source: string;
 
   try {
@@ -30,7 +73,8 @@ export async function loadDevelopmentConfig(
         cause: error instanceof Error ? error.message : String(error),
       },
       recovery: [
-        "Copy config/development.local.example.json to config/development.local.json.",
+        "Pass an explicit configuration path or run setup codex for this workspace.",
+        "For source development, copy config/development.local.example.json to config/development.local.json.",
         "Set godot.executable to a Godot 4.x editor executable.",
       ],
     });

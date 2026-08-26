@@ -123,4 +123,4 @@ pnpm run benchmark:milestone-5
 pnpm run benchmark:runtime
 ```
 
-存在 `config/development.local.json` 时，测试会真实启动配置的 Godot，覆盖 headless 导入、受管进程、Runtime Bridge 场景树/节点观察、2D/3D 物理仿真、Camera3D 投影与射线、组合输入、等待、暂停和 process/physics 帧推进闭环，以及 EditorPlugin 的 guarded 场景编辑、typed batch、项目设置/InputMap、资源、原生 Undo/Redo、显式保存和证据截图。安全边界见 [docs/security.md](docs/security.md)。核心仍不提供云同步、账号、AI 资产生成、任意脚本探针或发布平台；示例项目独立采用 MIT License，核心代码采用 AGPL-3.0-or-later。
+存在 `config/development.local.json` 时，测试会真实启动配置的 Godot，覆盖 headless 导入、受管进程、Runtime Bridge 场景树/节点观察、2D/3D 物理仿真、Camera3D 投影与射线、组合输入、等待、暂停和 process/physics 帧推进闭环，以及 EditorPlugin 的 guarded 场景编辑、typed batch、项目设置/InputMap、资源、原生 Undo/Redo、显式保存和证据截图。安全边界见 [docs/security.md](docs/security.md)。核心仍不提供云同步、账号、AI 资产生成、任意脚本探针或发布平台；`addons/godot_agent_runtime/` 和示例项目分别由各自目录内的 MIT License 覆盖，TypeScript/JavaScript 核心、CLI 与 MCP Server 继续采用 AGPL-3.0-or-later。复制进用户项目的 addon 不会把该游戏置于 AGPL 下，npm 中的核心程序仍作为独立工具运行。

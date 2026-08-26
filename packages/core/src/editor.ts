@@ -62,6 +62,7 @@ import {
   validateBridgeHandshake,
   type RuntimeLookupOptions,
 } from "./runtime.js";
+import { isGodotAgentRuntimeEnabled } from "./addon.js";
 
 const EDITOR_CAPABILITIES = [
   "scene_tree",
@@ -186,7 +187,7 @@ export async function launchEditor(
   options: GodotOperationOptions,
 ): Promise<GodotLaunchResult> {
   const project = await inspectProject(options.projectPath);
-  if (!project.enabledPlugins.includes("godot_agent_runtime")) {
+  if (!isGodotAgentRuntimeEnabled(project.enabledPlugins)) {
     throw new RuntimeFailure({
       code: "EDITOR_PLUGIN_NOT_ENABLED",
       stage: "validation",

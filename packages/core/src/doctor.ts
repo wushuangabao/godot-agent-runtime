@@ -10,7 +10,7 @@ import {
   type DoctorResult,
 } from "@godot-agent-runtime/protocol";
 
-import { loadDevelopmentConfig } from "./config.js";
+import { loadDevelopmentConfig, resolveConfigPath } from "./config.js";
 import { toRuntimeError } from "./errors.js";
 import { runProcess } from "./process.js";
 
@@ -85,12 +85,13 @@ export async function runDoctor(configPath?: string): Promise<DoctorResult> {
   });
 
   try {
-    const config = await loadDevelopmentConfig(configPath);
+    const resolvedConfigPath = await resolveConfigPath(configPath);
+    const config = await loadDevelopmentConfig(resolvedConfigPath);
     checks.push({
       name: "configuration",
       status: "pass",
       summary: "Development configuration matches schema version 1.",
-      details: { configPath: resolve(configPath ?? "config/development.local.json") },
+      details: { configPath: resolvedConfigPath },
     });
 
     await access(config.godot.executable, constants.X_OK);

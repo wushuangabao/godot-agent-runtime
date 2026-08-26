@@ -240,7 +240,6 @@ export function createNpmDistribution(
 ): DistributionLayout;
 export function configureDistribution(layout: DistributionLayout): void;
 export function getDistribution(): DistributionLayout;
-export function resetDistributionForTests(): void;
 ~~~
 
 Npm layout 固定为：
@@ -262,6 +261,7 @@ tests/unit/distribution.test.ts 覆盖：
 - source layout 解析到仓库 addon、packages/core/host/run-host.mjs 和源码 MCP bin。
 - npm layout 只解析 anchor 相邻的 ../assets，不回退仓库路径。
 - 重复配置相同 layout 幂等；不同 layout 二次配置返回 DISTRIBUTION_ALREADY_CONFIGURED。
+- 不暴露测试专用 reset API；需要不同全局布局的测试使用 Vitest 文件级模块隔离，生产进程只能保持一次布局。
 - 缺少 addon 或 host 时返回 DISTRIBUTION_ASSET_MISSING，details 含 kind 与精确 path，recovery 不包含联网下载。
 
 tests/unit/client-config.test.ts 增加 npm launcher 用例，期望 Codex 受管区段精确为：
@@ -358,9 +358,12 @@ export interface PlannedTextWrite {
   readonly operation: PlannedOperation;
 }
 
-export interface PlannedProjectFileWrite extends PlannedTextWrite {
+export interface PlannedProjectFileWrite {
   readonly projectPath: string;
   readonly resourcePath: string;
+  readonly content: string;
+  readonly expectedSha256: string | null;
+  readonly operation: PlannedOperation;
 }
 
 export async function planAtomicTextWrite(
@@ -492,6 +495,27 @@ export interface SetupCodexResult {
   readonly restartRequired: true;
 }
 
+export interface SetupCodexPorts {
+  readonly nodeVersion: string;
+  readonly probeGodotVersion: (executable: string) => Promise<string>;
+}
+
+export interface CodexSetupPlan {
+  readonly options: SetupCodexOptions;
+  readonly godotVersion: string;
+  readonly localConfigWrite: PlannedTextWrite;
+  readonly clientPlan: ClientConfigurationPlan;
+  readonly addonPlan: AddonInstallPlan;
+}
+
+export function assertSupportedNodeVersion(version: string): void;
+export function createCodexSetupPlan(
+  options: SetupCodexOptions,
+  ports?: SetupCodexPorts,
+): Promise<CodexSetupPlan>;
+export function applyCodexSetupPlan(
+  plan: CodexSetupPlan,
+): Promise<SetupCodexResult>;
 export async function setupCodex(
   options: SetupCodexOptions,
 ): Promise<SetupCodexResult>;

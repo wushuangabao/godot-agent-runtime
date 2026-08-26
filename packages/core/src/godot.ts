@@ -1,6 +1,5 @@
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 
 import type {
   GodotLaunchResult,
@@ -8,6 +7,7 @@ import type {
 } from "@godot-agent-runtime/protocol";
 
 import { loadDevelopmentConfig } from "./config.js";
+import { getDistribution } from "./distribution.js";
 import { RuntimeFailure } from "./errors.js";
 import { launchManagedProcess, stopManagedRun } from "./managed-run.js";
 import { inspectProject } from "./project.js";
@@ -179,9 +179,7 @@ export async function launchProject(
       recovery: ["Set application/run/main_scene or pass an explicit scene path."],
     });
   }
-  const runtimeScript = fileURLToPath(
-    new URL("../../../addons/godot_agent_runtime/runtime_entry.gd", import.meta.url),
-  );
+  const runtimeScript = resolve(getDistribution().addonRoot, "runtime_entry.gd");
   const runtimeBridgePort = await findLoopbackPort();
   const args = ["--path", project.projectPath, "--script", runtimeScript];
 

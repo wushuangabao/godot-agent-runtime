@@ -1,5 +1,5 @@
 import { lstat, mkdir, realpath } from "node:fs/promises";
-import { extname, relative, resolve, sep } from "node:path";
+import { basename, extname, relative, resolve, sep } from "node:path";
 
 import { RuntimeFailure } from "./errors.js";
 import { inspectProject } from "./project.js";
@@ -20,6 +20,7 @@ const ALLOWED_TEXT_EXTENSIONS = new Set([
   ".yaml",
   ".yml",
 ]);
+const ALLOWED_TEXT_FILENAMES = new Set(["LICENSE"]);
 
 export interface SafeProjectTarget {
   readonly projectRoot: string;
@@ -60,12 +61,19 @@ function assertContained(projectRoot: string, target: string, original: string):
 }
 
 function assertAllowedExtension(target: string, original: string): void {
-  if (!ALLOWED_TEXT_EXTENSIONS.has(extname(target).toLowerCase())) {
+  if (
+    !ALLOWED_TEXT_EXTENSIONS.has(extname(target).toLowerCase()) &&
+    !ALLOWED_TEXT_FILENAMES.has(basename(target))
+  ) {
     throw new RuntimeFailure({
       code: "FILE_TYPE_NOT_ALLOWED",
       stage: "validation",
       message: `File type ${extname(target) || "(none)"} is not writable by the safe text API.`,
-      details: { path: original, allowedExtensions: [...ALLOWED_TEXT_EXTENSIONS] },
+      details: {
+        path: original,
+        allowedExtensions: [...ALLOWED_TEXT_EXTENSIONS],
+        allowedFileNames: [...ALLOWED_TEXT_FILENAMES],
+      },
       recovery: ["Use a Godot text resource, script, configuration, or documentation file."],
     });
   }

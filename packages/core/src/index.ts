@@ -1,4 +1,8 @@
-export { defaultConfigPath, loadDevelopmentConfig } from "./config.js";
+export {
+  defaultConfigPath,
+  loadDevelopmentConfig,
+  resolveConfigPath,
+} from "./config.js";
 export { getAgentGuide } from "./agent-guidance.js";
 export type {
   AgentGuideOverview,
@@ -9,14 +13,52 @@ export type {
   AgentRecipeSummary,
   RecipeId,
 } from "@godot-agent-runtime/protocol";
-export { installGodotAddon } from "./addon.js";
-export type { AddonInstallResult } from "./addon.js";
-export { configureClient } from "./client-config.js";
+export {
+  GODOT_AGENT_LEGACY_PLUGIN_NAME,
+  GODOT_AGENT_PLUGIN_ID,
+  GODOT_AGENT_PLUGIN_PATH,
+  applyGodotAddonInstallPlan,
+  installGodotAddon,
+  isGodotAgentRuntimeEnabled,
+  planGodotAddonInstall,
+} from "./addon.js";
 export type {
+  AddonInstallPlan,
+  AddonInstallResult,
+  PlannedProjectFileWrite,
+} from "./addon.js";
+export {
+  applyClientConfigurationPlan,
+  configureClient,
+  planClientConfiguration,
+} from "./client-config.js";
+export type {
+  ClientConfigurationPlan,
   ClientConfigurationResult,
   ClientTarget,
   ConfigureClientOptions,
 } from "./client-config.js";
+export {
+  applyAtomicTextWrite,
+  planAtomicTextUpdate,
+  planAtomicTextWrite,
+} from "./atomic-file.js";
+export type {
+  PlannedOperation,
+  PlannedTextWrite,
+} from "./atomic-file.js";
+export {
+  RUNTIME_PACKAGE_VERSION,
+  configureDistribution,
+  createNpmDistribution,
+  createSourceDistribution,
+  getDistribution,
+} from "./distribution.js";
+export type {
+  ClientLauncher,
+  DistributionKind,
+  DistributionLayout,
+} from "./distribution.js";
 export { findProjects } from "./discovery.js";
 export type { FindProjectsOptions } from "./discovery.js";
 export { runDoctor } from "./doctor.js";
@@ -136,6 +178,18 @@ export {
 export type { ProjectSnapshot } from "./project.js";
 export { runProcess } from "./process.js";
 export type { ProcessResult, RunProcessOptions } from "./process.js";
+export {
+  applyCodexSetupPlan,
+  assertSupportedNodeVersion,
+  createCodexSetupPlan,
+  probeGodotVersion,
+  setupCodex,
+} from "./setup.js";
+export type {
+  CodexSetupPlan,
+  SetupCodexOptions,
+  SetupCodexPorts,
+} from "./setup.js";
 export { checkScript } from "./script-check.js";
 export type { ScriptCheckOptions } from "./script-check.js";
 export {

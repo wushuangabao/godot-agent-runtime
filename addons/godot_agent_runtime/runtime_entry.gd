@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 extends SceneTree
 
 const PROTOCOL_VERSION := "0.4.0"

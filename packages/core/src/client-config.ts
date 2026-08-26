@@ -1,10 +1,17 @@
-import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { access } from "node:fs/promises";
+import { resolve } from "node:path";
 
+import {
+  applyAtomicTextWrite,
+  planAtomicTextUpdate,
+  type PlannedTextWrite,
+} from "./atomic-file.js";
 import { RuntimeFailure } from "./errors.js";
+import {
+  getDistribution,
+  type ClientLauncher,
+} from "./distribution.js";
 
 export type ClientTarget = "codex" | "claude-code" | "deepseek-harness";
 
@@ -18,40 +25,30 @@ export interface ClientConfigurationResult {
   readonly ok: true;
   readonly target: ClientTarget;
   readonly path: string;
-  readonly serverPath: string;
+  readonly serverPath: string | null;
+  readonly launcher: ClientLauncher;
   readonly operation: "created" | "updated" | "unchanged";
+}
+
+export interface ClientConfigurationPlan {
+  readonly result: Omit<ClientConfigurationResult, "operation">;
+  readonly write: PlannedTextWrite;
 }
 
 const CODEX_START = "# >>> godot-agent-runtime managed section >>>";
 const CODEX_END = "# <<< godot-agent-runtime managed section <<<";
 const DEEPSEEK_HARNESS_PATCH = ".dsh/godot-agent-runtime.patch.yml";
 
-async function readOptional(path: string): Promise<string | null> {
-  try {
-    return await readFile(path, "utf8");
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
-    throw error;
-  }
-}
-
-async function writeAtomic(path: string, content: string): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temporary, content, { encoding: "utf8", flag: "wx" });
-  await rename(temporary, path);
-}
-
 function codexConfiguration(
   existing: string | null,
-  serverPath: string,
+  launcher: ClientLauncher,
   projectPath: string,
 ): string {
   const block = [
     CODEX_START,
     "[mcp_servers.godot-agent-runtime]",
-    `command = ${JSON.stringify(process.execPath)}`,
-    `args = [${JSON.stringify(serverPath)}]`,
+    `command = ${JSON.stringify(launcher.command)}`,
+    `args = [${launcher.args.map((argument) => JSON.stringify(argument)).join(", ")}]`,
     `cwd = ${JSON.stringify(projectPath)}`,
     CODEX_END,
   ].join("\n");
@@ -75,7 +72,7 @@ function codexConfiguration(
   return `${existing.trimEnd()}\n\n${block}\n`;
 }
 
-function claudeConfiguration(existing: string | null, serverPath: string): string {
+function claudeConfiguration(existing: string | null, launcher: ClientLauncher): string {
   let root: Record<string, unknown> = {};
   if (existing !== null && existing.trim() !== "") {
     try {
@@ -99,14 +96,14 @@ function claudeConfiguration(existing: string | null, serverPath: string): strin
       : {};
   mcpServers["godot-agent-runtime"] = {
     type: "stdio",
-    command: process.execPath,
-    args: [serverPath],
+    command: launcher.command,
+    args: [...launcher.args],
   };
   return `${JSON.stringify({ ...root, mcpServers }, null, 2)}\n`;
 }
 
 function deepseekHarnessConfiguration(
-  serverPath: string,
+  launcher: ClientLauncher,
   projectPath: string,
 ): string {
   return [
@@ -117,9 +114,9 @@ function deepseekHarnessConfiguration(
     "      config:",
     "        serverName: godot",
     "        transport: stdio",
-    `        command: ${JSON.stringify(process.execPath)}`,
+    `        command: ${JSON.stringify(launcher.command)}`,
     "        args:",
-    `          - ${JSON.stringify(serverPath)}`,
+    ...launcher.args.map((argument) => `          - ${JSON.stringify(argument)}`),
     `        cwd: ${JSON.stringify(projectPath)}`,
     "        toolCallTimeoutMs: 120000",
     "        failOnStartupError: true",
@@ -127,39 +124,69 @@ function deepseekHarnessConfiguration(
   ].join("\n");
 }
 
-export async function configureClient(
+export async function planClientConfiguration(
   options: ConfigureClientOptions,
-): Promise<ClientConfigurationResult> {
+): Promise<ClientConfigurationPlan> {
   const projectPath = resolve(options.projectPath ?? process.cwd());
-  const serverPath = resolve(
-    options.serverPath ??
-      fileURLToPath(new URL("../../mcp-server/dist/bin.js", import.meta.url)),
-  );
+  const explicitServerPath = options.serverPath === undefined
+    ? null
+    : resolve(options.serverPath);
+  const distribution = explicitServerPath === null ? getDistribution() : null;
+  const serverPath = explicitServerPath ?? distribution?.mcpServerPath ?? null;
+  const launcher: ClientLauncher = explicitServerPath === null
+    ? distribution!.mcpLauncher
+    : { command: process.execPath, args: [explicitServerPath] };
   const targetPath =
     options.target === "codex"
       ? resolve(projectPath, ".codex", "config.toml")
       : options.target === "deepseek-harness"
         ? resolve(projectPath, DEEPSEEK_HARNESS_PATCH)
         : resolve(projectPath, ".mcp.json");
-  try {
-    await access(serverPath, constants.R_OK);
-  } catch (error) {
-    throw new RuntimeFailure({
-      code: "CLIENT_SERVER_NOT_BUILT",
-      stage: "configuration",
-      message: `The MCP server entrypoint was not found at ${serverPath}.`,
-      details: { serverPath, cause: error instanceof Error ? error.message : String(error) },
-      recovery: ["Run the repository build, or pass --server with the absolute MCP server entrypoint."],
-    });
+  if (explicitServerPath !== null) {
+    try {
+      await access(explicitServerPath, constants.R_OK);
+    } catch (error) {
+      throw new RuntimeFailure({
+        code: "CLIENT_SERVER_NOT_BUILT",
+        stage: "configuration",
+        message: `The MCP server entrypoint was not found at ${explicitServerPath}.`,
+        details: {
+          serverPath: explicitServerPath,
+          cause: error instanceof Error ? error.message : String(error),
+        },
+        recovery: ["Run the repository build, or pass --server with the absolute MCP server entrypoint."],
+      });
+    }
   }
-  const existing = await readOptional(targetPath);
-  const content =
+  const write = await planAtomicTextUpdate(targetPath, (existing) =>
     options.target === "codex"
-      ? codexConfiguration(existing, serverPath, projectPath)
+      ? codexConfiguration(existing, launcher, projectPath)
       : options.target === "deepseek-harness"
-        ? deepseekHarnessConfiguration(serverPath, projectPath)
-        : claudeConfiguration(existing, serverPath);
-  const operation = existing === null ? "created" : existing === content ? "unchanged" : "updated";
-  if (operation !== "unchanged") await writeAtomic(targetPath, content);
-  return { ok: true, target: options.target, path: targetPath, serverPath, operation };
+        ? deepseekHarnessConfiguration(launcher, projectPath)
+        : claudeConfiguration(existing, launcher));
+  return {
+    result: {
+      ok: true,
+      target: options.target,
+      path: targetPath,
+      serverPath,
+      launcher,
+    },
+    write,
+  };
+}
+
+export async function applyClientConfigurationPlan(
+  plan: ClientConfigurationPlan,
+): Promise<ClientConfigurationResult> {
+  const operation = await applyAtomicTextWrite(plan.write);
+  return { ...plan.result, operation };
+}
+
+export async function configureClient(
+  options: ConfigureClientOptions,
+): Promise<ClientConfigurationResult> {
+  return await applyClientConfigurationPlan(
+    await planClientConfiguration(options),
+  );
 }

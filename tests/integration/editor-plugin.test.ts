@@ -111,6 +111,37 @@ async function waitForPath(path: string): Promise<void> {
 
 describe.skipIf(!hasLocalConfig)("EditorPlugin integration", () => {
   it(
+    "accepts the legacy bare plugin name until the installer migrates it",
+    async () => {
+      const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-editor-legacy-"));
+      await cp(resolve("examples", "control-ui"), projectPath, {
+        recursive: true,
+        filter: (source) => !source.includes(resolve("examples", "control-ui", ".godot")),
+      });
+      let runId: string | null = null;
+      try {
+        await installGodotAddon(projectPath);
+        const projectFile = resolve(projectPath, "project.godot");
+        const canonical = "res://addons/godot_agent_runtime/plugin.cfg";
+        const configured = await readFile(projectFile, "utf8");
+        await writeFile(projectFile, configured.replace(canonical, "godot_agent_runtime"), "utf8");
+
+        const launch = await launchEditor({ projectPath, configPath, timeoutMs: 30_000 });
+        runId = launch.runId;
+        await expect(getEditorInfo({ projectPath, runId })).resolves.toMatchObject({
+          protocolVersion: "0.7.0",
+        });
+      } finally {
+        if (runId !== null) {
+          await stopManagedRun({ projectPath, runId, timeoutMs: 15_000 });
+        }
+        await rm(projectPath, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
     "holds the shared project.godot lease and serializes editor commands without blocking handshake or operation-status reconcile",
     async () => {
       const projectPath = await mkdtemp(resolve(tmpdir(), "godot-agent-runtime-editor-settings-lease-"));
