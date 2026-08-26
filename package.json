@@ -1,8 +1,38 @@
 {
   "name": "godot-agent-runtime",
   "version": "0.2.0",
-  "private": true,
   "type": "module",
+  "description": "Local-first MCP and CLI runtime for coding agents to automate and verify Godot 4.x projects.",
+  "license": "AGPL-3.0-or-later",
+  "bin": {
+    "godot-agent-runtime": "dist/npm/bin/godot-agent-runtime.js"
+  },
+  "files": [
+    "dist/npm/bin/",
+    "dist/npm/assets/",
+    "README.md",
+    "LICENSE",
+    "LICENSING.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wushuangabao/godot-agent-runtime.git"
+  },
+  "homepage": "https://github.com/wushuangabao/godot-agent-runtime#readme",
+  "bugs": {
+    "url": "https://github.com/wushuangabao/godot-agent-runtime/issues"
+  },
+  "keywords": [
+    "godot",
+    "mcp",
+    "codex",
+    "automation",
+    "testing",
+    "agent"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "packageManager": "pnpm@11.19.0",
   "engines": {
     "node": ">=20.0.0"
@@ -17,15 +47,22 @@
     "benchmark:milestone-5": "pnpm run build && node tests/agent-benchmarks/milestone-5/run.mjs",
     "benchmark:runtime": "node tests/agent-benchmarks/runtime-loop/run.mjs",
     "clean": "tsc -b --clean",
+    "build:npm": "pnpm run build && node scripts/build-npm-package.mjs",
     "doctor": "node packages/cli/dist/bin.js doctor",
     "mcp": "node packages/mcp-server/dist/bin.js",
+    "prepack": "pnpm run build:npm",
     "test": "pnpm run build && vitest run",
     "typecheck": "tsc -b --pretty false",
     "check": "pnpm run typecheck && pnpm run test"
   },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
+    "zod": "^4.4.3"
+  },
   "devDependencies": {
     "@modelcontextprotocol/client": "^2.0.0",
     "@types/node": "^20.19.43",
+    "esbuild": "0.28.2",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   }

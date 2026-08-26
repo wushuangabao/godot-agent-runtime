@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 
-import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import { serveMcpStdio } from "./index.js";
 
-import { createMcpServer } from "./server.js";
-
-serveStdio(createMcpServer, {
-  onerror: (error) => {
-    console.error(error.message);
-  },
-});
+try {
+  await serveMcpStdio();
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+}

@@ -1,0 +1,11 @@
+{
+  "name": "@godot-agent-runtime/release",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@godot-agent-runtime/cli": "workspace:*",
+    "@godot-agent-runtime/core": "workspace:*",
+    "@godot-agent-runtime/mcp-server": "workspace:*"
+  }
+}
